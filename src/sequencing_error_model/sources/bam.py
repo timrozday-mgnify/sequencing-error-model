@@ -24,7 +24,7 @@ import csv
 import json
 import sys
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import replace
 from itertools import islice
 from pathlib import Path
@@ -96,7 +96,15 @@ def records(
 ) -> Iterator[tuple[str, Read, int]]:
     """(template, read, mate) per usable record, in file order. With `masked` (a boolean site mask per kept
     contig, from `masks`), reads on other contigs are skipped and masked sites produce no rows."""
-    for contig, start, end, reverse, template, read, mate in _aligned(bam, reference, min_mapq):
+    return apply_masks(_aligned(bam, reference, min_mapq), masked)
+
+
+Alignment = tuple[str, int, int, bool, str, Read, int]  # contig, start, end, reverse, template, read, mate
+
+
+def apply_masks(alignments: Iterable[Alignment], masked: dict[str, Array] | None) -> Iterator[tuple[str, Read, int]]:
+    """`records` from alignments in read orientation (a BAM's, or generated reads placed on a genome)."""
+    for contig, start, end, reverse, template, read, mate in alignments:
         if masked is not None:
             if contig not in masked:
                 continue
@@ -116,8 +124,13 @@ def pileup(bam: Path, reference: Path, min_mapq: int = 20) -> dict[str, Array]:
     before the site. Uses the same records and CIGAR walk as `records`."""
     with pysam.FastaFile(str(reference)) as fasta:
         lengths = dict(zip(fasta.references, fasta.lengths, strict=True))
+    return count_alleles(_aligned(bam, reference, min_mapq), lengths)
+
+
+def count_alleles(alignments: Iterable[Alignment], lengths: dict[str, int]) -> dict[str, Array]:
+    """`pileup` from alignments in read orientation and contig lengths."""
     counts: dict[str, Array] = {}
-    for contig, start, end, reverse, template, read, _ in _aligned(bam, reference, min_mapq):
+    for contig, start, end, reverse, template, read, _ in alignments:
         n = end - start
         sites, cols = [], []
         for t, op in align(template, read)[0]:
@@ -141,32 +154,42 @@ def masks(
     counts: dict[str, Array], reference: Path, max_alt_freq: float | None = None, min_contig_depth: float = 0.0
 ) -> tuple[dict[str, Array], list[dict[str, Any]]]:
     """Boolean site masks for kept contigs, and one report row per contig with aligned reads."""
+    with pysam.FastaFile(str(reference)) as fasta:
+        return site_masks(counts, fasta.fetch, max_alt_freq, min_contig_depth)
+
+
+def site_masks(
+    counts: dict[str, Array],
+    sequence: Callable[[str], str],
+    max_alt_freq: float | None = None,
+    min_contig_depth: float = 0.0,
+) -> tuple[dict[str, Array], list[dict[str, Any]]]:
+    """`masks` with contig sequences from `sequence(contig)`."""
     kept: dict[str, Array] = {}
     report = []
-    with pysam.FastaFile(str(reference)) as fasta:
-        for contig, table in counts.items():
-            ref = np.array([_BASE.get(b, -1) for b in fasta.fetch(contig).upper()] + [-1])
-            depth = table[:, :5].sum(axis=1)
-            alt = table.copy()
-            has_ref = ref >= 0
-            alt[np.flatnonzero(has_ref), ref[has_ref]] = 0
-            events = int(alt.sum())
-            top = alt.max(axis=1)
-            site_mask = np.zeros(len(ref), bool) if max_alt_freq is None else (top >= 2) & (top >= max_alt_freq * depth)
-            mean_depth = float(depth.sum()) / (len(ref) - 1)
-            keep = mean_depth >= min_contig_depth
-            if keep:
-                kept[contig] = site_mask
-            report.append(
-                {
-                    "contig": contig,
-                    "length": len(ref) - 1,
-                    "mean_depth": round(mean_depth, 3),
-                    "error_rate": round(events / max(1, int(depth.sum() + table[:, 5].sum())), 6),
-                    "masked_sites": int(site_mask.sum()),
-                    "kept": keep,
-                }
-            )
+    for contig, table in counts.items():
+        ref = np.array([_BASE.get(b, -1) for b in sequence(contig).upper()] + [-1])
+        depth = table[:, :5].sum(axis=1)
+        alt = table.copy()
+        has_ref = ref >= 0
+        alt[np.flatnonzero(has_ref), ref[has_ref]] = 0
+        events = int(alt.sum())
+        top = alt.max(axis=1)
+        site_mask = np.zeros(len(ref), bool) if max_alt_freq is None else (top >= 2) & (top >= max_alt_freq * depth)
+        mean_depth = float(depth.sum()) / (len(ref) - 1)
+        keep = mean_depth >= min_contig_depth
+        if keep:
+            kept[contig] = site_mask
+        report.append(
+            {
+                "contig": contig,
+                "length": len(ref) - 1,
+                "mean_depth": round(mean_depth, 3),
+                "error_rate": round(events / max(1, int(depth.sum() + table[:, 5].sum())), 6),
+                "masked_sites": int(site_mask.sum()),
+                "kept": keep,
+            }
+        )
     return kept, report
 
 

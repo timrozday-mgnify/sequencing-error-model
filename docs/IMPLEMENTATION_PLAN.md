@@ -674,11 +674,21 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - `bam.fit` fits it when an `IndelLength` token is given (the CLI then makes a second pass for events), and `recovery.cigar_mode` passes events through.
   - Tests: generated length distributions per kind and run group are within TV 0.05 of the truth; `recover` on a 4× indel-rate truth with longer indels in runs of 3+ passes the phase 2 tolerances, and refitted lengths are within weighted TV 0.05.
   - Known approximations: the post-insertion row is fitted as a full draw; adjacent deletions read back as one event; for deletions Q is the next read base's (the open deletion-Q convention).
-- Still to do in `sources/bam.py`:
-  - per-read error *and quality* trajectories for `Latent(S)`.
+- Deferred: per-read error *and quality* trajectories for `Latent(S)`. No phase fits `Latent(S)` yet, so they wait for the phase that adds its fitter.
 - One code path for three kinds of reference: an external genome, a spike-in or mock community, and a self-assembly. Ship documented recipes (assemble with metaSPAdes / metaFlye / myloasm / hifiasm-meta, polish, align with minimap2 or bwa-mem2) rather than wrapping assemblers.
-- Aligner bias check: align generated reads with known CIGARs and report how the aligner shifts op composition and indel placement.
-- **Clonal cost of masks.** On reads from a single genome, run with minor-allele masking and coverage filters on and off, and report the sites, op classes and contexts they remove and the resulting bias per head E component. With nothing to mask, any removal is an outcome-dependent loss of error hotspots (§6.6).
+- Aligner bias check: align generated reads with known CIGARs and report how the aligner shifts op composition and indel placement. **Blocked on an aligner:** none is installed locally or in CI; needs a decision on `mappy` (minimap2 bindings) as a test/extra dependency, or an aligner install in CI.
+- ✓ **Clonal cost of masks** (`recovery.mask_cost`, `python -m sequencing_error_model.recovery --mask-cost`). Reads come from one random genome, placed on both strands, so every mismatch is an error. Masks are computed with `bam.count_alleles` / `bam.site_masks` / `bam.apply_masks`, the BAM path's cores without file I/O. For each `max_alt_freq` it reports masked sites, removed rows and errors by op class, the most enriched trinucleotide contexts among removed errors, and a head E refit on the kept tuples against the truth on held-out reads: phase 2 rate tolerances, op TV, and the slope of fitted on true `Context` log-odds. The contig depth filter isn't measured: it selects whole contigs on depth, not on the outcome.
+  - Example spec (14% row error rate, so a harsh case), 20 kb genome, depth 30, 16,901 reads (72 s):
+
+    | `max_alt_freq` | masked sites | errors removed | removed rows' error rate | rate ratio | `Context` slope | phase 2 tolerances |
+    |---|---|---|---|---|---|---|
+    | off | 0 | 0 | – | 1.004 | 1.008 | pass |
+    | 0.1 | 5,298 | 43.6% | 24% | 0.888 | 0.867 | **fail** (marginal, every Q bin 0.85–0.92) |
+    | 0.2 | 220 | 2.5% | 36% | 0.998 | 0.993 | pass |
+    | 0.5 | 1 | ~0 | – | 1.004 | 1.008 | pass |
+
+  - The removed errors concentrate where the truth's substitution hotspot is (after G; `GGC`/`GCC` enriched 2× at 0.1 and 5.5× at 0.2), which is the outcome-dependent loss §6.6 predicts. At 0.2 it is too small to move a component past tolerance at this depth and error rate. Chance masking grows with the error rate and shrinks with depth.
+  - **Default:** masks stay off. A threshold only makes sense with the run's error rate and depth in view; the report tells a user what a given threshold costs on a clonal simulation of their spec. Test: on a small genome, a 0.2 mask removes rows more than twice as error-rich as the rest.
 - `compare.py` (§7): evidence-level and model-level comparison on shared support. First use: `pe-overlap` vs `reference` on the same Illumina reads, which also estimates the PCR/library error contribution.
 - **Baseline harness.** The phase 3 metrics computed on real reads vs reads from (a) the native generator, (b) ReSeq for Illumina, (c) Badread, PBSIM3 and CycSim for long reads, each simulator trained by its own profiler on the same alignment. Add k-mer spectrum concordance and context-dependent substitution rates, the metrics of the 2026 ONT benchmark.
 - **Exit:**
