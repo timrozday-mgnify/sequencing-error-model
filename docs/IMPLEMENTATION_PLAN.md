@@ -577,6 +577,9 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     | 0.01 | 0 | 1.44 | 1.10 | 1.017 | 2.9× / 7.3× |
     | 0.01 | 30 | **0.60** | 0.97 | 1.022 | 5.5× / 5.5× |
     | 0.01 | 300 | 0.64 | 0.96 | 1.020 | 5.8× / 6.0× |
+    | 0.001 | 30 | 0.60 | 0.96 | 1.010 | 5.4× / 5.5× |
+
+    `window_l2` 0.001 is indistinguishable from 0.01, so the `pe-overlap` default stays at the less extreme 0.01, with `smooth` 30.
 
     A weak window L2 alone collapses sparse bins (Q24 and Q26–29 at 0.03–0.13×). Smoothing alone can't move the level. Together they cut the error across Q by ~30% and at Q ≥ 30 by ~37%; smooth 300 over-smooths the middle (Q24–27 at 1.4–2.7×). The truth itself has a Q34 dip (rate below Q33 and Q35) that a shape prior can't follow (4.9× at smooth 30).
   - Head Q per-position TV reaches 0.35 even with the truth's own tokens, but only at the knots: 0.36 at cycle 5 and 0.12 at 25–27, against 0.01–0.05 elsewhere. The truth's knots sit at 1, 5.3, 28.4 and 151 (fitted on 150-bp reads) and the refit's at 1, 5, 25 and 125, so two coarse splines disagree at their kinks.
