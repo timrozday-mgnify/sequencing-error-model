@@ -105,9 +105,11 @@ These come from `skiver/docs/hmm_error_model.md`, `docs/performance.md`, `exampl
 | samtools stats / Qualimap / alignment-based (e.g. BEST) | Yes | mismatch/indel rates by cycle and quality. Biased by incomplete references and strain divergence (skiver paper) |
 | GATK BQSR | Yes, plus known sites | Joint read group × Q × cycle × dinucleotide context mismatch table: the closest existing analogue of the §5 error head, but reference-bound |
 | k-mer spectrum tools (GenomeScope-style) | No | a single error rate, no spectrum |
-| Simulator "profilers" (`iss model`, `badread error_model`/`qscore_model`, NanoSim `read_analysis.py`, `art_profile_builder`, `neat model-seq-err`) | Yes, BAM/PAF against a reference (ART and NEAT can use FASTQ for qualities) | simulator-specific models |
+| Simulator "profilers" (`iss model`, `badread error_model`/`qscore_model`, NanoSim `read_analysis.py`, `art_profile_builder`, `neat model-seq-err`, ReSeq `stats`, CycSim training, LongISLND, GemSIM) | Yes, BAM/PAF against a reference (ART and NEAT can use FASTQ for qualities) | simulator-specific models |
+| BEAR (DRISEE on artifactual duplicate reads) | No | per-position substitution rates, pooled indel rate, mean Q of erroneous bases vs position; feeds its own simulator |
+| ErrorProfiler (PE overlap), DADA2 `learnErrors` | No | substitution × Q tables; no simulator |
 
-**Our niche:** simulator-ready, quality-aware error models for samples where no good reference exists (metagenomes, novel isolates). We produce what the profilers would, without the alignment step, and in a representation richer than any single simulator's format.
+**Our niche:** simulator-ready, quality-aware error models for samples where no good reference exists (metagenomes, novel isolates). We produce what the profilers would, without the alignment step, and in a representation richer than any single simulator's format. §4.4 states how narrow that niche is and what would make the project redundant.
 
 ### 4.2 Read simulators: export targets
 
@@ -123,6 +125,8 @@ Maintenance data is from the GitHub API on 2026-09-15. "Q coupling" describes ho
 | **Badread** | ONT/PacBio | 2026-07 / 301 | Error model: text, one line per 7-mer `KMER,p;ALT,p;...` (≤ 25 alternatives); Q model: `CIGAR;count;q:p,...` keyed by local CIGAR window | **Q conditioned on the local error pattern** (CIGAR window around the base) | Long-read tool benchmarks | **High.** 7-mer → alternatives materialises the base-context part; P(Q \| local CIGAR window) is a marginal of the joint model. Neighbour-Q and position effects are lost |
 | **PBSIM3** | PacBio/ONT | 2025-04 / 117 | ERRHMM text (`IP`/`EP`(match,sub,ins,del)/`TP` per accuracy level) or QSHMM (quality HMM; errors from Q) | ERRHMM: none (qualities `!`). QSHMM: latent-state Q process, errors from Q | MeSS; top of the 2026 ONT simulator benchmark for length/Q realism | Medium. Export **QSHMM** for Q-bearing output (maps our latent state + Q head) and ERRHMM for error-only use. Sequence context is lost |
 | **NanoSim** | ONT | 2026-03 / 311 | Directory of pickled KDEs + text Markov/histogram files (`_error_markov_model`, `_match_markov_model`, `*_hist`, `_error_rate.tsv`, quality models) from alignments | Quality models conditioned on match/error state | CAMISIM (`nanosim3`) | Low–medium. Only the error/quality Markov parts are estimable; length KDEs must come from a base model. Lowest priority |
+| **ReSeq** | Illumina | 2021 paper / GitHub (maintenance to check) | Binary stats file from `reseq illuminaPE` statistics step (format to confirm in phase 5) | **Errors conditioned on Q**, position, errors so far in the read, reference base and recent dominant error; Q conditioned on previous Q, position, mate, tile, sequence quality and reference base; per-site systematic errors; stored as 2-D margins | Illumina tool benchmarks | Medium–high if the format is writable: head Q and centre-Q head E map closely. Preceding-sequence context is not modelled by ReSeq and is lost |
+| **CycSim** | ONT/HiFi/Cyclone | 2025 preprint, GigaScience 2026 | k-mer sliding-window error model + error-state transition matrix, learned from BAM (format to confirm) | Q assigned after errors are placed | Long-read mapper parameter tuning | Medium: base context and error clustering map; Q process thin. Candidate, not committed |
 | **genome-blender** | all | internal | `skiver-generate` subprocess contract | full joint model | This project's current consumer | Full: it uses our native generator |
 
 Metagenome wrappers: **MeSS** wraps ART + PBSIM3, and **CAMISIM** wraps ART, NanoSim3 and wgsim. Covering **ART, InSilicoSeq, Badread and PBSIM3** therefore reaches most short-read, long-read and metagenome-simulation users. NEAT, Mason2, wgsim and NanoSim are a second wave.
@@ -133,7 +137,9 @@ The 2026 ONT simulator benchmark (Badread, LongISLND, lrsim, NanoSim, PBSIM3, Si
 - **Badread and LongISLND** were the only ones to capture context-dependent substitution rates, which span ~2 orders of magnitude.
 - **Homopolymer errors** were poorly reproduced by most simulators.
 
-No existing simulator combines context-dependent errors with realistic, calibrated qualities, and that combination is the gap the native generator fills. Exports are necessarily projections of it.
+CycSim (not in that benchmark) reports better context-dependent substitution and simple-repeat error heterogeneity than Badread, NanoSim and PBSIM3, but its qualities are assigned after errors.
+
+No existing long-read simulator combines context-dependent errors with realistic, calibrated qualities. For Illumina, ReSeq comes closest (errors conditioned on Q, a rich Q process) but has no preceding-sequence context model and is BAM-bound. That combination is the gap the native generator fills. Exports are necessarily projections of it.
 
 ### 4.3 Evidence sources beyond skiver
 
@@ -165,6 +171,36 @@ Sources can be fitted alone or jointly, and disagreement between them is a first
 3. **ONT duplex/simplex source.** The best reference-free long-read truth when duplex data exist.
 4. **Raw FASTQ quality profiling.** Low as *evidence* (it carries none), but a hard dependency for *generating* qualities in default mode, so it is still built early (phase 1) as a feature/output source.
 5. **Importers**: BQSR tables, DADA2 matrices, InterOp metrics, spike-in BAMs (a special case of item 2 with a known reference).
+
+### 4.4 Closest prior art and redundancy risks
+
+Most parts of this project exist somewhere already. Only the combination below is new, so the plan must show it adds something on real data rather than assume it.
+
+| Tool | Reference-free training | Simulates | Base context | Quality model | Errors vs Q |
+|---|---|---|---|---|---|
+| **ReSeq** (Illumina) | No (BAM) | Yes | No preceding-sequence model (stated limitation); per-site systematic errors | Rich: previous Q, position, mate, tile, sequence quality, reference base (2-D margins) | Errors conditioned on Q, learned from data |
+| **Badread** | No | Yes | 7-mers | Q given local CIGAR window | Errors first, then Q |
+| **CycSim** (long reads) | No (BAM) | Yes | k-mer sliding window + error-state transitions | Assigned after errors | Errors first, then Q |
+| **LongISLND** | No | Yes | Per-k-mer error patterns | Position scaling | — |
+| **BEAR** (DRISEE) | **Yes** (artifactual duplicate reads) | Yes | None (per-position rates) | Mean Q of erroneous bases vs position | Q fitted to errors |
+| **skiver** (upstream) | **Yes** | **No** (QC only) | Marginal trinucleotide spectrum | Marginal P(error \| Q) | — |
+| **This project, default mode** | Yes | Yes | Two-sided, latent-position `Context(L,R)` | FASTQ Q Markov process | Centre-Q term by marginal matching; no Q window |
+| **This project, full model** | Yes (enhanced skiver, PE overlap) or BAM/duplex | Yes | Two-sided + `QualityxContext` | Q conditioned on true context, shared `Latent(S)` | Q first, then errors given the Q window; Q never a label |
+
+**Clearly distinct:**
+
+- simulator-ready models trained without alignment. BEAR is the only precedent, and it has no context and no Q coupling;
+- quality as a feature, with the calibration gap learned rather than assumed;
+- one spec exported to many simulators, with `--q-policy` and fidelity reports;
+- multi-source fitting with disagreement diagnostics.
+
+**Redundancy risks, each tied to a test:**
+
+1. **The reference-free advantage is narrower than it looks.** Skiver needs ≥ ~20× coverage on some genomes, roughly the genomes that also self-assemble. On a self-reference BAM, ReSeq, Badread, CycSim and NanoSim can train directly. Skiver's remaining advantages are speed, no aligner bias and no assembly errors used as truth. *Test:* the skiver-vs-BAM cross-check (phase 6, §12 decision 7).
+2. **Default mode is only modestly richer than existing profiles.** It is roughly Badread-level context plus an ART/NEAT-level quality process. *Test:* comparative exit criteria against BAM-trained baselines (phases 2–3, §12 decision 11).
+3. **The richest components come from alignment-type evidence** (BAM, duplex) that existing profilers already use. PE overlap is the reference-free exception for Illumina. On those sources the contribution is the joint model and exporter hub, not the evidence.
+4. **Exports discard what is new** (§6.3). Exporter users get about what the simulator's own profiler gives, minus the alignment step. Only the native generator carries the full model.
+5. **Expressiveness isn't realism.** A simple Q-HMM (PBSIM3) won on quality realism in the 2026 ONT benchmark. Components must earn their place on held-out data (§12 decision 10).
 
 ---
 
@@ -420,6 +456,7 @@ uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), L
   - the error rate implied per reported-Q bin is within 10% of truth;
   - per-position Q histograms are within TV < 0.05;
   - the marginal error rate is within 5%.
+- **Comparative check (not blocking, reported):** on a dataset with a reference, the default-mode model's held-out likelihood and marginals are compared with ReSeq (Illumina) and Badread (long reads) profiles trained on the aligned reads (§4.4, risk 2).
 
 ### Phase 3: native generator (bases + qualities) and recovery harness
 - `generate.py` implementing §5.3. Qualities are always emitted from head Q, and `--no-quality` is kept only for compatibility. It keeps the `skiver-generate` CLI contract so genome-blender can switch without code changes, and adds an alignment-consistency self-test.
@@ -427,7 +464,10 @@ uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), L
   - **errors:** TV/KL on op probabilities, marginal rate, position curve;
   - **qualities:** per-position Q TV, Q lag-1 autocorrelation, P(error | reported Q) calibration curve vs source, empirical-vs-reported Q curve.
 - A small version runs in CI (a few seconds of reads); the full-scale version is a manual `workflow_dispatch` workflow.
-- **Exit:** the self-consistency loop passes at v=13 for both heads, and the documented failure at small v is reproduced as a guarded error or warning.
+- **Baseline harness.** The same metrics computed on real reads vs reads from (a) the native generator, (b) ReSeq for Illumina, (c) Badread, PBSIM3 and CycSim for long reads, each simulator trained by its own profiler on an alignment of the same sample. Add k-mer spectrum concordance and context-dependent substitution rates, the metrics of the 2026 ONT benchmark.
+- **Exit:**
+  - the self-consistency loop passes at v=13 for both heads, and the documented failure at small v is reproduced as a guarded error or warning;
+  - the baseline harness runs on at least one Illumina and one long-read dataset, and the report states where the native generator beats, matches or trails each baseline.
 
 ### Phase 4: exporters, wave 1 (ART/art_modern, InSilicoSeq, Badread, PBSIM3)
 - Each exporter:
@@ -441,6 +481,7 @@ uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), L
 
 ### Phase 5: exporters, wave 2, and wrapper recipes
 - NEAT v4 (quality Markov + error model; optional dependency), Mason2 (including correct/wrong-base Q parameters) and wgsim parameter sets, and NanoSim error and quality model parts on a base model.
+- Candidates, pending a format check: **ReSeq** (its Q process and Q-conditioned errors map closely onto both heads, a better Illumina target than ART if its stats file can be written) and **CycSim** (k-mer errors and error-state transitions for long reads). Drop either if its model file is not documented or stable.
 - Documented CAMISIM (`art`/`nanosim3`/`wgsim` config) and MeSS recipes pointing at exported profiles.
 - **Exit:** the same round-trip criterion (NanoSim: best-effort, documented gaps).
 
@@ -456,7 +497,7 @@ In the order of §12 decision 6: PE overlap, self-reference BAM, ONT duplex, the
   Ship a documented recipe (assemble, polish, minimap2) rather than wrapping assemblers.
 - `sources/ont_duplex.py` (dorado duplex pairs, simplex Q tracks).
 - `sources/importers.py` for GATK BQSR recalibration tables, DADA2 `learnErrors` matrices and InterOp error metrics.
-- A cross-validation report comparing skiver-derived and alignment-derived models, per head and per component, on the same high-coverage genomes (real data, not synthetic).
+- A cross-validation report comparing skiver-derived and alignment-derived models, per head and per component, on the same high-coverage genomes (real data, not synthetic). This is the project's main redundancy test (§4.4, risk 1). A minimal version, using an off-the-shelf assemble-and-align recipe and existing profilers rather than `sources/bam.py`, should run as early as phase 3.
 - Multi-source joint fit with per-source disagreement diagnostics.
 - **Exit:**
   - each source recovers a known model, including `QualityWindow` effects, on synthetic data;
@@ -522,10 +563,11 @@ The standard matches `EBI-Metagenomics/mimicc-ena-submission-assistant`: uv + Py
 4. **Priority of wave-1 exporters.** Recommended order: Badread → InSilicoSeq → ART → PBSIM3 (context-rich first, then most-used Illumina tools).
 5. **Fork strategy.** Make a new fork of GZHoffie/skiver for enhanced outputs, base some of the changes on the current `timrozday-mgnify/skiver` fork but try to minimize modifications and if possible just extend with distinct module(s).
 6. **Evidence-source priority.** Recommended order: paired-end overlap, then self-reference BAM, ONT duplex, FASTQ quality, importers. Phase 6 could move ahead of phase 5 if long-read realism matters more than second-wave exporters.
-7. **Is skiver "primary"?** If the self-reference source turns out to dominate in accuracy, reposition skiver as the fast, reference-free default and alignment sources as the high-fidelity path. The phase 6 cross-validation report settles this with data.
+7. **Is skiver "primary"?** If the self-reference source turns out to dominate in accuracy, reposition skiver as the fast, reference-free default and alignment sources as the high-fidelity path. The cross-validation report (minimal version from phase 3, full version in phase 6) settles this with data. It is also the redundancy question (§4.4): if alignment sources dominate *and* existing profilers (ReSeq, Badread, CycSim) match the native generator on the same BAM, the project's value reduces to the joint Q model and the exporter hub, and scope should shrink accordingly.
 8. **Factorisation.** Q-then-errors (§5.2, recommended: head E is directly the reported error profile and allows two-sided quality windows) vs errors-then-Q (Badread-style; simpler for long-read exports). The alternative is derivable from the joint model either way, so this only decides which one is fitted.
 9. **Default `--q-policy`** for Q-coupled simulators: `preserve-quality` (recommended; realistic FASTQs for QC and aligner benchmarking) or `preserve-errors` (true error rates for assembly and variant benchmarking). It may be worth defaulting per use case.
 10. **Quality windows vs neural window.** Start with additive `QualityWindow(m)` + low-rank `QualityxContext` and add `NeuralWindow` only if phase 6 shows held-out gains large enough to justify an export-unfriendly model.
+11. **Baselines.** Which external simulators the baseline harness (phase 3) must include. Recommended: ReSeq for Illumina; Badread, PBSIM3 and CycSim for long reads. Also whether beating them should become a blocking exit criterion, rather than a reported one, before v0.1.0.
 
 ## Sources
 
@@ -544,3 +586,10 @@ The standard matches `EBI-Metagenomics/mimicc-ena-submission-assistant`: uv + Py
 - GATK BaseRecalibrator: https://gatk.broadinstitute.org/hc/en-us/articles/360036898312-BaseRecalibrator
 - Dorado duplex: https://software-docs.nanoporetech.com/dorado/latest/basecaller/duplex/
 - Duplex basecalling for assembly (R. Wick, 2024): https://rrwick.github.io/2024/05/08/duplex_assemblies.html
+- ReSeq (Genome Biology 2021): https://pmc.ncbi.nlm.nih.gov/articles/PMC7896392/, https://github.com/schmeing/ReSeq
+- CycSim, context-aware long-read simulation (2025 preprint; GigaScience 2026): https://www.biorxiv.org/content/10.64898/2025.12.04.692264, https://academic.oup.com/gigascience/article/doi/10.1093/gigascience/giag079/8728720
+- BEAR, sequence-read simulator for metagenomics (2014): https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4168713/
+- DRISEE: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3369934/
+- LongISLND: https://doi.org/10.1093/bioinformatics/btw602
+- GemSIM: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3305602/
+- Skiver v2 preprint: https://www.biorxiv.org/content/10.64898/2026.02.12.705514v2
