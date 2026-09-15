@@ -208,6 +208,7 @@ def fit(
     *,
     iterations: int = 30,
     tol: float = 1e-3,
+    smooth: float = 0.0,
     seed: int = 0,
     sources: Sequence[str] = ("pe-overlap",),
 ) -> ErrorModelSpec:
@@ -227,7 +228,7 @@ def fit(
                 counts[r] = counts.get(r, 0.0) + float(c)
         expected = cast("Counter[Key]", Counter({k: v for k, v in counts.items() if v > 0}))
         table = CountTable("pe-overlap", fields_, "base", True, expected, meta)
-        error_head = error.fit(table, error_tokens, alphabet, seed=seed, init=error_head)
+        error_head = error.fit(table, error_tokens, alphabet, smooth=smooth, seed=seed, init=error_head)
         if not groups:
             break
         keys = Counter(dict.fromkeys((k for rows, _ in groups for k in rows), 1))
