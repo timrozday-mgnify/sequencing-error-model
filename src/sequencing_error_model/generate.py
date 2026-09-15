@@ -6,7 +6,8 @@ Per batch of reads, vectorised across bases:
 2. draw a head E outcome for every template base from its Q window;
 3. materialise the read: a match or substitution emits one base with q_t; an insertion emits the inserted
    base and draws again at the same base (at most `max_ins_run` insertions); a deletion emits nothing and
-   drops q_t.
+   drops q_t. With `IndelLength` in head E, one draw starts each indel and its length comes from that
+   component (`max_ins_run` is then unused).
 
 ponytail: inserted bases reuse q_t until the `InsertionQuality` sub-head exists (needs `reference` tuples).
 Template bases other than A, C, G, T are copied through as N matches.
@@ -34,7 +35,7 @@ from typing import IO, Any, cast
 import numpy as np
 
 from sequencing_error_model import spec as spec_io
-from sequencing_error_model.fit import error, quality
+from sequencing_error_model.fit import error, indel, quality
 from sequencing_error_model.fit.quality import _BASE, Array
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component, ErrorModelSpec
@@ -125,7 +126,8 @@ def generate(
             ok = (j >= 0) & (j < rlen)
             cols[name] = np.where(ok, qidx[np.where(ok, np.arange(n) + j - within, 0)], len(alphabet))
 
-    probs = error.probabilities_at(model.error_head, cols) if n else np.zeros((0, _K))
+    body, length_head = indel.split(model.error_head)
+    probs = error.probabilities_at(body, cols) if n else np.zeros((0, _K))
     probs[:, 1:] *= error_rate_scale
     probs[cols["centre"] > 3] = np.eye(_K)[0]
     probs /= probs.sum(axis=1, keepdims=True)
@@ -133,20 +135,51 @@ def generate(
     no_ins[:, 5:9] = 0
     no_ins /= no_ins.sum(axis=1, keepdims=True)
 
-    def draw(p: Array, idx: Array) -> Array:
-        return np.minimum((rng.random((len(idx), 1)) > p[idx].cumsum(axis=1)).sum(axis=1), _K - 1)
+    def pick(p: Array) -> Array:
+        return np.asarray(np.minimum((rng.random((len(p), 1)) > p.cumsum(axis=1)).sum(axis=1), p.shape[1] - 1))
 
-    final = draw(probs, np.arange(n))
-    ev_pos, ev_cat = [], []
+    final = pick(probs)
+    ev_pos: list[Array] = []
+    ev_cat: list[Array] = []
+    ev_rank: list[Array] = []
     pending = np.flatnonzero((final >= 5) & (final <= 8))
-    for r in range(max_ins_run):
-        ev_pos.append(pending)
-        ev_cat.append(final[pending])
-        final[pending] = draw(probs if r + 1 < max_ins_run else no_ins, pending)
-        pending = pending[(final[pending] >= 5) & (final[pending] <= 8)]
+    if length_head is None:
+        for r in range(max_ins_run):
+            ev_pos.append(pending)
+            ev_cat.append(final[pending])
+            ev_rank.append(np.full(len(pending), r))
+            final[pending] = pick((probs if r + 1 < max_ins_run else no_ins)[pending])
+            pending = pending[(final[pending] >= 5) & (final[pending] <= 8)]
+    else:
+        centre = cols["centre"]
+        rid = np.cumsum(np.r_[True, (centre[1:] != centre[:-1]) | (within[1:] == 0)]) - 1
+        run = np.bincount(rid)[rid] if n else np.zeros(0, np.int64)
+
+        def length(kind: int, idx: Array) -> Array:
+            return 1 + pick(indel.probabilities_at(length_head, np.full(len(idx), kind), run[idx], qidx[idx]))
+
+        # An insertion event: its first base from head E, the rest from that base's insertion mix, then one
+        # final draw with no insertion.
+        # ponytail: that final row is fitted as a full draw; the bias is O(insertion rate^2).
+        extra = np.repeat(np.arange(len(pending)), length(0, pending) - 1)
+        mix = probs[pending, 5:9] / probs[pending, 5:9].sum(axis=1, keepdims=True)
+        ev_pos += [pending, pending[extra]]
+        ev_cat += [final[pending], 5 + pick(mix[extra])]
+        ev_rank += [np.zeros(len(pending), np.int64), 1 + np.arange(len(extra)) - np.searchsorted(extra, extra)]
+        final[pending] = pick(no_ins[pending])
+        # A deletion event removes the next length - 1 bases of the read too; their own draws are discarded.
+        # ponytail: a deletion starting right after another one reads back as one longer event.
+        covered, ends = np.zeros(n, bool), np.repeat(starts + lengths, lengths)
+        dels = np.flatnonzero(final == 9)
+        for i, k in zip(dels.tolist(), length(1, dels).tolist(), strict=True):
+            if not covered[i]:
+                covered[i + 1 : min(i + k, ends[i])] = True
+        final[covered] = 9
+        keep = [~covered[p] for p in ev_pos]
+        ev_pos, ev_cat, ev_rank = ([a[k] for a, k in zip(x, keep, strict=True)] for x in (ev_pos, ev_cat, ev_rank))
     # Events in read order: a base's insertions (in draw order), then its final outcome.
     pos = np.concatenate([*ev_pos, np.arange(n)])
-    rank = np.concatenate([np.full(len(p), r) for r, p in enumerate(ev_pos)] + [np.full(n, max_ins_run)])
+    rank = np.concatenate([*ev_rank, np.full(n, np.iinfo(np.int64).max)])
     order = np.lexsort((rank, pos))
     pos, cat = pos[order], np.concatenate([*ev_cat, final])[order]
     base = np.where(cat == 0, context[pos, left], np.where(cat < 5, cat - 1, cat - 5))
@@ -277,8 +310,16 @@ def indel_events(records: Iterable[tuple[str, Read, int]], source: str = "genera
     return CountTable(source, ("indel", "indel_length", "run", "q"), "error", True, counts)
 
 
+def _indel_kind(op: str) -> str | None:
+    return "I" if op[0] == "-" else "D" if op[-1] == "-" else None
+
+
 def observations(
-    records: Iterable[tuple[str, Read, int]], flank: tuple[int, int], m: int, source: str = "generator"
+    records: Iterable[tuple[str, Read, int]],
+    flank: tuple[int, int],
+    m: int,
+    source: str = "generator",
+    per_event: bool = False,
 ) -> CountTable:
     """Head E tuples from (template, read, mate) triples, one row per draw, as `fit.error` expects.
 
@@ -286,7 +327,8 @@ def observations(
     previous one at the read end), so windows touching a deletion differ from the generator's Q track.
     A read's `clipped` bases shift `pos_start` / `pos_end` to the read's own ends and fill Q windows past the
     aligned part; `strand` overrides the mate-based strand. Rows at template bases other than A, C, G, T, or
-    at `masked` template indices, are skipped.
+    at `masked` template indices, are skipped. With `per_event` (head E with `IndelLength`), an indel event gives
+    one row, its first inserted or deleted base, as the generator draws it.
     """
     left, right = flank
     fields = ("q", *(f"q{s}{o}" for o in range(1, m + 1) for s in "-+"))
@@ -296,7 +338,12 @@ def observations(
         rows, filled, before = _filled(template, read)
         padded, gc = "." * left + template.upper() + "." * right, gc_bin(template)
         strand = read.strand or ("-" if mate == 2 else "+")
+        last: tuple[int, str | None] = (-2, None)
         for t, op in rows:
+            kind, (t0, k0) = _indel_kind(op), last
+            last = (t, kind)
+            if per_event and kind and kind == k0 and t0 == t - (1 if kind == "D" else 0):
+                continue  # continuation of an indel event: `IndelLength` owns it
             i = t + before
             if template[t].upper() not in "ACGT" or filled[i] is None or t in read.masked:
                 continue

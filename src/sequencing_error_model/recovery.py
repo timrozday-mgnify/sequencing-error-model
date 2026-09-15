@@ -23,9 +23,9 @@ from pathlib import Path
 import numpy as np
 
 from sequencing_error_model import spec as spec_io
-from sequencing_error_model.fit import error, quality
+from sequencing_error_model.fit import error, indel, quality
 from sequencing_error_model.fit.quality import Array
-from sequencing_error_model.generate import Read, _flank, fragments, generate, insert_sizes, observations
+from sequencing_error_model.generate import Read, _flank, fragments, generate, indel_events, insert_sizes, observations
 from sequencing_error_model.observations import CountTable
 from sequencing_error_model.sources import bam
 from sequencing_error_model.spec import Component, ErrorModelSpec
@@ -82,7 +82,10 @@ def _tuples(model: ErrorModelSpec, templates: Sequence[str], reads: Sequence[Rea
     """Head E tuples wide enough for both heads' context and Q windows."""
     e, q = _flank(model.error_head), _flank(model.quality_head)
     m = max(model.error_head[0].args[0], model.quality_head[0].args[0])
-    return observations(zip(templates, reads, mates, strict=True), (max(e[0], q[0]), max(e[1], q[1])), m)
+    per_event = indel.split(model.error_head)[1] is not None
+    return observations(
+        zip(templates, reads, mates, strict=True), (max(e[0], q[0]), max(e[1], q[1])), m, per_event=per_event
+    )
 
 
 def cigar_mode(templates: list[str], reads: list[Read], mates: list[int], truth: ErrorModelSpec) -> ErrorModelSpec:
@@ -93,6 +96,7 @@ def cigar_mode(templates: list[str], reads: list[Read], mates: list[int], truth:
         [c.token for c in truth.error_head],
         [c.token for c in truth.quality_head],
         {"mode": "reference", "sources": ["generator-cigar"]},
+        indel_events(zip(templates, reads, mates, strict=True)) if indel.split(truth.error_head)[1] else None,
     )
 
 
@@ -147,7 +151,9 @@ def compare(
     true_reads = generate(truth, templates, mates, rng)
     table = _tuples(truth, templates, true_reads, mates)
     n = np.array(list(table.counts.values()), float)
-    p_true, p_fit = (error.probabilities(s.error_head, truth.quality_alphabet, table) for s in (truth, fitted))
+    p_true, p_fit = (
+        error.probabilities(indel.split(s.error_head)[0], truth.quality_alphabet, table) for s in (truth, fitted)
+    )
     if substitutions_only:
         p_true, p_fit = (
             np.pad(p[:, :5] / p[:, :5].sum(axis=1, keepdims=True), ((0, 0), (0, _K - 5))) for p in (p_true, p_fit)

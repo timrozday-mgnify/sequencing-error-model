@@ -33,9 +33,9 @@ from typing import Any
 import numpy as np
 import pysam
 
-from sequencing_error_model.fit import error, quality
+from sequencing_error_model.fit import error, indel, quality
 from sequencing_error_model.fit.quality import Array
-from sequencing_error_model.generate import Read, _revcomp, align, observations
+from sequencing_error_model.generate import Read, _revcomp, align, indel_events, observations
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component, ErrorModelSpec
 
@@ -183,9 +183,16 @@ def fit(
     error_tokens: Sequence[str],
     quality_tokens: Sequence[str],
     provenance: dict[str, Any],
+    indels: CountTable | None = None,
 ) -> ErrorModelSpec:
-    """Both heads from exact-position tuples: head E from every draw, head Q from bases that emit a read base."""
-    error_head = error.fit(table, error_tokens, alphabet)
+    """Both heads from exact-position tuples: head E from every draw, head Q from bases that emit a read base.
+    An `IndelLength` token is fitted from `indels` (`generate.indel_events`); `table` then needs per-event rows."""
+    body = [t for t in error_tokens if Component(t).name != "IndelLength"]
+    error_head = error.fit(table, body, alphabet)
+    if lengths := [t for t in error_tokens if Component(t).name == "IndelLength"]:
+        if indels is None:
+            raise ValueError(f"{lengths[0]} needs an indel event table")
+        error_head += (indel.fit(indels, lengths[0], alphabet),)
     oi = table.fields.index("op")
     # One row per template base with an emitted read base: matches and substitutions.
     final: Counter[Key] = Counter(
@@ -235,13 +242,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 writer.writerows(report)
     flank, m = window(args.error_tokens, args.quality_tokens)
     reads = islice(records(args.bam, args.reference, args.min_mapq, masked), args.max_reads)
-    table = observations(reads, flank, m, "bam")
+    per_event = any(Component(t).name == "IndelLength" for t in args.error_tokens)
+    table = observations(reads, flank, m, "bam", per_event)
+    indels = None
+    if per_event:  # a second pass over the same records
+        indels = indel_events(islice(records(args.bam, args.reference, args.min_mapq, masked), args.max_reads), "bam")
     if not table.counts:
         p.error("no usable aligned reads")
     # Q windows can reach clipped bases, whose Q never appears at a centre.
     qs = {v for k in table.counts for f, v in zip(table.fields, k, strict=True) if f.startswith("q") and v is not None}
     alphabet = sorted(int(v) for v in qs)  # type: ignore[call-overload]
-    spec = fit(table, alphabet, args.error_tokens, args.quality_tokens, provenance)
+    spec = fit(table, alphabet, args.error_tokens, args.quality_tokens, provenance, indels)
     spec.save(args.output)
     print(json.dumps({"rows": sum(table.counts.values()), "quality_alphabet": alphabet}))
     return 0
