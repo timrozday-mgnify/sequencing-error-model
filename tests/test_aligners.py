@@ -15,9 +15,14 @@ def _require(tool: str) -> None:
         pytest.skip(f"{tool} is not on PATH")
 
 
-@pytest.mark.parametrize(("aligner", "scale"), [("minibwa", 0.1), ("minimap2", 1.0)])
-def test_aligner_bias(tmp_path: Path, aligner: str, scale: float) -> None:
+@pytest.mark.parametrize(
+    ("aligner", "scale", "unclip"), [("minibwa", 0.1, False), ("minibwa", 0.1, True), ("minimap2", 1.0, False)]
+)
+def test_aligner_bias(tmp_path: Path, aligner: str, scale: float, unclip: bool) -> None:
     _require(aligner)
-    report = recovery.aligner_bias(recovery.example_spec(), aligner, tmp_path, n_reads=200, error_rate_scale=scale)
+    truth = recovery.example_spec()
+    report = recovery.aligner_bias(truth, aligner, tmp_path, n_reads=200, error_rate_scale=scale, unclip=unclip)
     assert report["mapped_fraction"] > 0.9
     assert 0.9 < report["op_rate_ratio"]["substitution"] < 1.1
+    assert report["edits_hidden"] > 0
+    assert report["failures_observable"] == [], {k: v for k, v in report.items() if k.endswith("_observable")}

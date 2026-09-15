@@ -16,6 +16,11 @@ Masking selects on the outcome, so it can drop true error hotspots (§6.6); it i
 clonal cost is measured. A contig is dropped when its mean depth is below `min_contig_depth`. `masks` also
 returns a per-contig report (depth, raw error rate, masked sites) so outlier contigs show.
 
+Aligners soft-clip read ends where errors cluster, so clipped bases lose errors selectively: on generated
+100-150 bp reads with ~5% errors, minibwa clipped 14% of reads and those kept 55% of their edits (plan, phase 5).
+With `unclip` scores (the aligner's own), a clipped read is realigned end to end inside the reference widened by
+its clips (`generate.realign`), unless a clipped end differs from the reference at more than 30% of its bases.
+
 ponytail: records with N or P ops are skipped. Per-read trajectories are still to come (phase 5).
 """
 
@@ -35,7 +40,7 @@ import pysam
 
 from sequencing_error_model.fit import error, indel, quality
 from sequencing_error_model.fit.quality import Array
-from sequencing_error_model.generate import Read, _revcomp, align, indel_events, observations
+from sequencing_error_model.generate import _CIGAR, Read, _revcomp, align, indel_events, observations, realign
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component, ErrorModelSpec
 
@@ -43,10 +48,52 @@ _OPS = "MIDNSHP=X"
 _NO_TRACK = np.zeros(0, np.int64)
 _BASE = {"A": 0, "C": 1, "G": 2, "T": 3}  # pileup columns; 4 deletion, 5 insertion before the site
 _COMPLEMENT = {"A": "T", "C": "G", "G": "C", "T": "A"}
+_UNCLIP_MARGIN = 16  # reference bases beyond the clips, room for indels inside them
+Scores = tuple[int, int, int, int]  # match, mismatch, gap open, gap extend
 
 
-def _aligned(bam: Path, reference: Path, min_mapq: int) -> Iterator[tuple[str, int, int, bool, str, Read, int]]:
-    """(contig, start, end, reverse, template, read, mate) per usable record, in read orientation."""
+def _unclipped(
+    fasta: pysam.FastaFile,
+    contig: str,
+    start: int,
+    end: int,
+    sequence: str,
+    qual: list[int],
+    a: int,
+    b: int,
+    scores: Scores,
+    max_divergence: float = 0.3,
+) -> tuple[int, int, str, str, list[tuple[str, int]]] | None:
+    """The whole read realigned inside the reference widened by its soft clips (read bases before `a` and from
+    `b`), as (start, end, template, aligned bases, CIGAR); None when a formerly clipped end differs from the
+    reference at more than `max_divergence` of its bases (adapters, chimeras), which keeps the aligner's clip.
+
+    ponytail: a fixed divergence cap, and a full (unbanded) DP over the window, fine for short reads; model
+    adapters, or band the DP, if real runs need it."""
+    trail = len(sequence) - b
+    lo = max(0, start - a - _UNCLIP_MARGIN)
+    hi = min(fasta.get_reference_length(contig), end + trail + _UNCLIP_MARGIN)
+    window = fasta.fetch(contig, lo, hi).upper()
+    placed, s0, s1 = realign(window, Read(sequence, _phred(qual), "", _NO_TRACK), scores, free_template_ends=True)
+    edits, ri, ti = [0, len(placed.clipped[1])], 0, s0  # trailing insertions came back as clipped bases
+    for n, op in _CIGAR.findall(placed.cigar):
+        for _ in range(int(n)):
+            side = 0 if ri < a else 1 if ri >= b else -1
+            bad = op != "M" or sequence[ri].upper() != window[ti]
+            ri, ti = ri + (op != "D"), ti + (op != "I")
+            if side >= 0:
+                edits[side] += bad
+    if any(e > max_divergence * s for e, s in zip(edits, (a, trail), strict=True) if s):
+        return None
+    cigar = [(op, int(n)) for n, op in _CIGAR.findall(placed.cigar)]
+    return lo + s0, lo + s1, window[s0:s1], placed.sequence, cigar
+
+
+def _aligned(
+    bam: Path, reference: Path, min_mapq: int, unclip: Scores | None = None
+) -> Iterator[tuple[str, int, int, bool, str, Read, int]]:
+    """(contig, start, end, reverse, template, read, mate) per usable record, in read orientation. With `unclip`
+    scores, soft-clipped records are realigned end to end (`_unclipped`)."""
     with (
         pysam.AlignmentFile(str(bam), reference_filename=str(reference)) as aln,
         pysam.FastaFile(str(reference)) as fasta,
@@ -71,8 +118,17 @@ def _aligned(bam: Path, reference: Path, min_mapq: int) -> Iterator[tuple[str, i
             cigar = [("M" if o > 6 else _OPS[o], n) for o, n in ops if o not in (4, 5)]  # =/X → M, drop clips
             if any(o in "NP" for o, _ in cigar):
                 continue
-            template = fasta.fetch(contig, r.reference_start, end).upper()
-            a, b, full = r.query_alignment_start, r.query_alignment_end, list(qual)
+            start, full = r.reference_start, list(qual)
+            a, b = r.query_alignment_start, r.query_alignment_end
+            template = fasta.fetch(contig, start, end).upper()
+            if (
+                unclip is not None
+                and (a or b < len(full))
+                and r.query_sequence
+                and (found := _unclipped(fasta, contig, start, end, r.query_sequence, full, a, b, unclip))
+            ):
+                start, end, template, seq, cigar = found
+                a, b = 0, len(seq)
             before, q, after = full[:a], full[a:b], full[b:]
             if r.is_reverse:
                 template, seq, cigar = _revcomp(template), _revcomp(seq), cigar[::-1]
@@ -88,15 +144,20 @@ def _aligned(bam: Path, reference: Path, min_mapq: int) -> Iterator[tuple[str, i
                 (_phred(before), _phred(after)),
                 "-" if r.is_reverse else "+",
             )
-            yield contig, r.reference_start, end, r.is_reverse, template, read, 2 if r.is_read2 else 1
+            yield contig, start, end, r.is_reverse, template, read, 2 if r.is_read2 else 1
 
 
 def records(
-    bam: Path, reference: Path, min_mapq: int = 20, masked: dict[str, Array] | None = None
+    bam: Path,
+    reference: Path,
+    min_mapq: int = 20,
+    masked: dict[str, Array] | None = None,
+    unclip: Scores | None = None,
 ) -> Iterator[tuple[str, Read, int]]:
     """(template, read, mate) per usable record, in file order. With `masked` (a boolean site mask per kept
-    contig, from `masks`), reads on other contigs are skipped and masked sites produce no rows."""
-    return apply_masks(_aligned(bam, reference, min_mapq), masked)
+    contig, from `masks`), reads on other contigs are skipped and masked sites produce no rows. With `unclip`
+    scores, soft-clipped reads are realigned end to end."""
+    return apply_masks(_aligned(bam, reference, min_mapq, unclip), masked)
 
 
 Alignment = tuple[str, int, int, bool, str, Read, int]  # contig, start, end, reverse, template, read, mate
@@ -119,12 +180,12 @@ def _phred(q: Sequence[int]) -> str:
     return "".join(chr(v + 33) for v in q)
 
 
-def pileup(bam: Path, reference: Path, min_mapq: int = 20) -> dict[str, Array]:
+def pileup(bam: Path, reference: Path, min_mapq: int = 20, unclip: Scores | None = None) -> dict[str, Array]:
     """Per contig, (length + 1) x 6 allele counts in reference orientation: A, C, G, T, deletion, insertion
     before the site. Uses the same records and CIGAR walk as `records`."""
     with pysam.FastaFile(str(reference)) as fasta:
         lengths = dict(zip(fasta.references, fasta.lengths, strict=True))
-    return count_alleles(_aligned(bam, reference, min_mapq), lengths)
+    return count_alleles(_aligned(bam, reference, min_mapq, unclip), lengths)
 
 
 def count_alleles(alignments: Iterable[Alignment], lengths: dict[str, int]) -> dict[str, Array]:
@@ -241,15 +302,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--mask-alt-freq", type=float, help="mask sites with a non-reference allele at this frequency")
     p.add_argument("--min-contig-depth", type=float, default=0.0, help="drop contigs below this mean depth")
     p.add_argument("--contig-report", type=Path, metavar="TSV", help="per-contig depth, raw error rate, masks")
+    p.add_argument(
+        "--unclip",
+        nargs=4,
+        type=int,
+        metavar=("MATCH", "MISMATCH", "OPEN", "EXTEND"),
+        help="realign soft-clipped reads end to end with these scores (minibwa, bwa-mem: 2 8 12 2)",
+    )
     args = p.parse_args(argv)
+    unclip: Scores | None = (args.unclip[0], args.unclip[1], args.unclip[2], args.unclip[3]) if args.unclip else None
     provenance: dict[str, Any] = {
         "mode": "reference",
         "sources": [str(args.bam), str(args.reference)],
         "min_mapq": args.min_mapq,
+        "unclip": args.unclip,
     }
     masked = None
     if args.mask_alt_freq is not None or args.min_contig_depth > 0 or args.contig_report:
-        counts = pileup(args.bam, args.reference, args.min_mapq)
+        counts = pileup(args.bam, args.reference, args.min_mapq, unclip)
         masked, report = masks(counts, args.reference, args.mask_alt_freq, args.min_contig_depth)
         provenance |= {
             "mask_alt_freq": args.mask_alt_freq,
@@ -264,12 +334,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 writer.writeheader()
                 writer.writerows(report)
     flank, m = window(args.error_tokens, args.quality_tokens)
-    reads = islice(records(args.bam, args.reference, args.min_mapq, masked), args.max_reads)
+    reads = islice(records(args.bam, args.reference, args.min_mapq, masked, unclip), args.max_reads)
     per_event = any(Component(t).name == "IndelLength" for t in args.error_tokens)
     table = observations(reads, flank, m, "bam", per_event)
     indels = None
     if per_event:  # a second pass over the same records
-        indels = indel_events(islice(records(args.bam, args.reference, args.min_mapq, masked), args.max_reads), "bam")
+        again = records(args.bam, args.reference, args.min_mapq, masked, unclip)
+        indels = indel_events(islice(again, args.max_reads), "bam")
     if not table.counts:
         p.error("no usable aligned reads")
     # Q windows can reach clipped bases, whose Q never appears at a centre.
