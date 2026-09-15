@@ -55,6 +55,7 @@ class Read:
     q_track: Array  # template-indexed Q, deleted positions included
     clipped: tuple[str, str] = ("", "")  # Phred+33 Q of unaligned read bases before and after the aligned part
     strand: str | None = None  # alignment strand; None: the generator's convention, "-" for mate 2
+    masked: frozenset[int] = frozenset()  # template indices whose draws produce no rows (masked reference sites)
 
 
 def gc_bin(template: str) -> tuple[int, int]:
@@ -237,8 +238,8 @@ def observations(
     The Q window is template-indexed from the read: a deleted base takes the Q of the next read base (the
     previous one at the read end), so windows touching a deletion differ from the generator's Q track.
     A read's `clipped` bases shift `pos_start` / `pos_end` to the read's own ends and fill Q windows past the
-    aligned part; `strand` overrides the mate-based strand. Rows at template bases other than A, C, G, T are
-    skipped.
+    aligned part; `strand` overrides the mate-based strand. Rows at template bases other than A, C, G, T, or
+    at `masked` template indices, are skipped.
     """
     left, right = flank
     fields = ("q", *(f"q{s}{o}" for o in range(1, m + 1) for s in "-+"))
@@ -257,7 +258,7 @@ def observations(
         strand = read.strand or ("-" if mate == 2 else "+")
         for t, op in rows:
             i = t + len(before)
-            if template[t].upper() not in "ACGT" or filled[i] is None:
+            if template[t].upper() not in "ACGT" or filled[i] is None or t in read.masked:
                 continue
             window = tuple(
                 filled[i + o] if 0 <= i + o < len(filled) else None for k in range(1, m + 1) for o in (-k, k)
