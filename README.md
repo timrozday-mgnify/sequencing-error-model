@@ -1,6 +1,7 @@
 # sequencing-error-model
 
-> Working name. Early planning stage: there is no usable functionality yet.
+> Working name. Early development: the native generator and the `pe-overlap` mode work; the `reference`
+> and `kmer` modes and the exporters are planned.
 
 Train sequencing error models from read evidence. Models are
 quality-aware: they estimate the error profile of a base from its reported quality and the
@@ -24,6 +25,21 @@ Further sources (ONT duplex reads, GATK/DADA2 error tables) come later.
 
 See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for scope, feasibility,
 limitations and the phased plan.
+
+## Usage
+
+Fit a model from paired Illumina reads whose mates overlap (amplicon or short-insert libraries). See
+[docs/pe_overlap.md](docs/pe_overlap.md) for what it identifies and its limits:
+
+```bash
+uv run python -m sequencing_error_model.sources.pe_overlap reads_R1.fastq.gz reads_R2.fastq.gz --output spec/
+```
+
+Simulate reads (bases, qualities and CIGAR) from a spec, as single templates or as standalone pairs:
+
+```bash
+uv run sem-generate --model spec/ --input genome.fasta --output reads.fastq --pairs 10000 --read-length 125 --insert-mean 300 --insert-sd 50
+```
 
 ## Development
 
