@@ -31,6 +31,7 @@ from sequencing_error_model import spec as spec_io
 from sequencing_error_model.fit import error, indel, quality
 from sequencing_error_model.fit.quality import Array
 from sequencing_error_model.generate import (
+    _CIGAR,
     Read,
     _edits,
     _flank,
@@ -273,6 +274,37 @@ def indel_profile(records: Sequence[tuple[str, Read, int]], max_length: int = 4)
     }
 
 
+def indel_components(a: ErrorModelSpec, b: ErrorModelSpec, table: CountTable) -> dict[str, float]:
+    """Per-component indel check (plan phase 5): expected deletion (D) and insertion (I) counts under head E of
+    `b` over those under `a`, on `table`'s rows, grouped by the centre base's homopolymer run inside the context
+    window (`Homopolymer`: "D run 3+") and by the base at each context offset (`Context`: "I -1G"). On random
+    templates the other components average out of each group, so a ratio away from 1 is that component's indel
+    effect moved; the phase 2 per-Q tolerance (10%) applies."""
+    n = np.array(list(table.counts.values()), float)
+    expected = {}
+    for name, s in (("a", a), ("b", b)):
+        p = error.probabilities(indel.split(s.error_head)[0], a.quality_alphabet, table)
+        expected[name] = {"D": n * p[:, 9], "I": n * p[:, 5:9].sum(axis=1)}
+    f0 = table.meta["flank"][0]
+    contexts = [str(k[table.fields.index("context")]) for k in table.counts]
+    runs = []
+    for c in contexts:
+        left = len(c[: f0 + 1]) - len(c[: f0 + 1].rstrip(c[f0]))
+        right = len(c[f0:]) - len(c[f0:].lstrip(c[f0]))
+        runs.append(_RUNS[min(left + right - 1, 3) - 1])
+    groups = {f"run {r}": np.array(runs) == r for r in _RUNS}
+    chars = np.array([list(c) for c in contexts])
+    for i in range(chars.shape[1]):
+        for base in "ACGT":
+            groups[f"{i - f0:+d}{base}"] = chars[:, i] == base
+    return {
+        f"{kind} {g}": round(float(expected["b"][kind][sel].sum() / expected["a"][kind][sel].sum()), 3)
+        for kind in ("D", "I")
+        for g, sel in groups.items()
+        if sel.any()
+    }
+
+
 def _refit_error(truth: ErrorModelSpec, table: CountTable, records: Sequence[tuple[str, Read, int]]) -> ErrorModelSpec:
     """The truth with head E (and any `IndelLength`) refitted with its tokens from `table` and `records`."""
     body, length_head = indel.split(truth.error_head)
@@ -371,6 +403,44 @@ ALIGNER_SCORES = {"minibwa": (2, 8, 12, 2), "minimap2": (2, 4, 4, 2)}  # match, 
 ALIGNER_READS = {"minibwa": (100, 151), "minimap2": (1000, 2001)}  # default read lengths: short, long
 
 
+def _flip(read: Read) -> Read:
+    """`read` on the other strand: bases reverse-complemented; Q, CIGAR and clips reversed."""
+    return replace(
+        read,
+        sequence=_revcomp(read.sequence),
+        quality=read.quality[::-1],
+        cigar="".join(f"{n}{op}" for n, op in reversed(_CIGAR.findall(read.cigar))),
+        q_track=read.q_track[::-1],
+        clipped=(read.clipped[1][::-1], read.clipped[0][::-1]),
+    )
+
+
+def realign_observable(
+    window: str, read: Read, reverse: bool, scores: tuple[int, int, int, int]
+) -> tuple[Read, int, int]:
+    """The read's best alignment inside `window` (forward reference strand; the read is from the reverse strand
+    if `reverse`), with free template ends: (the read in read orientation, window start, end).
+
+    The DP runs on the forward strand, so equal-score gaps are left-aligned on the reference, where the aligners
+    put them. Left-aligned in read orientation instead, 745 of minibwa's 748 tied reads differed, all on the
+    reverse strand, and deletions after G read 1.2x high."""
+    best, s0, s1 = realign(window, _flip(read) if reverse else read, scores, free_template_ends=True)
+    if not reverse:
+        return best, s0, s1
+    best = _flip(best)
+    ops = _CIGAR.findall(best.cigar)
+    if ops and ops[-1][1] == "I":  # a leading insertion on the forward strand: clipped, as `sources.bam` does
+        n = int(ops[-1][0])
+        best = replace(
+            best,
+            sequence=best.sequence[:-n],
+            quality=best.quality[:-n],
+            cigar="".join(f"{c}{op}" for c, op in ops[:-1]),
+            clipped=(best.clipped[0], best.quality[-n:] + best.clipped[1]),
+        )
+    return best, s0, s1
+
+
 def run_aligner(aligner: str, reference: Path, reads: Path, sam: Path, preset: str = "map-ont") -> None:
     """Align single-end FASTQ `reads` to `reference` as SAM: minibwa for short reads, minimap2 (`-x preset`) for
     long reads."""
@@ -411,7 +481,8 @@ def aligner_bias(
     Generated CIGARs can hold edits no alignment recovers (a deletion and an insertion of one base in a
     homopolymer run cancel), so the metrics are also reported against the observable truth: each whole true read
     `realign`ed under the aligner's own scores (`ALIGNER_SCORES`, first affine gap of each) to the genome around
-    its true span, with free template ends, indels left-aligned (`*_observable`, plus indel rates and lengths by
+    its true span, with free template ends, indels left-aligned on the reference (`realign_observable`; `*_observable`,
+    plus indel rates and lengths by
     run). The true span's ends aren't observable either: an indel next to a read end can score the same or worse
     than a shifted end. That isolates the aligner's heuristics
     (seeding, bands, clipping); `edits_hidden` and `observable_rate_ratio` size what even the optimal alignment
@@ -445,10 +516,9 @@ def aligner_bias(
     observed = []  # (forward start, forward end, template, read)
     for s, k, rev, r in zip(start, size, reverse, reads, strict=True):
         lo, hi = max(0, int(s) - margin), min(genome_length, int(s + k) + margin)
-        window = _revcomp(genome[lo:hi]) if rev else genome[lo:hi]
-        best, s0, s1 = realign(window, r, scores, free_template_ends=True)
-        span = (hi - s1, hi - s0) if rev else (lo + s0, lo + s1)
-        observed.append((*span, window[s0:s1], best))
+        best, s0, s1 = realign_observable(genome[lo:hi], r, bool(rev), scores)
+        template = genome[lo + s0 : lo + s1]
+        observed.append((lo + s0, lo + s1, _revcomp(template) if rev else template, best))
     o_templates, observable = [o[2] for o in observed], [o[3] for o in observed]
     true_table, aligned_table = _tuples(truth, templates, reads, mates), _tuples(truth, a_templates, a_reads, a_mates)
     observable_table = _tuples(truth, o_templates, observable, mates)
@@ -499,6 +569,9 @@ def aligner_bias(
     report = compare(truth, fitted, held, held_mates, rng, q_reads=len(held))
     against_observable = compare(observable_fit, fitted, held, held_mates, rng, q_reads=len(held))
     identified = compare(truth, observable_fit, held, held_mates, rng, q_reads=len(held))
+    held_table = _tuples(truth, held, generate(truth, held, held_mates, rng), held_mates)
+    components = indel_components(truth, fitted, held_table)
+    components_observable = indel_components(observable_fit, fitted, held_table)
 
     def by_q(r: Report) -> list[float]:
         ratio = np.array(r.curves["rate_by_q_fit"]) / np.array(r.curves["rate_by_q_true"])
@@ -552,6 +625,11 @@ def aligner_bias(
         "op_tv_observable": against_observable.scalars["op_tv"],
         "rate_by_q_ratio_observable": by_q(against_observable),
         "failures_observable": error_failures(against_observable),
+        "indel_components": components,
+        "indel_components_observable": components_observable,
+        "indel_component_failures_observable": {
+            k: v for k, v in components_observable.items() if abs(v - 1) > TOLERANCES["rate_by_q"]
+        },
     }
 
 

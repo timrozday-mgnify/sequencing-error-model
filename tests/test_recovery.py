@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -43,12 +44,44 @@ def test_realign_is_optimal_and_left_aligned() -> None:
     assert hidden > 0  # the generator's CIGARs carry edits no alignment recovers
 
 
+def test_observable_left_aligns_on_the_reference() -> None:
+    # A reverse-strand read with one G of the GGG run deleted: the gap sits at the run's first base on the
+    # forward strand (6M1D7M there), so at its last base in read orientation.
+    window, forward = "GATCACGGGTCATG", "GATCACGGTCATG"
+    read = gen.Read(gen._revcomp(forward), "ABCDEFGHIJKLM", "", np.zeros(0, np.int64))
+    best, start, end = recovery.realign_observable(window, read, True, recovery.ALIGNER_SCORES["minibwa"])
+    assert (best.cigar, best.sequence, best.quality, start, end) == ("7M1D6M", read.sequence, read.quality, 0, 14)
+    # An insertion before the window's first base (1I14M forward) ends the read: clipped, as `sources.bam` does.
+    read = gen.Read(gen._revcomp("T" + window), "ABCDEFGHIJKLMNO", "", np.zeros(0, np.int64))
+    best = recovery.realign_observable(window, read, True, recovery.ALIGNER_SCORES["minibwa"])[0]
+    assert (best.cigar, best.sequence, best.clipped) == ("14M", read.sequence[:-1], ("", "O"))
+
+
 def test_cigar_mode_recovers_example_spec() -> None:
     truth = recovery.example_spec()
     fitted, report = recovery.recover(truth, n_reads=3000, seed=3)
     assert [c.token for c in fitted.error_head] == [c.token for c in truth.error_head]
     assert report.failures() == [], report.scalars
     assert abs(report.scalars["q_lag1_fit"] - report.scalars["q_lag1_true"]) < 0.05, report.scalars
+
+
+def test_indel_components_isolate_homopolymer_and_context() -> None:
+    truth = recovery.example_spec()
+    rng = np.random.default_rng(0)
+    templates = ["".join(rng.choice(list("ACGT"), size=40)) for _ in range(2000)]
+    mates = [1] * len(templates)
+    table = recovery._tuples(truth, templates, gen.generate(truth, templates, mates, rng), mates)
+    assert set(recovery.indel_components(truth, truth, table).values()) == {1.0}
+
+    head = list(truth.error_head)
+    runs, ctx = (head[i].params["weights"].copy() for i in (2, 1))
+    runs[2:, 5:] = 0.0  # no homopolymer effect on indels
+    ctx[0, 0, 9] = 1.0  # deletions after A
+    head[2] = replace(head[2], params={"weights": runs})
+    head[1] = replace(head[1], params={"weights": ctx})
+    moved = recovery.indel_components(truth, replace(truth, error_head=tuple(head)), table)
+    assert moved["D run 3+"] < 0.5 and moved["I run 3+"] < 0.5 and moved["I run 1"] > 0.9
+    assert moved["D -1A"] > 1.5 * moved["D -1C"] and 0.9 < moved["I -1A"] / moved["I -1C"] < 1.1
 
 
 def test_cli_writes_report(tmp_path: Path) -> None:

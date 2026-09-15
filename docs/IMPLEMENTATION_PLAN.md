@@ -693,17 +693,41 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 
     | truth | aligner | reads | edits hidden | vs truth | vs observable | vs observable, `--unclip` | indels in runs of 3+ vs observable (D / I) |
     |---|---|---|---|---|---|---|---|
-    | example, scale 0.1 | minibwa | 3,000 × 100–150 bp | 0.8% | 0.984 | 0.978 | 1.002 | 1.00 / 0.94 (`--unclip`) |
-    | `IndelLength`, scale 0.25 | minibwa | 4,000 × 100–150 bp | 3.8% | **0.926** | 0.961 | 1.003 | 0.92 / 0.86; 0.98 / 0.95 (`--unclip`) |
-    | example | minimap2 `map-ont` | 400 × 1–2 kb | 2.3% | 0.975 | 0.996 | – | 0.95 / 0.91 |
-    | `IndelLength` | minimap2 `map-ont` | 600 × 1–2 kb | 7.4% | **0.915** | 1.001 | – | 0.96 / 0.95 |
+    | example, scale 0.1 | minibwa | 3,000 × 100–150 bp | 0.7% | 0.984 | 0.977 | 1.000 | 0.96 / 0.94; 1.00 / 1.00 (`--unclip`) |
+    | `IndelLength`, scale 0.25 | minibwa | 4,000 × 100–150 bp | 3.8% | **0.926** | 0.956 | 0.998 | 0.95 / 0.91; 1.00 / 1.00 (`--unclip`) |
+    | example | minimap2 `map-ont` | 400 × 1–2 kb | 2.3% | 0.975 | 0.993 | – | 0.98 / 1.00 |
+    | `IndelLength` | minimap2 `map-ont` | 600 × 1–2 kb | 7.4% | **0.915** | 0.995 | – | 0.99 / 0.99 |
 
-  - Against the observable truth on the `IndelLength` truth, indel rates by kind and run are 0.95–1.04 for minimap2 and for minibwa with `--unclip`, length TV ≤ 0.04, and site agreement 0.73–0.78 for indels. Most of the site disagreement against the generator's CIGARs was equivalent placement.
+    Observable columns are against the forward-strand observable (below).
+
+  - Against the observable truth on the `IndelLength` truth, with minimap2 and minibwa `--unclip`:
+    - indel rates by kind and run are 0.98–1.00;
+    - length TV is ≤ 0.014;
+    - indel site agreement is 0.97–0.99, up from 0.73–0.78 against the read-orientation observable, whose tie-break placed reverse reads' gaps elsewhere.
+  - Without `--unclip`, minibwa's indel site agreement is 0.85–0.94. Most of the site disagreement against the generator's CIGARs was equivalent placement.
   - **Free template ends** (2026-09-15). The observable truth first aligned each read end to end on its true template. That span isn't observable: an indel a few bases from a read end ties with, or loses to, a shifted end (`110M1I1M` vs `110M2D2M`). About 40% of minibwa's remaining 3+-run indel loss was this. The observable now realigns each whole read inside the genome around its true span (±16 bases) with free template ends.
   - A unit-cost observable was tried first and rejected. Substitutions and indels tie under unit costs, so its tie-break either split long indels (length TV 0.15–0.22) or inflated indels (deletion ratio 0.75).
 - ✓ **Soft-clipping correction** (`bam --unclip MATCH MISMATCH OPEN EXTEND`, `recovery --aligner … --unclip`). minibwa's indel loss is clipping. On the `IndelLength` run, 14% of reads were clipped and those kept 55% of their edits, while unclipped reads matched the optimal alignment (NM 1.004×). A clipped read is realigned end to end inside the reference widened by its clips (`realign` with free template ends), unless a clipped end of 8+ bases differs from the reference at more than half its bases (adapters, chimeras). Test: errors in a clipped end, including a 3-base clip, come back as rows; a clipped adapter stays clipped.
   - The cap was 30% of any clip at first, which rejected 390 of 542 clipped reads: one error in a 2–3 base clip exceeds it. Realigned with no cap, clips holding only sequencing errors reach 0.42–0.67 divergence at the 90th percentile from 8 bases on, and random 8+ base ends 0.75–0.91 at the median. Below 8 bases the two overlap, so short clips are always realigned. At 0.5 the cap rejects 4–19% of error clips and 76–96% of random ends of 8+ bases.
-  - **Open:** whether `--unclip` should default on for short reads (check on a real run with adapters first; short adapter remnants under 8 bases are now realigned); the unclip DP and the free-ends observable are unbanded, so long reads need a band (the minimap2 rows take 2–3 minutes); per-component checks of `Homopolymer` and `Context` on indels, beyond rates.
+  - **Open:** whether `--unclip` should default on for short reads (check on a real run with adapters first; short adapter remnants under 8 bases are now realigned); the unclip DP and the free-ends observable are unbanded, so long reads need a band (the minimap2 rows take 2–3 minutes).
+- ✓ **Indel components** (`recovery.indel_components`, in `aligner_bias` as `indel_components*`). Both specs' head E on held-out tuples: expected deletions and insertions, fitted over reference, grouped by the centre base's homopolymer run (`Homopolymer`) and by the base at each context offset (`Context`). On random templates the other components average out of each group. The phase 2 per-Q tolerance (10%) applies. Test: removing the truth's run effect on indels moves only runs of 3+, and a deletion-after-A context weight moves only deletions.
+  - Aligned fit over observable fit, same runs as the table above:
+
+    | truth | aligner | D by run 1 / 2 / 3+ | I by run 1 / 2 / 3+ | context groups off by > 10% |
+    |---|---|---|---|---|
+    | example, scale 0.1 | minibwa `--unclip` | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | 0 of 40 |
+    | `IndelLength`, scale 0.25 | minibwa `--unclip` | 1.00 / 0.99 / 1.00 | 0.99 / 1.00 / 1.00 | 0 of 40 |
+    | `IndelLength`, scale 0.25 | minibwa | 0.92 / 0.95 / 0.97 | **0.88** / 0.91 / 0.94 | 3 of 40 (0.89–0.90) |
+    | example | minimap2 `map-ont` | 0.98 / 0.95 / 0.98 | 0.98 / 0.98 / 0.99 | 0 of 40 |
+    | `IndelLength` | minimap2 `map-ont` | 1.00 / 0.98 / 0.99 | 0.99 / 1.00 / 0.99 | 0 of 40 |
+    | `IndelLength`, `Context` zeroed, scale 0.25 | minibwa `--unclip` | 1.00 / 0.99 / 1.00 | 0.99 / 1.00 / 1.00 | 0 of 40 |
+    | `IndelLength`, `Context` zeroed | minimap2 `map-ont` | 0.99 / 0.99 / 0.99 | 1.00 / 1.00 / 0.99 | 0 of 40 |
+
+  - `Homopolymer` and `Context` on indels are met for minimap2 and for minibwa with `--unclip`: every group within 5%, most within 1%. Without `--unclip`, minibwa loses about 10% of insertions in every group, which is clipping (above), not a component shift.
+- ✓ **Forward-strand observable** (`recovery.realign_observable`). The first indel components run failed `Context` on deletions with both aligners: deletions after G 1.14–1.41, before G 0.81–0.89. It persisted with the truth's G substitution hotspot zeroed, since G stays an error hotspot through head Q's low Q on G.
+  - Scoring the aligned CIGARs under the aligner's scores showed ties. On the `IndelLength` truth with `Context` zeroed, minibwa aligned 2,791 reads as the observable did, 748 at an equal score but a different placement, and 7 worse; the whole G shift was in the tied reads.
+  - 745 of the 748 tied reads were on the reverse strand (minimap2: 131 reverse, 40 forward, split evenly by direction). The aligners left-align gaps on the reference, but `realign` ran in read orientation, which right-aligns reverse reads on the reference.
+  - The observable now realigns on the forward strand and flips back; a leading insertion there becomes a clipped read end, as in `sources.bam`. Tests: a reverse read's deletion in a GGG run sits at the run's first base on the reference, and a leading forward insertion comes back clipped.
 - ✓ **Clonal cost of masks** (`recovery.mask_cost`, `python -m sequencing_error_model.recovery --mask-cost`). Reads come from one random genome, placed on both strands, so every mismatch is an error. Masks are computed with `bam.count_alleles` / `bam.site_masks` / `bam.apply_masks`, the BAM path's cores without file I/O. For each `max_alt_freq` it reports masked sites, removed rows and errors by op class, the most enriched trinucleotide contexts among removed errors, and a head E refit on the kept tuples against the truth on held-out reads: phase 2 rate tolerances, op TV, and the slope of fitted on true `Context` log-odds. The contig depth filter isn't measured: it selects whole contigs on depth, not on the outcome.
   - Example spec (14% row error rate, so a harsh case), 20 kb genome, depth 30, 16,901 reads (72 s):
 
@@ -727,7 +751,7 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - **Open:** running it on a real near-clonal Illumina run (phase 5 exit); per-component comparison (context log-odds, position curve) beyond rates; expected-gap declarations for other mode pairs (`kmer`, phase 6).
 - **Baseline harness.** The phase 3 metrics computed on real reads vs reads from (a) the native generator, (b) ReSeq for Illumina, (c) Badread, PBSIM3 and CycSim for long reads, each simulator trained by its own profiler on the same alignment. Add k-mer spectrum concordance and context-dependent substitution rates, the metrics of the 2026 ONT benchmark.
 - **Exit:**
-  - on generated reads aligned back to their genome, the full spec (including indel lengths and homopolymer effects) is recovered within the phase 2 tolerances, after correcting for the measured aligner bias. Redefined 2026-09-15 against the observable truth (aligner bias check above). Rates, indel lengths and indel rates by homopolymer run (within 10%) are met for minimap2, and for minibwa with `--unclip`; per-component `Homopolymer` and `Context` checks on indels remain;
+  - on generated reads aligned back to their genome, the full spec (including indel lengths and homopolymer effects) is recovered within the phase 2 tolerances, after correcting for the measured aligner bias. Redefined 2026-09-15 against the observable truth (aligner bias check above). Rates, indel lengths and indel rates by homopolymer run (within 10%) are met for minimap2, and for minibwa with `--unclip`, and so are `Homopolymer` and `Context` on indels (indel components above);
   - the clonal cost of each mask is reported, and masks that bias a head E component beyond the phase 2 tolerances on clonal reads are off by default;
   - on one real near-clonal Illumina dataset (isolate, spike-in or amplicon mock), `pe-overlap` and `reference` specs agree per component on shared support within tolerance, or the report explains each disagreement;
   - `QualityWindow` beats the centre-Q-only head E on held-out likelihood, or the report shows it doesn't;
