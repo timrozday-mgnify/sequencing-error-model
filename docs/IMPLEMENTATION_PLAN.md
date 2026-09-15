@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py` and the head Q and head E fitters landed; selection is next); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
 
 ## 1. Goal
 
@@ -509,7 +509,7 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   Each row is one template base with a true centre base; an insertion and a substitution at the same base can't both be counted yet (revisit with `reference` tuples). Recovery test on labels sampled from a known head: Q-window, context (substitutions) and homopolymer (indels) log-odds correlate r > 0.9, the error rate per reported-Q bin is within 10% and the marginal rate within 5%, with a truth far from 10^(−Q/10).
 
   The `kmer` default fitters (latent edit position, marginal matching) are in phase 6.
-- Criterion-based selection per head (AIC/BIC on held-out reads).
+- ✓ Criterion-based selection per head (`select.py`): greedy forward search as in the fork, screening variants of the required first component (`QualityMarkov(m)` / `QualityWindow(m)`), then adding the candidate group that most improves the criterion until none does. Both heads expose `log_likelihood`; criteria are scored on a held-out table split by read. The default is held-out log-likelihood (`test-ll`); `aic`/`bic` are available, but with raw parameter counts (gauge and masked cells included) BIC rejected real position and neighbouring-Q effects in the recovery tests. Tests: head Q selects every true component; head E keeps the true Q window and context and rejects `Mate` and `Strand`, which have no true effect.
 - **Exit:** on observation tuples sampled from a known spec:
   - recovered context and quality-window log-odds correlate with truth (r > 0.9 for dominant effects);
   - the error rate implied per reported-Q bin is within 10% of truth;

@@ -107,13 +107,9 @@ def _check(components: Sequence[Component]) -> None:
             raise ValueError(f"bad arguments in {c.token!r}")
 
 
-def fit(table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2: float = 1.0) -> tuple[Component, ...]:
-    """Fit head Q components (in `tokens` order) by penalised maximum likelihood.
-
-    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge.
-    """
-    components = [Component(t) for t in tokens]
-    _check(components)
+def _table(table: CountTable, components: Sequence[Component], alphabet: Sequence[int]) -> tuple[Array, _Rows]:
+    """Validate `table` for `components`; return counts [R, K] and the covariate rows."""
+    tokens = [c.token for c in components]
     k, qi = len(alphabet), table.fields.index("q")
     q_index: dict[Any, int] = {q: i for i, q in enumerate(alphabet)}
     keys: dict[Key, int] = {}
@@ -151,6 +147,18 @@ def fit(table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2
         _BASE[np.frombuffer(context.encode(), np.uint8)].reshape(n_rows, -1),
         flank,
     )
+    return counts, rows
+
+
+def fit(table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2: float = 1.0) -> tuple[Component, ...]:
+    """Fit head Q components (in `tokens` order) by penalised maximum likelihood.
+
+    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge.
+    """
+    components = [Component(t) for t in tokens]
+    _check(components)
+    k = len(alphabet)
+    counts, rows = _table(table, components, alphabet)
     if any(c.name == "Position" for c in components):
         top = np.log(max(rows.pos_start.max(), rows.pos_end.max(), 2))
         components = [
@@ -181,6 +189,14 @@ def fit(table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2
             i += prod(shape)
         out.append(Component(c.token, params))
     return tuple(out)
+
+
+def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> float:
+    """Log-likelihood of `table`'s counts under fitted head Q components."""
+    _check(components)
+    counts, rows = _table(table, components, alphabet)
+    logits = _matrix(components, rows, len(alphabet)) @ _theta(components, len(alphabet))
+    return float(np.sum(counts * (logits - special.logsumexp(logits, axis=1, keepdims=True))))
 
 
 def sample(

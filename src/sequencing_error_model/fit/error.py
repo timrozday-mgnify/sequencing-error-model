@@ -212,16 +212,10 @@ def _mask(d: dict[str, Any]) -> Array:
     return mask
 
 
-def fit(
-    table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2: float = 1.0, seed: int = 0
-) -> tuple[Component, ...]:
-    """Fit head E components (in `tokens` order) by penalised maximum likelihood.
-
-    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge. `seed` initialises
-    the `QualityxContext` factors (zero is a saddle point).
-    """
-    components = [Component(t) for t in tokens]
-    _check(components)
+def _labelled(
+    table: CountTable, components: Sequence[Component], alphabet: Sequence[int]
+) -> tuple[Array, dict[str, Any]]:
+    """Validate a labelled table for `components`; return counts [R, K] and the feature columns."""
     if "op" not in table.fields:
         raise ValueError(f"{table.source}: head E needs op labels from a truth-bearing source")
     fields = [f for f in table.fields if f != "op"]
@@ -237,6 +231,29 @@ def fit(
     d = _data(fields, list(keys), alphabet, table.meta)
     counts = np.zeros((len(keys), _K))
     np.add.at(counts, (r_idx, cat), n)
+    return counts, d
+
+
+def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> float:
+    """Log-likelihood of a labelled table's counts under fitted head E components."""
+    _check(components)
+    counts, d = _labelled(table, components, alphabet)
+    logits = np.where(_mask(d), -np.inf, _logits(components, d))
+    logp = logits - special.logsumexp(logits, axis=1, keepdims=True)
+    return float(np.sum(counts[counts > 0] * logp[counts > 0]))
+
+
+def fit(
+    table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2: float = 1.0, seed: int = 0
+) -> tuple[Component, ...]:
+    """Fit head E components (in `tokens` order) by penalised maximum likelihood.
+
+    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge. `seed` initialises
+    the `QualityxContext` factors (zero is a saddle point).
+    """
+    components = [Component(t) for t in tokens]
+    _check(components)
+    counts, d = _labelled(table, components, alphabet)
 
     for i, c in enumerate(components):
         if c.name == "Position":
