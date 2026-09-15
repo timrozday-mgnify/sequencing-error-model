@@ -7,5 +7,6 @@ Guidance for AI agents working in this repo.
 - `main` only accepts PRs with green `lint` and `test` checks. Never push to `main` directly.
 - Prior art lives in `~/Documents/skiver` (fork of GZHoffie/skiver): `scripts/lib/context_error_models.py`, `error_application.py`, `model_selection.py` and `docs/hmm_error_model.md`. Port ideas and tests from there; don't copy its torch-pickle artifact format.
 - **Default mode must work with an unmodified, pinned skiver release.** Never make a default-mode code path depend on fork-only outputs (`skiver dump`, `windows.bin`, `fragment_id`, `read_id`).
+- **Reported quality scores are a feature and an output, never evidence of error.** No code path may derive error labels or error rates from Q (e.g. 10^(−Q/10)). Error models condition on the base, its quality, and the surrounding bases and qualities; the generator always emits bases and qualities (plan §5).
 - Every exporter needs a round-trip test: export, simulate, re-estimate, compare rates within tolerance.
 - Don't commit large skiver outputs or trained models. Test fixtures must be small (under 1 MB; the pre-commit hook enforces this).
