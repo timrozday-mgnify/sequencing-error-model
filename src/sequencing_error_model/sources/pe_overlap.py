@@ -201,6 +201,37 @@ def _row(
     return (q[p], *window, ctx[:left] + centre + ctx[left + 1 :], p + 1, n - p, mate, "+-"[mate - 1], gc, op)
 
 
+Groups = list[tuple[tuple[Key, Key, Key, Key], int]]
+
+
+def _expected(ev: Evidence, groups: Groups, first: Array) -> CountTable:
+    """Head E rows with each disagreement split by `first`, P(mate 1 read the template base)."""
+    counts: dict[Key, float] = dict(ev.certain)
+    for (rows, n), w in zip(groups, first, strict=True):
+        for r, c in zip(rows, (n * w, n * w, n * (1 - w), n * (1 - w)), strict=True):
+            counts[r] = counts.get(r, 0.0) + float(c)
+    expected = cast("Counter[Key]", Counter({k: v for k, v in counts.items() if v > 0}))
+    return CountTable("pe-overlap", fields(ev.m), "base", True, expected, {"flank": ev.flank})
+
+
+def _posterior(ev: Evidence, groups: Groups, error_head: Sequence[Component]) -> Array:
+    """P(mate 1 read the template base) per disagreement under `error_head`."""
+    alphabet, meta = tuple(sorted(ev.alphabet)), {"flank": ev.flank}
+    keys = Counter(dict.fromkeys((k for rows, _ in groups for k in rows), 1))
+    p = error.probabilities(error_head, alphabet, CountTable("pe-overlap", fields(ev.m), "base", True, keys, meta))
+    prob = {k: p[r, error._category(k[-1], str(k[-7])[ev.flank[0]])] for r, k in enumerate(keys)}
+    like = np.array([[prob[a1] * prob[a2], prob[b1] * prob[b2]] for (a1, a2, b1, b2), _ in groups])
+    return np.asarray(like[:, 0] / like.sum(axis=1))
+
+
+def table(ev: Evidence, error_head: Sequence[Component] | None = None) -> CountTable:
+    """The overlap's head E rows as expected counts, each disagreement split by P(mate 1 read the template base)
+    under `error_head` (e.g. the fitted spec's), or by a coin flip without one. The input `compare` takes."""
+    groups = list(ev.disputed.items())
+    first = np.full(len(groups), 0.5) if error_head is None or not groups else _posterior(ev, groups, error_head)
+    return _expected(ev, groups, first)
+
+
 def fit(
     ev: Evidence,
     error_tokens: Sequence[str],
@@ -223,26 +254,21 @@ def fit(
     they cut mean |log2(fitted / true rate)| over Q >= 30 from 1.54 to 0.97 (plan, phase 4).
     """
     alphabet, groups = tuple(sorted(ev.alphabet)), list(ev.disputed.items())
-    first, sizes = np.full(len(groups), 0.5), np.array([n for _, n in groups], float)
-    fields_, meta = fields(ev.m), {"flank": ev.flank}
+    first = np.full(len(groups), 0.5)
     error_head: tuple[Component, ...] | None = None
     for _ in range(max(iterations, 1)):
-        counts: dict[Key, float] = dict(ev.certain)
-        for (rows, _n), n, w in zip(groups, sizes, first, strict=True):
-            for r, c in zip(rows, (n * w, n * w, n * (1 - w), n * (1 - w)), strict=True):
-                counts[r] = counts.get(r, 0.0) + float(c)
-        expected = cast("Counter[Key]", Counter({k: v for k, v in counts.items() if v > 0}))
-        table = CountTable("pe-overlap", fields_, "base", True, expected, meta)
         error_head = error.fit(
-            table, error_tokens, alphabet, smooth=smooth, window_l2=window_l2, seed=seed, init=error_head
+            _expected(ev, groups, first),
+            error_tokens,
+            alphabet,
+            smooth=smooth,
+            window_l2=window_l2,
+            seed=seed,
+            init=error_head,
         )
         if not groups:
             break
-        keys = Counter(dict.fromkeys((k for rows, _ in groups for k in rows), 1))
-        p = error.probabilities(error_head, alphabet, CountTable("pe-overlap", fields_, "base", True, keys, meta))
-        prob = {k: p[r, error._category(k[-1], str(k[-7])[ev.flank[0]])] for r, k in enumerate(keys)}
-        like = np.array([[prob[a1] * prob[a2], prob[b1] * prob[b2]] for (a1, a2, b1, b2), _ in groups])
-        update = like[:, 0] / like.sum(axis=1)
+        update = _posterior(ev, groups, error_head)
         moved, first = np.abs(update - first).max(), update
         if moved < tol:
             break
