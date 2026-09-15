@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phase 0 (repo, CI and PR policy) is done; everything else is planned.
+Status: **draft, revised 2026-09-15**. Phase 0 (repo, CI and PR policy) is done; phase 1 is in progress (skiver analyze parsers, fixtures and `skiver-compat` landed); everything else is planned.
 
 ## 1. Goal
 
@@ -272,7 +272,7 @@ These are computed from the fitted heads, not fitted separately:
 
 **Default-mode marginal matching.** Unmodified skiver gives two error marginals, P(error | context) from `kvmer.csv` and P(error | centre Q) from `summary_phred.csv`. The FASTQ gives the exposure: the joint distribution of centre Q and observed context. Head E is fitted as log-additive context + centre-Q terms so that its implied marginals *under that exposure* reproduce both skiver marginals. This is raking/IPF-style, and it avoids double-counting when low Q and difficult context co-occur. Neighbouring-Q terms are unidentifiable here and fixed at zero. The spec records this, and exports carry it in their fidelity report.
 
-**Phase 1 must also pin down `summary_phred.csv`'s counting convention** in upstream skiver: whether it counts only the first value base, or all bases up to the first error. That convention affects the exposure used above.
+**`summary_phred.csv`'s counting convention** (pinned in phase 1 from upstream v0.3.2 `PhredScoreSummary`): each observed value is scanned from its first base against the consensus and stops at the first mismatch. Every base up to and including that mismatch contributes its own Q (matches to `num_correct`, the mismatch to `num_error`), over value positions t ∈ [1 + ignore_smallest_t, v − ignore_largest_t] only. The exposure for marginal matching is therefore the hazard-model exposure, not all value bases. The reported `per_base_error_rate` is a per-Q Weibull λ with the global β, not the raw count ratio. Details are in `sources/skiver_analyze.py`.
 
 ---
 
@@ -395,8 +395,8 @@ Each phase lands as one or more PRs with green CI. Exit criteria are testable.
 ### Phase 0: repository, CI and PR policy ✓
 uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), Linting, Testing and Release workflows, PR template, and a `main` ruleset requiring PRs with passing `lint` + `test`.
 
-### Phase 1: default-mode inputs
-- `sources/skiver_analyze.py`: typed, header-validated parsers for all v0.3.x analyze CSVs. Document `summary_phred.csv`'s counting convention (§5.6).
+### Phase 1: default-mode inputs (in progress)
+- ✓ `sources/skiver_analyze.py`: typed, header-validated parsers for all v0.3.x analyze CSVs. `summary_phred.csv`'s counting convention is documented (§5.6).
 - `sources/fastq_quality.py`: streaming quality-process statistics from raw FASTQ(.gz), per mate. Labelled in code and spec as a feature/output source, never as error evidence. Collects:
   - per-position Q histograms;
   - Q transition counts (order m);
@@ -404,8 +404,8 @@ uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), L
   - the joint centre Q × observed context exposure used for marginal matching;
   - read-length distribution.
 - `observations.py`: the sparse tuple schema shared by all sources.
-- **Fixtures.** A tiny synthetic genome plus reads with known injected errors *and qualities*, analysed by the *released* skiver binary. Fixture files are committed (< 1 MB).
-- **CI job `skiver-compat`.** Downloads skiver release binaries (matrix: v0.3.1, v0.3.2), regenerates the fixtures and diffs them against the committed parsers. It runs on PR only when `sources/skiver_*` changes, plus a weekly schedule to catch new releases.
+- ✓ **Fixtures.** A tiny synthetic genome plus reads with known injected errors *and qualities* (`tests/fixtures/make_skiver_fixtures.py`, seeded), analysed by the skiver v0.3.2 x86-64 release binary (taken from the `skiver-compat` artifact; an arm64 build counts slightly differently). The CSVs are committed (`tests/fixtures/skiver-v0.3.2/`, ~130 KB); the reads are regenerated, not committed.
+- ✓ **CI job `skiver-compat`.** Downloads skiver release binaries (matrix: v0.3.1, v0.3.2, latest), regenerates the fixtures, runs the parser tests on them and diffs the deterministic files (bootstrap CIs vary run to run) against the committed fixtures. It runs on PR only when `sources/skiver_*` changes, plus a weekly schedule to catch new releases.
 - **Exit:** every analyze file and the FASTQ statistics round-trip into the schema; unsupported versions fail with a clear error.
 
 ### Phase 2: model spec, both heads, default-mode fitting
