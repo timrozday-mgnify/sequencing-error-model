@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phase 0 (repo, CI and PR policy) is done; phase 1 is in progress (skiver analyze parsers, fixtures and `skiver-compat` landed); everything else is planned.
+Status: **draft, revised 2026-09-15**. Phase 0 (repo, CI and PR policy) is done; phase 1 is in progress (skiver analyze parsers, fixtures, `skiver-compat` and FASTQ quality statistics landed); everything else is planned.
 
 ## 1. Goal
 
@@ -397,11 +397,10 @@ uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), L
 
 ### Phase 1: default-mode inputs (in progress)
 - ✓ `sources/skiver_analyze.py`: typed, header-validated parsers for all v0.3.x analyze CSVs. `summary_phred.csv`'s counting convention is documented (§5.6).
-- `sources/fastq_quality.py`: streaming quality-process statistics from raw FASTQ(.gz), per mate. Labelled in code and spec as a feature/output source, never as error evidence. Collects:
-  - per-position Q histograms;
-  - Q transition counts (order m);
-  - Q | observed base context;
-  - the joint centre Q × observed context exposure used for marginal matching;
+- ✓ `sources/fastq_quality.py`: streaming quality-process statistics from raw FASTQ(.gz), per mate (one call per mate, several lanes allowed). Labelled in code and spec as a feature/output source, never as error evidence. Collects sparse counters for:
+  - per-position Q histograms (from the read start);
+  - Q transition counts (order m, for t ≥ m);
+  - Q | observed base context (`flank` = (L, R), `.`-padded at read ends), which is also the joint centre Q × observed context exposure used for marginal matching;
   - read-length distribution.
 - `observations.py`: the sparse tuple schema shared by all sources.
 - ✓ **Fixtures.** A tiny synthetic genome plus reads with known injected errors *and qualities* (`tests/fixtures/make_skiver_fixtures.py`, seeded), analysed by the skiver v0.3.2 x86-64 release binary (taken from the `skiver-compat` artifact; an arm64 build counts slightly differently). The CSVs are committed (`tests/fixtures/skiver-v0.3.2/`, ~130 KB); the reads are regenerated, not committed.
