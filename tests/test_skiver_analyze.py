@@ -52,6 +52,37 @@ def test_marginals(analyze: sa.SkiverAnalyze) -> None:
     assert proportions == pytest.approx(1, abs=1e-5)
 
 
+def test_tables_round_trip(analyze: sa.SkiverAnalyze) -> None:
+    t = {x.source.removeprefix("skiver_analyze:"): x for x in sa.tables(analyze)}
+    assert all(x.truth for x in t.values())
+    for name, rows in (("phred", analyze.phred), ("gc_content", analyze.gc_content)):
+        for b in rows:
+            key = b.lo if name == "phred" else (b.lo, b.hi)
+            assert (t[name].counts[(key, "=")], t[name].counts[(key, "!")]) == (b.num_correct, b.num_error)
+    for r in analyze.read_position:
+        c = t["read_position_start" if r.from_start else "read_position_end"].counts
+        assert (c[(r.index, "=")], c[(r.index, "!")]) == (r.num_correct, r.num_error)
+
+    trimmed = set(range(3, analyze.v - 1))  # value positions, as in summary_phred.csv
+    hazard = t["hazard"].marginal("t").counts
+    assert {key[0] for key in hazard} == trimmed
+    assert [hazard[(h.t - analyze.k,)] for h in analyze.hazard] == [h.num_candidates for h in analyze.hazard]
+    assert {key[1] for key in t["spectrum_by_t"].counts} <= trimmed
+
+    spectrum = t["spectrum"].marginal("op").counts
+    assert spectrum == {
+        (op,): sum(s.total for s in analyze.spectrum if s.op == op) for op in {s.op for s in analyze.spectrum}
+    }
+    # summary_error_spectrum.csv counts every value position; the by-t file only the trimmed range
+    assert t["spectrum_by_t"].marginal("op").counts <= spectrum
+    assert {str(key[0])[1] for key in t["spectrum"].counts if str(key[2]).startswith("-")} == {"-"}
+
+    for kv in analyze.kvmer:
+        locus = kv.key + kv.consensus_value
+        survived = t["kvmer_survival"].counts[(locus, analyze.v, "=")]
+        assert t["kvmer"].counts[(locus, "=")] == survived == (kv.consensus_count if kv.passes_filter else 0)
+
+
 def test_hazard_na(tmp_path: Path) -> None:
     path = tmp_path / "x.hazard_rate.csv"
     path.write_text("t,num_candidates,num_survival,hazard_ratio,5th_percentile,95th_percentile\n3,0,0,NA,0,0\n")

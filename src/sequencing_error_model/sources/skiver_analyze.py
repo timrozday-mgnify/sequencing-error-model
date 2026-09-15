@@ -27,18 +27,16 @@ Conventions pinned from upstream source:
 """
 
 import csv
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from sequencing_error_model.observations import ERROR_OPS, CountTable, Key, count
 
 SUPPORTED_VERSIONS = ("0.3.1", "0.3.2")
 
-# Upstream `ALL_OPERATIONS` order, as `Display` names.
-OPS = (
-    *("A>C", "A>G", "A>T", "G>A", "G>C", "G>T", "C>A", "C>G", "C>T", "T>A", "T>C", "T>G"),
-    *("->A", "->C", "->G", "->T"),
-    *("A>-", "C>-", "G>-", "T>-"),
-)
+OPS = ERROR_OPS  # upstream `ALL_OPERATIONS` order, as `Display` names
 _KVMER_OP_COLUMNS = [op.replace(">", "").replace("-", "_") for op in OPS]
 
 CI = tuple[float, float]
@@ -291,3 +289,36 @@ def read_analyze(prefix: str | Path) -> SkiverAnalyze:
         read_position=read_read_position(Path(f"{p}.summary_read_position.csv")),
         kvmer=kvmer,
     )
+
+
+def tables(a: SkiverAnalyze) -> list[CountTable]:
+    """The analyze counts as observation tables, with `t` rebased to the value position.
+
+    `summary_error_rate.csv` and `survival_rate.csv` are fitted parameters, not counts;
+    they stay on `SkiverAnalyze`. `kvmer.csv` keys failing skiver's outlier filter are dropped.
+    """
+    k, v = a.k, a.v
+    scan = "value bases up to and including the first mismatch"
+    trimmed = f"{scan}, t in [3, {v - 2}]"  # default ignore_smallest_t = ignore_largest_t = 2
+
+    def table(
+        name: str, fields: tuple[str, ...], unit: str, items: Iterable[tuple[Key, int]], **meta: Any
+    ) -> CountTable:
+        return CountTable(f"skiver_analyze:{name}", fields, unit, True, count(items), {"k": k, "v": v, **meta})
+
+    def context(op: str, prev: str, nxt: str) -> str:
+        return prev + ("-" if op.startswith("-") else op[0]) + nxt
+
+    passing = [r for r in a.kvmer if r.passes_filter]
+    return [
+        table("phred", ("q", "op"), "base", (((b.lo, op), n) for b in a.phred for op, n in (("=", b.num_correct), ("!", b.num_error))), exposure=trimmed),
+        table("gc_content", ("gc", "op"), "base", ((((b.lo, b.hi), op), n) for b in a.gc_content for op, n in (("=", b.num_correct), ("!", b.num_error))), exposure=trimmed),
+        table("read_position_start", ("pos_start", "op"), "base", (((r.index, op), n) for r in a.read_position if r.from_start for op, n in (("=", r.num_correct), ("!", r.num_error))), exposure=scan),
+        table("read_position_end", ("pos_end", "op"), "base", (((r.index, op), n) for r in a.read_position if not r.from_start for op, n in (("=", r.num_correct), ("!", r.num_error))), exposure=scan),
+        table("hazard", ("t", "op"), "value", (((h.t - k, op), n) for h in a.hazard for op, n in (("=", h.num_survival), ("!", h.num_candidates - h.num_survival)))),
+        table("spectrum", ("context", "strand", "op"), "error", (((context(r.op, r.prev_base, r.next_base), s, r.op), n) for r in a.spectrum for s, n in (("+", r.forward), ("-", r.total - r.forward))), flank=(1, 1)),
+        table("spectrum_by_t", ("context", "t", "op"), "error", (((context(r.op, r.prev_base, r.next_base), t - k, r.op), n) for r in a.spectrum_by_t for t, n in r.freq_at_t.items()), flank=(1, 1)),
+        # "=" counts values matching the consensus throughout; single-edit op counts have a latent t
+        table("kvmer", ("locus", "op"), "value", (((r.key + r.consensus_value, op), n) for r in passing for op, n in (("=", r.consensus_count), *r.op_counts.items()))),
+        table("kvmer_survival", ("locus", "t", "op"), "value", (((r.key + r.consensus_value, t, "="), n) for r in passing for t, n in enumerate(r.consensus_count_up_to_v, 1))),
+    ]  # fmt: skip
