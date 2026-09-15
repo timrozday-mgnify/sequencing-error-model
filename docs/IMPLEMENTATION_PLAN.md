@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py` and the head Q fitters landed); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py` and the head Q and head E fitters landed; selection is next); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
 
 ## 1. Goal
 
@@ -500,10 +500,13 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 - ✓ Head Q fitters (`fit/quality.py`): `QualityMarkov(m)` (required; holds the bias), `Position(n)` (linear splines over log distance from start and end), `Mate` and `Context(L,R)`, as one log-linear softmax over the quality alphabet fitted by L2-penalised L-BFGS (scipy) from a joint `CountTable` with a `q` field. `sample` draws Q tracks from the same design matrix, for tests now and the generator in phase 3. Recovery test: on tuples sampled from a known head, lag, context and mate effects correlate r > 0.9 and per-position Q histograms are within TV < 0.05.
   - Still to do: the insertion-quality sub-head (needs insertion rows, so it waits for `reference` tuples), and a joint (lags × position × context) table from `fastq_quality`, whose current counters are separate marginals.
 - Input is FASTQ statistics (every mode, conditioned on observed bases) or per-observation tuples (conditioned on true bases, from `pe-overlap` and `reference`).
-- Head E fitters over exact-position tuples, the form `pe-overlap` and `reference` produce:
-  - `Context(L,R)` with the true-base mask;
-  - `QualityWindow(m)`, always including the centre-Q term, and `QualityxContext(rank)`;
-  - `Position`, `Mate`, `Strand`, `Homopolymer`, GC.
+- ✓ Head E fitters over exact-position tuples, the form `pe-overlap` and `reference` produce (`fit/error.py`): one log-linear softmax over 10 categories (match, 4 substitutions, 4 insertions, deletion) with the substitute-to-self category masked in the likelihood and in `probabilities`, fitted by L2-penalised L-BFGS. Components:
+  - `QualityWindow(m)` (required; holds the bias and always the centre-Q term), per-offset alphabet effects plus "beyond the read end";
+  - `Context(L,R)`; `Homopolymer` (run length of the centre base inside the table's context window);
+  - `Position(n)`, `Mate`, `Strand`, `GC(n)` (linear spline over the GC bin midpoint);
+  - `QualityxContext(r)`: a rank-r bilinear interaction of centre Q with x_{t−1..t+1}, sum-to-zero over bases so it can't absorb a centre-Q main effect.
+
+  Each row is one template base with a true centre base; an insertion and a substitution at the same base can't both be counted yet (revisit with `reference` tuples). Recovery test on labels sampled from a known head: Q-window, context (substitutions) and homopolymer (indels) log-odds correlate r > 0.9, the error rate per reported-Q bin is within 10% and the marginal rate within 5%, with a truth far from 10^(−Q/10).
 
   The `kmer` default fitters (latent edit position, marginal matching) are in phase 6.
 - Criterion-based selection per head (AIC/BIC on held-out reads).
