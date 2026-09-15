@@ -14,6 +14,11 @@ Template bases other than A, C, G, T are copied through as N matches.
 `align` and `observations` invert this: head E tuples re-derived from template, read and CIGAR, the input of
 the recovery harness (and the core of `reference` mode). The CLI (`sem-generate`) keeps the fork's
 `skiver-generate` contract, so genome-blender can switch by pointing its generate command at it.
+
+`fragments` samples standalone read pairs from genome contigs, with insert sizes from the spec's
+`insert_size` marginal (row 0 sizes, row 1 probabilities; `insert_sizes` builds one). Mate 2's template
+is the fragment's reverse complement, and a mate reads through into its adapter when the insert is
+shorter than the read.
 """
 
 import argparse
@@ -38,6 +43,8 @@ _K = len(error.CATEGORIES)
 _ASCII = np.frombuffer(b"ACGTN", np.uint8)
 _M, _I, _D = (ord(c) for c in "MID")
 _CIGAR = re.compile(r"(\d+)([MID])")
+ADAPTERS = ("AGATCGGAAGAGCACACGTCTGAACTCCAGTCA", "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT")  # TruSeq read-through, R1/R2
+_COMPLEMENT = str.maketrans("ACGT", "TGCA")
 
 
 @dataclass(frozen=True)
@@ -151,6 +158,50 @@ def generate(
     return reads
 
 
+def insert_sizes(mean: float, sd: float) -> Array:
+    """A discretised normal insert-size marginal over mean ± 4 sd (at least 1): row 0 sizes, row 1 probabilities."""
+    if mean < 1 or sd < 0:
+        raise ValueError("insert size mean must be >= 1 and sd >= 0")
+    sizes = np.arange(max(1, int(mean - 4 * sd)), int(np.ceil(mean + 4 * sd)) + 1)
+    p = np.exp(-0.5 * ((sizes - mean) / sd) ** 2) if sd else (sizes == round(mean)).astype(float)
+    return np.vstack([sizes, p / p.sum()])
+
+
+def fragments(
+    contigs: Sequence[tuple[str, str]],
+    insert_size: Array,
+    n: int,
+    read_length: int,
+    rng: np.random.Generator,
+    first: int = 0,
+) -> list[tuple[str, str, str]]:
+    """`n` fragments as (name, mate 1 template, mate 2 template), uniform over the placements that fit.
+
+    Names are `contig:start-end#i` (1-based, inclusive; i counts from `first`). Past the fragment a mate reads
+    its adapter, then N.
+    """
+    sizes, p = np.asarray(insert_size[0], np.int64), np.asarray(insert_size[1], float)
+    if read_length < 1 or not len(sizes) or sizes.min() < 1 or p.min() < 0 or not p.sum():
+        raise ValueError("need read_length >= 1 and an insert_size marginal of sizes >= 1 with probabilities")
+    lengths = np.array([len(s) for _, s in contigs], np.int64)
+    out = []
+    # ponytail: O(n × contigs) Python loop; vectorise if many-contig standalone runs get slow.
+    for i, size in enumerate(rng.choice(sizes, size=n, p=p / p.sum())):
+        slots = np.clip(lengths - size + 1, 0, None)
+        if not slots.sum():
+            raise ValueError(f"insert size {size} is longer than every contig")
+        c = int(rng.choice(len(contigs), p=slots / slots.sum()))
+        start = int(rng.integers(slots[c]))
+        name, frag = contigs[c][0], contigs[c][1][start : start + size].upper()
+        r1, r2 = (s[:read_length].ljust(read_length, "N") for s in (frag + ADAPTERS[0], _revcomp(frag) + ADAPTERS[1]))
+        out.append((f"{name}:{start + 1}-{start + size}#{first + i}", r1, r2))
+    return out
+
+
+def _revcomp(seq: str) -> str:
+    return seq.translate(_COMPLEMENT)[::-1]
+
+
 def align(template: str, read: Read) -> tuple[list[tuple[int, str]], list[int | None]]:
     """Walk the CIGAR: (template position, op) per draw, and each template base's aligned read Q (None if
     deleted). Insertions are attributed to the following template base."""
@@ -230,9 +281,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="sem-generate", description="Simulate reads (bases, qualities, CIGAR) from a spec."
     )
     p.add_argument("--model", type=Path, required=True, metavar="SPEC_DIR", help="error model spec directory")
-    p.add_argument("--input", type=Path, help="template FASTA[.gz] (default: stdin)")
+    p.add_argument("--input", type=Path, help="template FASTA[.gz], or genome FASTA with --pairs (default: stdin)")
     p.add_argument("--output", type=Path, help="FASTQ[.gz] (default: stdout); headers carry cigar:CIGAR")
     p.add_argument("--paired", action="store_true", help="interleaved R1/R2; names ending /2 are mate 2")
+    p.add_argument("--pairs", type=int, help="sample this many interleaved pairs from the input genome instead")
+    p.add_argument("--read-length", type=int, help="read length for --pairs")
+    p.add_argument("--insert-mean", type=float, help="normal insert size for --pairs (default: the spec's)")
+    p.add_argument("--insert-sd", type=float, default=0.0, help="insert size sd with --insert-mean")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-ins-run", type=int, default=10, help="max insertions before one template base")
     p.add_argument("--error-rate-scale", type=float, default=1.0, help="multiplier on every error probability")
@@ -242,24 +297,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_ins_run < 1 or args.error_rate_scale < 0:
         p.error("--max-ins-run must be >= 1 and --error-rate-scale >= 0")
     model, rng = spec_io.load(args.model), np.random.default_rng(args.seed)
+    sizes = model.marginals.get("insert_size", np.zeros((2, 0)))
+    if args.pairs is not None:
+        if args.paired or args.pairs < 0 or not args.read_length or args.read_length < 1:
+            p.error("--pairs needs --read-length >= 1, a count >= 0, and excludes --paired")
+        if args.insert_mean is not None:
+            try:
+                sizes = insert_sizes(args.insert_mean, args.insert_sd)
+            except ValueError as e:
+                p.error(str(e))
+        if not sizes.shape[1]:
+            p.error("--pairs needs --insert-mean or a spec with an insert_size marginal")
     src = _open(args.input, "r") if args.input else sys.stdin
     out = _open(args.output, "w") if args.output else sys.stdout
+
+    def records() -> Iterator[tuple[str, str, int]]:
+        if args.pairs is None:
+            for name, seq in _fasta(src):
+                yield name, seq, 2 if args.paired and name.endswith("/2") else 1
+            return
+        contigs = list(_fasta(src))
+        for first in range(0, args.pairs, args.batch):
+            n = min(args.batch, args.pairs - first)
+            for name, r1, r2 in fragments(contigs, sizes, n, args.read_length, rng, first):
+                yield from ((f"{name}/1", r1, 1), (f"{name}/2", r2, 2))
+
     try:
-        batch: list[tuple[str, str]] = []
-        for record in (*_fasta(src), None):
+        batch: list[tuple[str, str, int]] = []
+        for record in (*records(), None):
             if record is not None:
                 batch.append(record)
             if batch and (record is None or len(batch) >= args.batch):
-                mates = [2 if args.paired and name.endswith("/2") else 1 for name, _ in batch]
                 reads = generate(
                     model,
-                    [s for _, s in batch],
-                    mates,
+                    [s for _, s, _ in batch],
+                    [m for _, _, m in batch],
                     rng,
                     max_ins_run=args.max_ins_run,
                     error_rate_scale=args.error_rate_scale,
                 )
-                for (name, _), read in zip(batch, reads, strict=True):
+                for (name, _, _), read in zip(batch, reads, strict=True):
                     qual = "*" * len(read.sequence) if args.no_quality else read.quality
                     out.write(f"@{name} cigar:{read.cigar}\n{read.sequence}\n+\n{qual}\n")
                 batch = []
