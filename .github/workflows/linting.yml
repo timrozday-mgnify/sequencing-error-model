@@ -1,0 +1,38 @@
+name: Linting
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      # Hygiene hooks (whitespace, large files, private keys, ...). Ruff and mypy
+      # run as explicit steps below so their failures are easy to read.
+      - name: Pre-commit hygiene hooks
+        env:
+          SKIP: ruff-check,ruff-format,mypy,pytest
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy src tests

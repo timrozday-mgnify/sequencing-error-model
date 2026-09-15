@@ -1,0 +1,45 @@
+# Standardised across the MIMICC/ENA repos (revs match
+# mimicc-ena-submission-assistant). When bumping a rev, bump it in all of them
+# together so a file formatted in one repo is not reformatted by another.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.6
+    hooks:
+      - id: ruff-check
+        args: ["--fix"]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      # Local rather than mirrors-mypy: type-checks against uv.lock instead of a
+      # hand-maintained additional_dependencies list that drifts.
+      - id: mypy
+        name: mypy
+        entry: uv run --frozen mypy
+        language: system
+        pass_filenames: false
+        args: ["src", "tests"]
+
+      # On push (not every commit): slower than the lint hooks above.
+      - id: pytest
+        name: pytest
+        entry: uv run --frozen pytest -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

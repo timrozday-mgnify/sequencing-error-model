@@ -1,0 +1,14 @@
+version: "3"
+
+tasks:
+  lint:
+    desc: Formatting, lint and type checks (mirrors the Linting workflow)
+    cmds:
+      - uv run ruff format --check .
+      - uv run ruff check .
+      - uv run mypy src tests
+
+  test:
+    desc: Run the pytest suite
+    cmds:
+      - uv run pytest {{.CLI_ARGS}}

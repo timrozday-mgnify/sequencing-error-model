@@ -1,0 +1,35 @@
+[project]
+name = "sequencing-error-model"
+version = "0.0.1"
+description = "Train sequencing error models from skiver (k,v)-mer outputs and export them to read simulators."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy>=1.14",
+    "pre-commit>=4",
+    "pytest",
+    "ruff>=0.16",
+]
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

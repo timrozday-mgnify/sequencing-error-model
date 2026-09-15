@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.pyc
+dist/
+.env
+.DS_Store
+
+# Test/tooling artifacts
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Large skiver outputs and trained models belong in object storage, not git
+*.tsv
+*.tsv.gz
+*.bin
+*.kvmer
+*.pt
+
+# Editors
+.idea/
+.vscode/
+
+# Serena tool state
+.serena/
