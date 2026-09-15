@@ -693,14 +693,18 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 
     | truth | aligner | reads | edits hidden | vs truth | vs observable | vs observable, `--unclip` | indels in runs of 3+ vs observable (D / I) |
     |---|---|---|---|---|---|---|---|
-    | example, scale 0.1 | minibwa | 3,000 × 100–150 bp | 0.8% | 0.984 | 0.978† | 1.000 | 1.00 / 1.00 (`--unclip`) |
+    | example, scale 0.1 | minibwa | 3,000 × 100–150 bp | 0.7% | 0.984 | 0.977 | 1.000 | 0.96 / 0.94; 1.00 / 1.00 (`--unclip`) |
     | `IndelLength`, scale 0.25 | minibwa | 4,000 × 100–150 bp | 3.8% | **0.926** | 0.956 | 0.998 | 0.95 / 0.91; 1.00 / 1.00 (`--unclip`) |
     | example | minimap2 `map-ont` | 400 × 1–2 kb | 2.3% | 0.975 | 0.993 | – | 0.98 / 1.00 |
     | `IndelLength` | minimap2 `map-ont` | 600 × 1–2 kb | 7.4% | **0.915** | 0.995 | – | 0.99 / 0.99 |
 
-    Observable columns are against the forward-strand observable (indel components below). † Not rerun since; it predates that change.
+    Observable columns are against the forward-strand observable (below).
 
-  - Against the observable truth on the `IndelLength` truth, indel rates by kind and run are 0.98–1.00 for minimap2 and 0.99–1.00 for minibwa with `--unclip`. Length TV (≤ 0.04) and indel site agreement (0.73–0.78) were measured before the forward-strand observable and not rerun. Most of the site disagreement against the generator's CIGARs was equivalent placement.
+  - Against the observable truth on the `IndelLength` truth, with minimap2 and minibwa `--unclip`:
+    - indel rates by kind and run are 0.98–1.00;
+    - length TV is ≤ 0.014;
+    - indel site agreement is 0.97–0.99, up from 0.73–0.78 against the read-orientation observable, whose tie-break placed reverse reads' gaps elsewhere.
+  - Without `--unclip`, minibwa's indel site agreement is 0.85–0.94. Most of the site disagreement against the generator's CIGARs was equivalent placement.
   - **Free template ends** (2026-09-15). The observable truth first aligned each read end to end on its true template. That span isn't observable: an indel a few bases from a read end ties with, or loses to, a shifted end (`110M1I1M` vs `110M2D2M`). About 40% of minibwa's remaining 3+-run indel loss was this. The observable now realigns each whole read inside the genome around its true span (±16 bases) with free template ends.
   - A unit-cost observable was tried first and rejected. Substitutions and indels tie under unit costs, so its tie-break either split long indels (length TV 0.15–0.22) or inflated indels (deletion ratio 0.75).
 - ✓ **Soft-clipping correction** (`bam --unclip MATCH MISMATCH OPEN EXTEND`, `recovery --aligner … --unclip`). minibwa's indel loss is clipping. On the `IndelLength` run, 14% of reads were clipped and those kept 55% of their edits, while unclipped reads matched the optimal alignment (NM 1.004×). A clipped read is realigned end to end inside the reference widened by its clips (`realign` with free template ends), unless a clipped end of 8+ bases differs from the reference at more than half its bases (adapters, chimeras). Test: errors in a clipped end, including a 3-base clip, come back as rows; a clipped adapter stays clipped.
