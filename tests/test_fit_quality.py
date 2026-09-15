@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from sequencing_error_model import select
 from sequencing_error_model.fit import quality
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component
@@ -83,6 +84,16 @@ def test_recovers_known_head() -> None:
     got = quality.sample(fitted, ALPHABET, reads, mates, np.random.default_rng(4))
     tv = 0.5 * np.abs(position_hist(want, 30) - position_hist(got, 30)).sum(axis=1)
     assert tv.max() < 0.05, tv
+
+
+def test_select_finds_true_components() -> None:
+    true = truth()
+    train, test = tuples(*simulate(true, 2000, seed=6)), tuples(*simulate(true, 1000, seed=7))
+    first = ("QualityMarkov(0)", "QualityMarkov(1)")
+    result = select.select(quality, train, test, ALPHABET, first, [("Position(3)",), ("Mate",), ("Context(1,1)",)])
+    tokens = [c.token for c in result.components]
+    assert tokens[0] == "QualityMarkov(1)" and set(tokens) == {c.token for c in true}, result.trace
+    assert sum(s.accepted for s in result.trace) == len(true)
 
 
 def test_sample_emits_only_alphabet() -> None:

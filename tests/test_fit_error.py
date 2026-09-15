@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from sequencing_error_model import select
 from sequencing_error_model.fit import error
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component
@@ -118,6 +119,17 @@ def test_recovers_known_head() -> None:
     n = np.array(list(held_out.counts.values()))
     marginal = [n @ (1 - error.probabilities(c, ALPHABET, held_out)[:, 0]) for c in (true, fitted)]
     assert abs(marginal[1] / marginal[0] - 1) < 0.05, marginal
+
+
+def test_select_keeps_true_effects_only() -> None:
+    by = {c.name: c for c in truth()}
+    context = by["Context"].params["weights"][1:4]
+    true = (by["QualityWindow"], Component("Context(1,1)", {"weights": context}))
+    train, test = (labelled(true, exposure(n, seed=s), seed=s) for n, s in ((3000, 6), (1500, 7)))
+    first = ("QualityWindow(0)", "QualityWindow(1)")
+    result = select.select(error, train, test, ALPHABET, first, [("Context(1,1)",), ("Mate",), ("Strand",)])
+    assert [c.token for c in result.components] == ["QualityWindow(1)", "Context(1,1)"], result.trace
+    assert all(s.test_log_likelihood < 0 for s in result.trace)
 
 
 def test_mask_and_categories() -> None:

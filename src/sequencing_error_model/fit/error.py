@@ -6,10 +6,9 @@ before t, "-" deletion of t. Substituting a base by itself is impossible, so tha
 the likelihood and in `probabilities` (plan §3, lesson 2): no fitted mass leaks into categories the
 generator drops.
 
-Each table row is one template base: the `context` centre is its true base (A, C, G or T) and `op` is
-"=", "X>Y" with X the centre, "->Y" or "X>-".
-ponytail: one outcome per template base, so an insertion and a substitution at the same base can't both
-be counted; add a separate insertion slot when `reference` tuples need it.
+Each table row is one draw at a template base: the `context` centre is its true base (A, C, G or T) and
+`op` is "=", "X>Y" with X the centre, "->Y" or "X>-". An insertion is followed by another draw at the same
+base (as the generator does, up to its `max_ins_run`), so a base with an insertion contributes two rows.
 
 Components and params (A = alphabet size, trailing axis K):
 
@@ -17,7 +16,7 @@ Components and params (A = alphabet size, trailing axis K):
   "beyond the read end". Fields `q` and `q-1`..`q-m`, `q+1`..`q+m` (None beyond a read end).
 - `Context(L,R)`: `weights` [L+R+1, 5, K] as in head Q. Field `context`.
 - `Homopolymer`: `weights` [W, K] by the run length of the centre base inside the fitted table's context
-  window (W bases wide, so runs are capped at W). Field `context`.
+  window, kept in `meta["flank"]` (W bases wide, so runs are capped at W). Field `context`.
 - `Position(n)`, `Mate`: as in head Q. `Strand`: `weights` [2, K] for "+", "-".
 - `GC(n)`: `knots` [n] over GC %, `weights` [n, K]: linear spline of the `gc` bin midpoint.
 - `QualityxContext(r)`: `quality` [A, r] and `context` [3, 5, r, K], a rank-r interaction of the centre Q
@@ -68,7 +67,8 @@ def _validate(components: Sequence[Component], fields: Sequence[str], meta: dict
         raise ValueError(f"{source}: head E components {[c.token for c in components]} need fields {missing}")
     left, right = tuple(meta.get("flank", (0, 0)))
     for c in components:
-        cover = c.args if c.name == "Context" else (1, 1) if c.name == "QualityxContext" else (0, 0)
+        flank = tuple(c.meta.get("flank", (0, 0)))
+        cover = {"Context": c.args, "QualityxContext": (1, 1), "Homopolymer": flank}.get(c.name, (0, 0))
         if cover[0] > left or cover[1] > right:
             raise ValueError(f"{source}: context flank {(left, right)} does not cover {c.token}")
 
@@ -106,7 +106,7 @@ def _shapes(c: Component, d: dict[str, Any]) -> dict[str, tuple[int, ...]]:
     if c.name == "Context":
         return {"weights": (sum(c.args) + 1, 5)}
     if c.name == "Homopolymer":
-        return {"weights": (c.params["weights"].shape[0] if "weights" in c.params else d["context"].shape[1],)}
+        return {"weights": (sum(c.meta.get("flank", d["flank"])) + 1,)}
     if c.name in ("Position",):
         return {"start": (c.args[0],), "end": (c.args[0],)}
     if c.name in ("Mate", "Strand"):
@@ -129,9 +129,10 @@ def _design(c: Component, d: dict[str, Any]) -> tuple[Array, Array]:
         window = d["context"][:, f0 - left : f0 + right + 1]
         return np.arange(window.shape[1]) * 5 + window, np.ones(window.shape)
     if c.name == "Homopolymer":
-        same = d["context"] == d["centre"][:, None]
-        run = np.cumprod(same[:, f0::-1], axis=1).sum(axis=1) + np.cumprod(same[:, f0 + 1 :], axis=1).sum(axis=1)
-        return np.minimum(run, _shapes(c, d)["weights"][0])[:, None] - 1, np.ones((n, 1))
+        left, right = c.meta.get("flank", d["flank"])
+        same = d["context"][:, f0 - left : f0 + right + 1] == d["centre"][:, None]
+        run = np.cumprod(same[:, left::-1], axis=1).sum(axis=1) + np.cumprod(same[:, left + 1 :], axis=1).sum(axis=1)
+        return (run - 1)[:, None], np.ones((n, 1))
     if c.name == "Position":
         knots = c.params["knots"]
         vals = np.hstack([_hat(d["pos_start"], knots), _hat(d["pos_end"], knots)])
@@ -212,16 +213,10 @@ def _mask(d: dict[str, Any]) -> Array:
     return mask
 
 
-def fit(
-    table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2: float = 1.0, seed: int = 0
-) -> tuple[Component, ...]:
-    """Fit head E components (in `tokens` order) by penalised maximum likelihood.
-
-    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge. `seed` initialises
-    the `QualityxContext` factors (zero is a saddle point).
-    """
-    components = [Component(t) for t in tokens]
-    _check(components)
+def _labelled(
+    table: CountTable, components: Sequence[Component], alphabet: Sequence[int]
+) -> tuple[Array, dict[str, Any]]:
+    """Validate a labelled table for `components`; return counts [R, K] and the feature columns."""
     if "op" not in table.fields:
         raise ValueError(f"{table.source}: head E needs op labels from a truth-bearing source")
     fields = [f for f in table.fields if f != "op"]
@@ -237,6 +232,29 @@ def fit(
     d = _data(fields, list(keys), alphabet, table.meta)
     counts = np.zeros((len(keys), _K))
     np.add.at(counts, (r_idx, cat), n)
+    return counts, d
+
+
+def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> float:
+    """Log-likelihood of a labelled table's counts under fitted head E components."""
+    _check(components)
+    counts, d = _labelled(table, components, alphabet)
+    logits = np.where(_mask(d), -np.inf, _logits(components, d))
+    logp = logits - special.logsumexp(logits, axis=1, keepdims=True)
+    return float(np.sum(counts[counts > 0] * logp[counts > 0]))
+
+
+def fit(
+    table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2: float = 1.0, seed: int = 0
+) -> tuple[Component, ...]:
+    """Fit head E components (in `tokens` order) by penalised maximum likelihood.
+
+    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge. `seed` initialises
+    the `QualityxContext` factors (zero is a saddle point).
+    """
+    components = [Component(t) for t in tokens]
+    _check(components)
+    counts, d = _labelled(table, components, alphabet)
 
     for i, c in enumerate(components):
         if c.name == "Position":
@@ -244,6 +262,8 @@ def fit(
             components[i] = Component(c.token, {"knots": np.linspace(0, top, c.args[0])})
         elif c.name == "GC":
             components[i] = Component(c.token, {"knots": np.linspace(0, 100, c.args[0])})
+        elif c.name == "Homopolymer":
+            components[i] = Component(c.token, meta={"flank": list(d["flank"])})
     x = _matrix(components, d)
     n_lin, k_q = x.shape[1] * _K, len(alphabet)
     rank = next((c.args[0] for c in components if c.name == "QualityxContext"), 0)
@@ -285,7 +305,7 @@ def fit(
         if c.name == "QualityxContext":
             v = _centre(res.x[split:].reshape(3, 5, rank, _K))
             params = {"quality": res.x[n_lin:split].reshape(k_q, rank), "context": v}
-        out.append(Component(c.token, params))
+        out.append(Component(c.token, params, meta=c.meta))
     return tuple(out)
 
 
@@ -295,5 +315,15 @@ def probabilities(components: Sequence[Component], alphabet: Sequence[int], tabl
     fields = [f for f in table.fields if f != "op"]
     _validate(components, fields, table.meta, table.source)
     idx = [table.fields.index(f) for f in fields]
-    d = _data(fields, [tuple(k[i] for i in idx) for k in table.counts], alphabet, table.meta)
-    return np.asarray(special.softmax(np.where(_mask(d), -np.inf, _logits(components, d)), axis=1))
+    return probabilities_at(
+        components, _data(fields, [tuple(k[i] for i in idx) for k in table.counts], alphabet, table.meta)
+    )
+
+
+def probabilities_at(components: Sequence[Component], columns: dict[str, Any]) -> Array:
+    """P(category) [R, K] from feature columns shaped like `_data`'s (the generator builds them as arrays):
+    `k_q`, `flank`, `context` [R, L+R+1] base indices, `centre`, `q` and `q±i` alphabet indices (A beyond a
+    read end), `pos_start`, `pos_end`, `mate`, `strand` (1 for "-") and `gc` (bin midpoint)."""
+    _check(components)
+    logits = np.where(_mask(columns), -np.inf, _logits(components, columns))
+    return np.asarray(special.softmax(logits, axis=1))
