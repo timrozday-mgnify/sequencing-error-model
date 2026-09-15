@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phase 0 (repo, CI and PR policy) is done; phase 1 is in progress (skiver analyze parsers, fixtures, `skiver-compat` and FASTQ quality statistics landed); everything else is planned.
+Status: **draft, revised 2026-09-15**. Phase 0 (repo, CI and PR policy) is done; phase 1 is in progress (skiver analyze parsers, fixtures, `skiver-compat`, FASTQ quality statistics and the observation schema landed); everything else is planned.
 
 ## 1. Goal
 
@@ -438,7 +438,7 @@ uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), L
   - Q transition counts (order m, for t ≥ m);
   - Q | observed base context (`flank` = (L, R), `.`-padded at read ends), which is also the joint centre Q × observed context exposure used for marginal matching;
   - read-length distribution.
-- `observations.py`: the sparse tuple schema shared by all sources.
+- ✓ `observations.py`: the sparse tuple schema shared by all sources. A `CountTable` is a sparse count over a subset of one field vocabulary (`op`, `context`, `locus`, `q`/`q±i`, `t`, `pos_start`/`pos_end`, `strand`, `mate`, `gc`, `length`); fewer fields means a marginal of the joint model. Tables declare their unit (base, value, read, error event) and whether they are truth-bearing, and the constructor rejects an `op` field on non-truth tables, so quality-only sources can't carry error labels. Positions and `t` are 1-based value/read positions throughout (skiver's k + t is rebased). `skiver_analyze.tables` and `fastq_quality.tables` convert both default-mode sources; the fitted-parameter files (`summary_error_rate.csv`, `survival_rate.csv`) stay on `SkiverAnalyze` as passthrough, and `kvmer.csv` keys failing skiver's filter are dropped.
 - ✓ **Fixtures.** A tiny synthetic genome plus reads with known injected errors *and qualities* (`tests/fixtures/make_skiver_fixtures.py`, seeded), analysed by the skiver v0.3.2 x86-64 release binary (taken from the `skiver-compat` artifact; an arm64 build counts slightly differently). The CSVs are committed (`tests/fixtures/skiver-v0.3.2/`, ~130 KB); the reads are regenerated, not committed.
 - ✓ **CI job `skiver-compat`.** Downloads skiver release binaries (matrix: v0.3.1, v0.3.2, latest), regenerates the fixtures, runs the parser tests on them and diffs the deterministic files (bootstrap CIs vary run to run) against the committed fixtures. It runs on PR only when `sources/skiver_*` changes, plus a weekly schedule to catch new releases.
 - **Exit:** every analyze file and the FASTQ statistics round-trip into the schema; unsupported versions fail with a clear error.

@@ -2,18 +2,22 @@
 
 A feature/output source (plan §5.2, §6.1). Reported qualities are counted as what the
 generator must reproduce and as the exposure for marginal matching (§5.6). Nothing here
-is error evidence, and no count may be turned into an error rate. Bases are *observed*
-bases, so Q | context is conditioned on reads, not on the true template (§6.2).
+is error evidence, and no count may be turned into an error rate: `tables` emits no `op`
+field and `truth=False`. Bases are *observed* bases, so Q | context is conditioned on
+reads, not on the true template (§6.2).
 
 Profile each mate separately; pass all files (lanes) for one mate in a single call.
 """
 
 import gzip
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from itertools import chain, islice
 from pathlib import Path
+from typing import Any
+
+from sequencing_error_model.observations import CountTable, Key, count
 
 PHRED_OFFSET = 33
 MAX_Q = 93
@@ -31,9 +35,9 @@ class QualityProfile:
     flank: tuple[int, int]  # (L, R): observed bases before and after the centre base
     n_reads: int = 0
     lengths: Counter[int] = field(default_factory=Counter)
-    # (0-based position from read start, Q)
+    # (1-based position from read start, Q)
     position: Counter[tuple[int, int]] = field(default_factory=Counter)
-    # (q_{t-order}, ..., q_{t-1}, q_t) for t >= order; the first positions come from `position`
+    # (q_{t-order}, ..., q_{t-1}, q_t) for t > order; the first positions come from `position`
     transitions: Counter[tuple[int, ...]] = field(default_factory=Counter)
     # (observed x_{t-L..t+R}, q_t): Q | observed context, and the centre-Q x context exposure
     context: Counter[tuple[str, int]] = field(default_factory=Counter)
@@ -73,8 +77,29 @@ def profile_fastq(
     for seq, q in islice(chain.from_iterable(map(read_fastq, paths)), max_reads):
         p.n_reads += 1
         p.lengths[len(q)] += 1
-        p.position.update(enumerate(q))
+        p.position.update(enumerate(q, 1))
         p.transitions.update(zip(*(q[i:] for i in range(order + 1)), strict=False))
         padded = PAD * left + seq + PAD * right
         p.context.update((padded[t : t + left + right + 1], qt) for t, qt in enumerate(q))
     return p
+
+
+def tables(p: QualityProfile, mate: int | None = None) -> list[CountTable]:
+    """The profile as observation tables, with a `mate` field appended when `mate` is given."""
+    extra = () if mate is None else (mate,)
+
+    def table(
+        name: str, fields: tuple[str, ...], unit: str, items: Iterable[tuple[Key, int]], **meta: Any
+    ) -> CountTable:
+        fields = (*fields, "mate") if extra else fields
+        return CountTable(
+            f"fastq_quality:{name}", fields, unit, False, count(((*k, *extra), n) for k, n in items), meta
+        )
+
+    lags = tuple(f"q-{i}" for i in range(p.order, 0, -1))
+    return [
+        table("position", ("pos_start", "q"), "base", p.position.items()),
+        table("transitions", (*lags, "q"), "base", p.transitions.items()),
+        table("context", ("context", "q"), "base", p.context.items(), flank=p.flank),
+        table("length", ("length",), "read", (((n,), c) for n, c in p.lengths.items())),
+    ]
