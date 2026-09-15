@@ -97,20 +97,24 @@ def test_unclip_recovers_clipped_errors(tmp_path: Path) -> None:
     for p in (50, 55):  # two substitutions in the 15 bases the aligner clipped
         errors[p] = "A" if errors[p] != "A" else "C"
     adapter = genome[800:845] + "".join(rng.choice(list("ACGT"), size=15))  # 15 bases that aren't the genome
+    short = list(genome[1200:1248])
+    for p in (45, 47):  # two substitutions in a 3-base clip: too short to tell from an adapter, so realigned
+        short[p] = "A" if short[p] != "A" else "C"
     path = tmp_path / "clipped.bam"
     with pysam.AlignmentFile(str(path), "wb", header={"SQ": [{"SN": "chr", "LN": len(genome)}]}) as out:
-        for i, (start, seq) in enumerate(((500, "".join(errors)), (800, adapter))):
+        reads = ((500, "".join(errors), "45M15S"), (800, adapter, "45M15S"), (1200, "".join(short), "45M3S"))
+        for i, (start, seq, cigar) in enumerate(reads):
             a = pysam.AlignedSegment(out.header)
             a.query_name, a.reference_id, a.reference_start, a.mapping_quality = f"r{i}", 0, start, 60
-            a.cigarstring, a.query_sequence = "45M15S", seq
+            a.cigarstring, a.query_sequence = cigar, seq
             a.query_qualities = pysam.qualitystring_to_array("?" * len(seq))
             out.write(a)
     scores = (2, 8, 12, 2)
-    assert [r.cigar for _, r, _ in bam.records(path, ref)] == ["45M", "45M"]
-    # The error-rich clip is realigned end to end; the adapter clip is kept.
-    assert [r.cigar for _, r, _ in bam.records(path, ref, unclip=scores)] == ["60M", "45M"]
+    assert [r.cigar for _, r, _ in bam.records(path, ref)] == ["45M", "45M", "45M"]
+    # The error-rich clips are realigned end to end; the adapter clip is kept.
+    assert [r.cigar for _, r, _ in bam.records(path, ref, unclip=scores)] == ["60M", "45M", "48M"]
     assert _subs(gen.observations(bam.records(path, ref), (2, 2), 1)) == 0
-    assert _subs(gen.observations(bam.records(path, ref, unclip=scores), (2, 2), 1)) == 2
+    assert _subs(gen.observations(bam.records(path, ref, unclip=scores), (2, 2), 1)) == 4
 
 
 def test_cli_fits_spec(tmp_path: Path) -> None:

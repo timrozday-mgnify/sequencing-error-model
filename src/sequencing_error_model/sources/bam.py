@@ -19,7 +19,8 @@ returns a per-contig report (depth, raw error rate, masked sites) so outlier con
 Aligners soft-clip read ends where errors cluster, so clipped bases lose errors selectively: on generated
 100-150 bp reads with ~5% errors, minibwa clipped 14% of reads and those kept 55% of their edits (plan, phase 5).
 With `unclip` scores (the aligner's own), a clipped read is realigned end to end inside the reference widened by
-its clips (`generate.realign`), unless a clipped end differs from the reference at more than 30% of its bases.
+its clips (`generate.realign`), unless a clipped end of 8+ bases differs from the reference at more than half its
+bases.
 
 ponytail: records with N or P ops are skipped. Per-read trajectories are still to come (phase 5).
 """
@@ -62,11 +63,17 @@ def _unclipped(
     a: int,
     b: int,
     scores: Scores,
-    max_divergence: float = 0.3,
+    max_divergence: float = 0.5,
+    min_clip: int = 8,
 ) -> tuple[int, int, str, str, list[tuple[str, int]]] | None:
     """The whole read realigned inside the reference widened by its soft clips (read bases before `a` and from
-    `b`), as (start, end, template, aligned bases, CIGAR); None when a formerly clipped end differs from the
-    reference at more than `max_divergence` of its bases (adapters, chimeras), which keeps the aligner's clip.
+    `b`), as (start, end, template, aligned bases, CIGAR); None when a formerly clipped end of at least `min_clip`
+    bases differs from the reference at more than `max_divergence` of its bases (adapters, chimeras), which keeps
+    the aligner's clip.
+
+    On generated reads realigned this way, clipped ends holding only sequencing errors reach 0.4-0.5 divergence
+    at the 90th percentile from 8 bases on, random ends 0.75-0.9 at the median; below 8 bases the two overlap, so
+    shorter clips are always realigned.
 
     ponytail: a fixed divergence cap, and a full (unbanded) DP over the window, fine for short reads; model
     adapters, or band the DP, if real runs need it."""
@@ -83,7 +90,7 @@ def _unclipped(
             ri, ti = ri + (op != "D"), ti + (op != "I")
             if side >= 0:
                 edits[side] += bad
-    if any(e > max_divergence * s for e, s in zip(edits, (a, trail), strict=True) if s):
+    if any(e > max_divergence * s for e, s in zip(edits, (a, trail), strict=True) if s >= min_clip):
         return None
     cigar = [(op, int(n)) for n, op in _CIGAR.findall(placed.cigar)]
     return lo + s0, lo + s1, window[s0:s1], placed.sequence, cigar
