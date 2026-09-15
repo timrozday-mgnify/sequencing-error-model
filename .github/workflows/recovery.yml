@@ -1,0 +1,42 @@
+name: recovery
+
+# Full-scale recovery harness (plan §9 phase 3): generate reads from the built-in example spec, refit from
+# the generator's CIGARs and check the phase 2 tolerances. The small version runs in the Testing workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      reads:
+        description: Number of training reads (held-out reads are half this)
+        default: "100000"
+      seed:
+        description: Random seed
+        default: "0"
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Run recovery harness
+        env:
+          READS: ${{ inputs.reads }}
+          SEED: ${{ inputs.seed }}
+        run: uv run python -m sequencing_error_model.recovery --reads "$READS" --seed "$SEED" --output recovery.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: recovery-report
+          path: recovery.json
