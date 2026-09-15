@@ -141,8 +141,8 @@ def test_smoothing_borrows_from_neighbouring_q() -> None:
             counts[(q, "A", "A>C")] = errors
     table = CountTable("x", ("q", "context", "op"), "base", True, counts, {"flank": (0, 0)})
 
-    def rates(smooth: float) -> np.ndarray:
-        head = error.fit(table, ["QualityWindow(0)"], alphabet, smooth=smooth)
+    def rates(smooth: float, window_l2: float | None = None) -> np.ndarray:
+        head = error.fit(table, ["QualityWindow(0)"], alphabet, smooth=smooth, window_l2=window_l2)
         return 1 - error.probabilities(head, alphabet, table.marginal("q", "context"))[:, 0]
 
     plain, smoothed = rates(0.0), rates(30.0)
@@ -151,6 +151,11 @@ def test_smoothing_borrows_from_neighbouring_q() -> None:
     assert plain[3] > plain[2]
     assert smoothed[3] < smoothed[2] < smoothed[1] < smoothed[0]
     np.testing.assert_allclose(smoothed[:3], [0.1, 0.03, 0.01], rtol=0.35)  # L2 alone puts Q30 at 1.18x
+
+    # A weak L2 on the window lets the observed bins sit at their empirical rates; smoothing still carries Q40.
+    weak = rates(30.0, window_l2=0.01)
+    np.testing.assert_allclose(weak[:3], [0.1, 0.03, 0.01], rtol=0.1)
+    assert weak[3] < weak[2]
 
 
 def test_mask_and_categories() -> None:
