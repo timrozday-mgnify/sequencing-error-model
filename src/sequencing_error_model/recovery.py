@@ -21,6 +21,7 @@ import tempfile
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from sequencing_error_model.fit import error, indel, quality
 from sequencing_error_model.fit.quality import Array
 from sequencing_error_model.generate import (
     Read,
+    _edits,
     _flank,
     _revcomp,
     fragments,
@@ -38,6 +40,7 @@ from sequencing_error_model.generate import (
     indel_events,
     insert_sizes,
     observations,
+    realign,
 )
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.sources import bam
@@ -249,6 +252,36 @@ def _op_class(op: str) -> str:
     return "match" if op == "=" else "insertion" if op[0] == "-" else "deletion" if op[-1] == "-" else "substitution"
 
 
+_RUNS = ("1", "2", "3+")
+
+
+def indel_profile(records: Sequence[tuple[str, Read, int]], max_length: int = 4) -> dict[str, dict[str, Any]]:
+    """Indel events per template base, and their length distribution (lengths above `max_length` pooled), by
+    kind and the template base's homopolymer run (1, 2, 3+)."""
+    bases = Counter[str]()
+    for template, _, _ in records:
+        for _, stretch in groupby(template.upper()):
+            size = len(list(stretch))
+            bases[_RUNS[min(size, 3) - 1]] += size
+    lengths: dict[str, Array] = {}
+    for (kind, length, run, _), c in indel_events(records).counts.items():
+        h = lengths.setdefault(f"{kind}:{_RUNS[min(int(str(run)), 3) - 1]}", np.zeros(max_length))
+        h[min(int(str(length)), max_length) - 1] += c
+    return {
+        key: {"rate": float(h.sum() / bases[key[2:]]), "lengths": (h / h.sum()).tolist()}
+        for key, h in sorted(lengths.items())
+    }
+
+
+def _refit_error(truth: ErrorModelSpec, table: CountTable, records: Sequence[tuple[str, Read, int]]) -> ErrorModelSpec:
+    """The truth with head E (and any `IndelLength`) refitted with its tokens from `table` and `records`."""
+    body, length_head = indel.split(truth.error_head)
+    head = tuple(error.fit(table, [c.token for c in body], truth.quality_alphabet))
+    if length_head is not None:
+        head += (indel.fit(indel_events(records), length_head.token, truth.quality_alphabet),)
+    return replace(truth, error_head=head)
+
+
 def mask_cost(
     truth: ErrorModelSpec,
     alt_freqs: Sequence[float] = (0.1, 0.2, 0.5),
@@ -334,6 +367,7 @@ def mask_cost(
     return {"reads": n, "genome_length": genome_length, "depth": depth, "seed": seed, "settings": settings}
 
 
+ALIGNER_SCORES = {"minibwa": (2, 8, 12, 2), "minimap2": (2, 4, 4, 2)}  # match, mismatch, gap open, extend
 ALIGNER_READS = {"minibwa": (100, 151), "minimap2": (1000, 2001)}  # default read lengths: short, long
 
 
@@ -362,15 +396,24 @@ def aligner_bias(
     preset: str = "map-ont",
     seed: int = 0,
     min_mapq: int = 20,
+    unclip: bool = False,
 ) -> dict[str, Any]:
     """Aligner bias check (plan phase 5): align generated single-end reads, whose true CIGARs are known, back to
-    their random genome and report how the aligner changes the evidence.
+    their random genome and report how the aligner changes the evidence. With `unclip`, the BAM source realigns
+    soft-clipped reads end to end under the aligner's scores (`sources.bam`), the correction for clipping.
 
     The truth's error rate is scaled by `error_rate_scale` (non-match logits shifted by its log, exactly what
     `generate(error_rate_scale=)` does) and the scaled spec is the truth throughout. Reported, true vs aligned:
     mapped fraction; op-class rates per head E row; per reference site, the fraction of true substitution,
     deletion and insertion counts the alignments place at the same site; mean indel length per kind; and head E
-    refitted from the aligned tuples against the truth on held-out reads (head Q and `IndelLength` kept)."""
+    (with any `IndelLength`) refitted from the aligned tuples against the truth on held-out reads (head Q kept).
+
+    Generated CIGARs can hold edits no alignment recovers (a deletion and an insertion of one base in a
+    homopolymer run cancel), so the metrics are also reported against the observable truth: the true reads
+    `realign`ed end to end under the aligner's own scores (`ALIGNER_SCORES`, first affine gap of each), indels
+    left-aligned (`*_observable`, plus indel rates and lengths by run). That isolates the aligner's heuristics
+    (seeding, bands, clipping); `edits_hidden` and `observable_rate_ratio` size what even the optimal alignment
+    doesn't show."""
     lengths = lengths or ALIGNER_READS[aligner]
     head0 = truth.error_head[0]
     shift = np.r_[0.0, np.full(_K - 1, np.log(error_rate_scale))]
@@ -393,9 +436,13 @@ def aligner_bias(
     fastq.write_text("".join(f"@r{i}\n{r.sequence}\n+\n{r.quality}\n" for i, r in enumerate(reads)))
     run_aligner(aligner, reference, fastq, sam, preset)
 
-    aligned = list(bam.records(sam, reference, min_mapq))
+    scores = ALIGNER_SCORES[aligner]
+    aligned = list(bam.records(sam, reference, min_mapq, unclip=scores if unclip else None))
     a_templates, a_reads, a_mates = (list(x) for x in zip(*aligned, strict=True)) if aligned else ([], [], [])
+    observable = [realign(t, r, scores)[0] for t, r in zip(templates, reads, strict=True)]
     true_table, aligned_table = _tuples(truth, templates, reads, mates), _tuples(truth, a_templates, a_reads, a_mates)
+    observable_table = _tuples(truth, templates, observable, mates)
+    true_records, observable_records = (list(zip(templates, x, mates, strict=True)) for x in (reads, observable))
 
     def op_rates(table: CountTable) -> dict[str, float]:
         oi, c = table.fields.index("op"), Counter[str]()
@@ -415,7 +462,12 @@ def aligner_bias(
         for s, k, rev, t, r in zip(start, size, reverse, templates, reads, strict=True)
     ]
     true_counts = bam.count_alleles(placed, {"g": genome_length})["g"]
-    aligned_counts = bam.pileup(sam, reference, min_mapq).get("g", np.zeros_like(true_counts))
+    observable_counts = bam.count_alleles(
+        [(*p[:5], o, 1) for p, o in zip(placed, observable, strict=True)], {"g": genome_length}
+    )["g"]
+    aligned_counts = bam.pileup(sam, reference, min_mapq, scores if unclip else None).get(
+        "g", np.zeros_like(true_counts)
+    )
     ref = np.array(["ACGT".index(b) for b in genome] + [0])
 
     def columns(c: Array) -> dict[str, Array]:
@@ -423,20 +475,36 @@ def aligner_bias(
         subs[np.arange(len(ref)), ref] = 0
         return {"substitution": subs, "deletion": c[:, 4], "insertion": c[:, 5]}
 
-    true_cols, aligned_cols = columns(true_counts), columns(aligned_counts)
-    rates_true, rates_aligned = op_rates(true_table), op_rates(aligned_table)
+    true_cols, aligned_cols, observable_cols = (columns(c) for c in (true_counts, aligned_counts, observable_counts))
+    rates_true, rates_aligned, rates_observable = (op_rates(t) for t in (true_table, aligned_table, observable_table))
+    profiles = {"true": indel_profile(true_records), "observable": indel_profile(observable_records)}
+    profiles["aligned"] = indel_profile(aligned)
 
-    body, length_head = indel.split(truth.error_head)
-    head = error.fit(aligned_table, [c.token for c in body], truth.quality_alphabet)
-    fitted = replace(truth, error_head=(*head, *([length_head] if length_head else [])))
+    fitted = _refit_error(truth, aligned_table, aligned)
+    observable_fit = _refit_error(truth, observable_table, observable_records)
     held = ["".join(rng.choice(list("ACGT"), size=rng.integers(*lengths))) for _ in range(max(n_reads // 2, 2))]
-    report = compare(truth, fitted, held, [1] * len(held), rng, q_reads=len(held))
+    held_mates = [1] * len(held)
+    report = compare(truth, fitted, held, held_mates, rng, q_reads=len(held))
+    against_observable = compare(observable_fit, fitted, held, held_mates, rng, q_reads=len(held))
+    identified = compare(truth, observable_fit, held, held_mates, rng, q_reads=len(held))
+
+    def by_q(r: Report) -> list[float]:
+        ratio = np.array(r.curves["rate_by_q_fit"]) / np.array(r.curves["rate_by_q_true"])
+        return [round(float(x), 3) for x in ratio]
+
+    def error_failures(r: Report) -> list[str]:
+        return [f for f in r.failures() if not f.startswith("per-position Q")]
+
+    def length_tv(a: dict[str, Any], b: dict[str, Any]) -> float:
+        return round(0.5 * float(np.abs(np.array(a["lengths"]) - np.array(b["lengths"])).sum()), 3)
+
     return {
         "aligner": aligner,
         "preset": preset if aligner == "minimap2" else None,
         "reads": n_reads,
         "lengths": list(lengths),
         "error_rate_scale": error_rate_scale,
+        "unclip": unclip,
         "mapped_fraction": len(aligned) / n_reads,
         "op_rates_true": rates_true,
         "op_rates_aligned": rates_aligned,
@@ -448,10 +516,30 @@ def aligner_bias(
         "mean_indel_length_aligned": mean_lengths(aligned),
         "rate_ratio": report.scalars["rate_ratio"],
         "op_tv": report.scalars["op_tv"],
-        "rate_by_q_ratio": np.round(
-            np.array(report.curves["rate_by_q_fit"]) / np.array(report.curves["rate_by_q_true"]), 3
-        ).tolist(),
-        "failures": [f for f in report.failures() if not f.startswith("per-position Q")],
+        "rate_by_q_ratio": by_q(report),
+        "failures": error_failures(report),
+        "edits_hidden": 1
+        - sum(_edits(t, r) for t, r, _ in observable_records) / sum(_edits(t, r) for t, r, _ in true_records),
+        "observable_rate_ratio": identified.scalars["rate_ratio"],
+        "op_rates_observable": rates_observable,
+        "op_rate_ratio_observable": {k: rates_aligned.get(k, 0.0) / v for k, v in rates_observable.items()},
+        "site_agreement_observable": {
+            k: float(np.minimum(v, aligned_cols[k]).sum() / max(1, v.sum())) for k, v in observable_cols.items()
+        },
+        "indel_by_run": profiles,
+        "indel_rate_ratio_observable": {
+            k: round(profiles["aligned"][k]["rate"] / v["rate"], 3) if k in profiles["aligned"] else 0.0
+            for k, v in profiles["observable"].items()
+        },
+        "indel_length_tv_observable": {
+            k: length_tv(v, profiles["aligned"][k])
+            for k, v in profiles["observable"].items()
+            if k in profiles["aligned"]
+        },
+        "rate_ratio_observable": against_observable.scalars["rate_ratio"],
+        "op_tv_observable": against_observable.scalars["op_tv"],
+        "rate_by_q_ratio_observable": by_q(against_observable),
+        "failures_observable": error_failures(against_observable),
     }
 
 
@@ -480,6 +568,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--aligner", choices=sorted(ALIGNER_READS), help="report aligner bias instead (uses --reads)")
     p.add_argument("--error-rate-scale", type=float, default=1.0, help="with --aligner")
     p.add_argument("--preset", default="map-ont", help="minimap2 preset, with --aligner minimap2")
+    p.add_argument("--unclip", action="store_true", help="with --aligner: realign soft-clipped reads end to end")
     args = p.parse_args(argv)
     if args.mask_cost or args.aligner:
         truth = spec_io.load(args.spec) if args.spec else example_spec()
@@ -495,6 +584,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     error_rate_scale=args.error_rate_scale,
                     preset=args.preset,
                     seed=args.seed,
+                    unclip=args.unclip,
                 )
         else:
             doc = mask_cost(truth, genome_length=args.genome_length, depth=args.depth, seed=args.seed)

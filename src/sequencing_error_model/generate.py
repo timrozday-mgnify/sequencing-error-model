@@ -28,7 +28,8 @@ import re
 import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import groupby
 from pathlib import Path
 from typing import IO, Any, cast
 
@@ -261,6 +262,89 @@ def align(template: str, read: Read) -> tuple[list[tuple[int, str]], list[int | 
                 rows.append((t, f"{x}>-"))
                 tq.append(None)
     return rows, tq
+
+
+def _edits(template: str, read: Read) -> int:
+    """Edit rows of a read's alignment: substitutions and indel bases."""
+    return sum(op != "=" for _, op in align(template, read)[0])
+
+
+def _op_kind(op: str) -> str:
+    return "I" if op[0] == "-" else "D" if op[-1] == "-" else "M"
+
+
+def realign(
+    template: str, read: Read, scores: tuple[int, int, int, int], free_template_ends: bool = False
+) -> tuple[Read, int, int]:
+    """The best alignment of all of `read` to `template` under affine `scores` (match, mismatch, gap open, gap
+    extend; a gap of length L costs open + L * extend): (the read with that CIGAR, template start, end).
+
+    Indels are left-aligned (in a homopolymer run they sit at its first base) and kept whole where scores tie. A
+    trailing insertion becomes clipped bases, as `sources.bam` treats one. With `free_template_ends` the read may
+    start and end anywhere in the template; otherwise both align end to end, in a band that can't cut off the
+    optimum: a path drifting d from the diagonal pays at least open + d * extend, and the read's own CIGAR
+    scores a lower bound. Unit scores (0, 1, 0, 1) give a minimum-edit alignment."""
+    a, b, o, e = scores
+    t, r = (np.frombuffer(s.upper().encode(), np.uint8) for s in (template, read.sequence))
+    n, m = len(t), len(r)
+    if free_template_ends:
+        w = max(n, m)
+    else:
+        rows = [op for _, op in align(template, read)[0]]
+        gaps = [len(list(g)) for kind, g in groupby(map(_op_kind, rows)) if kind != "M"]
+        subs = sum(_op_kind(op) == "M" and op != "=" for op in rows)
+        bound = a * rows.count("=") - b * subs - sum(o + e * g for g in gaps)
+        w = min(max(0, a * min(n, m) - o - bound) // max(e, 1), max(n, m)) + 1
+    neg = -(1 << 30)
+    k = np.arange(2 * w + 1)
+    h, dl, ins = (np.full((n + 1, len(k)), neg, np.int32) for _ in range(3))
+    padded = np.r_[r, 0]
+    for i in range(n + 1):
+        col = i - w + k  # read index of each band cell
+        valid = (col >= 0) & (col <= m)
+        if i == 0:
+            h0, d_row = np.where(col == 0, 0, neg), np.full(len(k), neg)
+        else:
+            diag = np.where(col >= 1, h[i - 1] + np.where(padded[np.clip(col - 1, 0, m)] == t[i - 1], a, -b), neg)
+            d_row = np.maximum(np.r_[h[i - 1, 1:], neg] - o - e, np.r_[dl[i - 1, 1:], neg] - e)
+            h0 = np.maximum(diag, d_row)
+            if free_template_ends:
+                h0 = np.where(col == 0, np.maximum(h0, 0), h0)
+        h0 = np.where(valid, h0, neg)
+        opened = np.maximum.accumulate(h0.astype(np.int64) + e * k)  # an insertion from any cell to the left
+        i_row = np.r_[neg, opened[:-1]] - o - e * k
+        h[i], dl[i], ins[i] = (np.where(valid, np.maximum(x, neg), neg) for x in (np.maximum(h0, i_row), d_row, i_row))
+
+    i = int(np.argmax(h[np.arange(n + 1), m - np.arange(n + 1) + w])) if free_template_ends else n
+    j, end, state, ops = m, i, "H", []
+    while True:
+        d = j - i + w
+        if state == "H":
+            if j == 0 and (free_template_ends or i == 0):
+                break
+            if i and j and h[i, d] == h[i - 1, d] + (a if r[j - 1] == t[i - 1] else -b):  # matches first: gaps go left
+                ops.append("M")
+                i, j = i - 1, j - 1
+            else:
+                state = "D" if i and h[i, d] == dl[i, d] else "I"
+            continue
+        ops.append(state)  # extend a gap whenever that ties, so it stays whole
+        if state == "D":
+            state = "D" if d + 1 < len(k) and dl[i, d] == dl[i - 1, d + 1] - e else "H"
+            i -= 1
+        else:
+            state = "I" if d > 0 and ins[i, d] == ins[i, d - 1] - e else "H"
+            j -= 1
+    ops.reverse()
+    tail = len(ops) - len("".join(ops).rstrip("I"))
+    seq, q, after = read.sequence, read.quality, read.clipped[1]
+    if tail:
+        seq, q, after = seq[:-tail], q[:-tail], q[-tail:] + after
+    cigar = "".join(f"{len(list(g))}{op}" for op, g in groupby(ops[: len(ops) - tail]))
+    aligned = replace(
+        read, sequence=seq, quality=q, cigar=cigar, q_track=np.zeros(0, np.int64), clipped=(read.clipped[0], after)
+    )
+    return aligned, i, end
 
 
 def _filled(template: str, read: Read) -> tuple[list[tuple[int, str]], list[int | None], int]:

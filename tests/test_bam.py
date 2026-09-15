@@ -88,6 +88,31 @@ def test_pileup_and_masks(tmp_path: Path) -> None:
     assert list(bam.records(path, ref, masked={})) == []
 
 
+def test_unclip_recovers_clipped_errors(tmp_path: Path) -> None:
+    rng = np.random.default_rng(11)
+    genome = "".join(rng.choice(list("ACGT"), size=2000))
+    ref = tmp_path / "ref.fa"
+    ref.write_text(f">chr\n{genome}\n")
+    errors = list(genome[500:560])
+    for p in (50, 55):  # two substitutions in the 15 bases the aligner clipped
+        errors[p] = "A" if errors[p] != "A" else "C"
+    adapter = genome[800:845] + "".join(rng.choice(list("ACGT"), size=15))  # 15 bases that aren't the genome
+    path = tmp_path / "clipped.bam"
+    with pysam.AlignmentFile(str(path), "wb", header={"SQ": [{"SN": "chr", "LN": len(genome)}]}) as out:
+        for i, (start, seq) in enumerate(((500, "".join(errors)), (800, adapter))):
+            a = pysam.AlignedSegment(out.header)
+            a.query_name, a.reference_id, a.reference_start, a.mapping_quality = f"r{i}", 0, start, 60
+            a.cigarstring, a.query_sequence = "45M15S", seq
+            a.query_qualities = pysam.qualitystring_to_array("?" * len(seq))
+            out.write(a)
+    scores = (2, 8, 12, 2)
+    assert [r.cigar for _, r, _ in bam.records(path, ref)] == ["45M", "45M"]
+    # The error-rich clip is realigned end to end; the adapter clip is kept.
+    assert [r.cigar for _, r, _ in bam.records(path, ref, unclip=scores)] == ["60M", "45M"]
+    assert _subs(gen.observations(bam.records(path, ref), (2, 2), 1)) == 0
+    assert _subs(gen.observations(bam.records(path, ref, unclip=scores), (2, 2), 1)) == 2
+
+
 def test_cli_fits_spec(tmp_path: Path) -> None:
     path, ref, *_ = _write(tmp_path, 200)
     out, report = tmp_path / "spec", tmp_path / "contigs.tsv"
