@@ -208,8 +208,8 @@ def fit(
     *,
     iterations: int = 30,
     tol: float = 1e-3,
-    smooth: float = 0.0,
-    window_l2: float | None = None,
+    smooth: float = 30.0,
+    window_l2: float | None = 0.01,
     seed: int = 0,
     sources: Sequence[str] = ("pe-overlap",),
 ) -> ErrorModelSpec:
@@ -217,6 +217,10 @@ def fit(
 
     Each iteration refits head E (warm-started) on expected counts, then updates P(mate 1 read the template
     base) per disagreement; it stops when no posterior moves by `tol`, or after `iterations`.
+
+    `smooth` and `window_l2` go to `fit.error.fit`. Overlap evidence has few errors at high Q, so the defaults
+    trade the global L2 on `QualityWindow` for a curvature prior across Q. On a 20,000-pair HiSeq-like simulation
+    they cut mean |log2(fitted / true rate)| over Q >= 30 from 1.54 to 0.97 (plan, phase 4).
     """
     alphabet, groups = tuple(sorted(ev.alphabet)), list(ev.disputed.items())
     first, sizes = np.full(len(groups), 0.5), np.array([n for _, n in groups], float)
@@ -296,6 +300,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--max-pairs", type=int)
     p.add_argument("--min-overlap", type=int, default=20)
     p.add_argument("--iterations", type=int, default=30, help="maximum EM iterations")
+    p.add_argument("--smooth", type=float, default=30.0, help="curvature prior across Q on head E's QualityWindow")
+    p.add_argument("--window-l2", type=float, default=0.01, help="L2 precision on QualityWindow weights")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     m = max(Component(args.error_tokens[0]).args[0], Component(args.quality_tokens[0]).args[0])
@@ -305,6 +311,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.error_tokens,
         args.quality_tokens,
         iterations=args.iterations,
+        smooth=args.smooth,
+        window_l2=args.window_l2,
         seed=args.seed,
         sources=[str(args.r1), str(args.r2)],
     )
