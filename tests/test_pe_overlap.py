@@ -22,6 +22,9 @@ def test_place_finds_offset_read_through_and_indels() -> None:
         s, indel = pe_overlap.place(r1, mutated)
         assert s is None or indel, size
     assert pe_overlap.place("ACGT" * 10, "") == (None, False)
+    # A tandem repeat overlaps equally well at several offsets: ambiguous, so not placed.
+    frag = "".join(rng.choice(list("ACGT"), size=15)) * 5
+    assert pe_overlap.place(frag[:50], gen._revcomp(frag)[:50]) == (None, False)
     # Unrelated mates (long inserts) are neither placed nor mistaken for indels.
     for _ in range(50):
         r1, r2 = ("".join(rng.choice(list("ACGT"), size=125)) for _ in range(2))

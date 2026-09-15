@@ -5,7 +5,8 @@ Per pair, streaming:
 1. `place` finds the gapless offset of reverse-complemented R2 on R1 from bases alone, never Q: the offset with
    the lowest mismatch fraction over at least `min_overlap` comparable bases (then the longest). When the insert
    is shorter than the read, the adapter tails fall outside the overlap, so read-through needs no adapter list.
-2. The pair is dropped and counted when an indel is implied (splitting the overlap at a breakpoint and shifting
+2. The pair is dropped and counted as `no_overlap` when another offset also matches well (`max_rival`), and as
+   `indel` when an indel is implied (splitting the overlap at a breakpoint and shifting
    one side by up to `max_shift` removes at least `min_gain` mismatches), or else when the best offset's
    mismatch fraction exceeds `max_mismatch`.
 3. Every overlapping base where both mates read A, C, G or T gives one head E row per mate, in that mate's own
@@ -78,9 +79,21 @@ def fields(m: int) -> tuple[str, ...]:
 
 
 def place(
-    r1: str, r2: str, min_overlap: int = 20, max_mismatch: float = 0.2, max_shift: int = 3, min_gain: int = 3
+    r1: str,
+    r2: str,
+    min_overlap: int = 20,
+    max_mismatch: float = 0.2,
+    max_shift: int = 3,
+    min_gain: int = 3,
+    max_rival: float = 0.35,
 ) -> tuple[int | None, bool]:
-    """(offset s, indel): reverse-complemented `r2`[k] pairs with `r1`[s + k]; s is None if nothing qualifies."""
+    """(offset s, indel): reverse-complemented `r2`[k] pairs with `r1`[s + k]; s is None if nothing qualifies.
+
+    The pair is ambiguous when any offset more than `max_shift` from the best also has a mismatch fraction below
+    `max_rival`. Repeats and low-complexity sequence give false overlaps with close rivals; on a real HiSeq run
+    with long inserts those were ~70% of placements, at 7-15% mismatches even where both mates had Q >= 30.
+    The threshold is absolute, not a margin over the best offset, so it doesn't reject error-rich true overlaps.
+    """
     a, b = (_BASE[np.frombuffer(s.upper().encode(), np.uint8)] for s in (r1, _revcomp(r2.upper())))
     if not len(a) or not len(b):
         return None, False
@@ -92,7 +105,11 @@ def place(
     if not np.isfinite(frac.min()):
         return None, False
     best = np.flatnonzero(frac == frac.min())
-    s = int(best[np.argmax(n[best])]) - len(b) + 1
+    top = int(best[np.argmax(n[best])])
+    s = top - len(b) + 1
+    rivals = np.abs(np.arange(len(frac)) - top) > max_shift  # nearby offsets are the other side of an indel
+    if rivals.any() and frac[rivals].min() < max_rival:
+        return None, False
 
     i = np.arange(max(0, s), min(len(a), s + len(b)))
 
@@ -122,6 +139,7 @@ def collect(
     max_mismatch: float = 0.2,
     max_shift: int = 3,
     min_gain: int = 3,
+    max_rival: float = 0.35,
 ) -> Evidence:
     """Overlap rows for Q windows of ±`m` and contexts of `flank`, counted over `pairs`.
 
@@ -138,7 +156,7 @@ def collect(
             for p in range(len(seq)):
                 lags = tuple(q[p - k] if p >= k else None for k in range(1, m + 1))
                 ev.quality[(*lags, p + 1, len(seq) - p, mate, padded[p : p + left + right + 1], q[p])] += 1
-        s, indel = place(reads[0], reads[1], min_overlap, max_mismatch, max_shift, min_gain)
+        s, indel = place(reads[0], reads[1], min_overlap, max_mismatch, max_shift, min_gain, max_rival)
         if s is None or indel:
             ev.stats.no_overlap += s is None
             ev.stats.indel += indel
