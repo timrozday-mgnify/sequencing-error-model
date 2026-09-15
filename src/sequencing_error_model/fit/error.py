@@ -186,6 +186,31 @@ def _interaction(u: Array, v: Array, xq: sparse.csr_matrix, xc: sparse.csr_matri
     return np.einsum("nj,njk->nk", uq, per_row), uq, per_row
 
 
+def _walk(m: int, alphabet: Sequence[int], n_slots: int) -> sparse.csr_matrix:
+    """D^T D for second divided differences along the alphabet of each `QualityWindow` offset.
+
+    Curvature, not slope, is penalised, so a sparse Q bin follows its neighbours' trend instead of flattening
+    them (a first-difference prior dragged well-observed bins toward sparse ones). Differences are scaled by
+    the mean Q gap squared, so one `smooth` means the same on binned and unbinned alphabets. `QualityWindow` is
+    the first component, so its slots are 0 (bias) then 1 + offset * (A + 1) + q index; the "beyond the read
+    end" row A is not smoothed.
+    """
+    a, q = len(alphabet), np.asarray(alphabet, float)
+    scale = float(np.mean(np.diff(q))) ** 2 if a > 1 else 1.0
+    rows: list[int] = []
+    cols: list[int] = []
+    vals: list[float] = []
+    for o in range(2 * m + 1):
+        for i in range(1, a - 1):
+            h1, h2 = q[i] - q[i - 1], q[i + 1] - q[i]
+            r, first = len(rows) // 3, 1 + o * (a + 1) + i - 1
+            rows += [r, r, r]
+            cols += [first, first + 1, first + 2]
+            vals += [scale * 2 / (h1 * (h1 + h2)), -scale * 2 / (h1 * h2), scale * 2 / (h2 * (h1 + h2))]
+    diff = sparse.csr_matrix((vals, (rows, cols)), shape=(len(rows) // 3, n_slots))
+    return sparse.csr_matrix(diff.T @ diff)
+
+
 def _category(op: Any, centre: str) -> int:
     if op == "=":
         return 0
@@ -250,14 +275,22 @@ def fit(
     alphabet: Sequence[int],
     *,
     l2: float = 1.0,
+    smooth: float = 0.0,
+    window_l2: float | None = None,
     seed: int = 0,
     init: Sequence[Component] | None = None,
 ) -> tuple[Component, ...]:
     """Fit head E components (in `tokens` order) by penalised maximum likelihood.
 
-    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge. `seed` initialises
-    the `QualityxContext` factors (zero is a saddle point). `init` warm-starts from components fitted with the
-    same tokens on a table with the same rows (EM refits).
+    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge. `window_l2` replaces
+    it on the `QualityWindow` window weights (default: `l2`): L2 pulls every level toward the overall rate, so a
+    weak value lets rare, very low or very high error rates at extreme Q stand. `smooth` is a
+    second-order random-walk prior precision along the quality alphabet on every `QualityWindow` offset: it
+    penalises the curvature of each category's weights across reported Q (see `_walk`). Rare Q bins then
+    follow their neighbours' trend instead of shrinking to the overall rate. It is a prior on shape only; no
+    rate is derived from Q. `seed` initialises the `QualityxContext`
+    factors (zero is a saddle point). `init` warm-starts from components fitted with the same tokens on a
+    table with the same rows (EM refits).
     """
     if init is not None and [c.token for c in init] != list(tokens):
         raise ValueError(f"init tokens {[c.token for c in init]} differ from {list(tokens)}")
@@ -286,8 +319,13 @@ def fit(
             if c.name == "QualityxContext":
                 start[n_lin:] = np.r_[c.params["quality"].ravel(), c.params["context"].ravel()]
     xq, xc = _onehots(d) if rank else (x[:, :0], x[:, :0])
+    walk = _walk(components[0].args[0], alphabet, x.shape[1])
+    precision = np.full(len(start), l2)
+    if window_l2 is not None:  # QualityWindow's window slots follow its bias slot
+        precision[_K : (1 + (2 * components[0].args[0] + 1) * (k_q + 1)) * _K] = window_l2
 
     def objective(flat: Array) -> tuple[float, Array]:
+        smoothed = smooth * np.asarray(walk @ flat[:n_lin].reshape(-1, _K))
         logits = np.asarray(x @ flat[:n_lin].reshape(-1, _K))
         if rank:
             u, v = flat[n_lin:split].reshape(k_q, rank), flat[split:].reshape(3, 5, rank, _K)
@@ -297,14 +335,14 @@ def fit(
         top = logits.max(axis=1, keepdims=True)
         logp = logits - top - np.log(np.exp(logits - top).sum(axis=1, keepdims=True))
         logp[mask] = 0.0
-        nll = -np.sum(counts * logp) + 0.5 * l2 * flat @ flat
+        nll = -np.sum(counts * logp) + 0.5 * flat @ (precision * flat) + 0.5 * np.sum(flat[:n_lin] * smoothed.ravel())
         g = totals[:, None] * np.where(mask, 0.0, np.exp(logp)) - counts
-        grads = [np.asarray(x.T @ g).ravel()]
+        grads = [np.asarray(x.T @ g).ravel() + smoothed.ravel()]
         if rank:
             grads.append(np.asarray(xq.T @ np.einsum("njk,nk->nj", per_row, g)).ravel())
             dv = np.asarray(xc.T @ (uq[:, :, None] * g[:, None, :]).reshape(len(g), -1))
             grads.append(_centre(dv.reshape(3, 5, rank, _K)).ravel())
-        return float(nll), np.concatenate(grads) + l2 * flat
+        return float(nll), np.concatenate(grads) + precision * flat
 
     res = optimize.minimize(objective, start, jac=True, method="L-BFGS-B")
     if not res.success:
