@@ -21,5 +21,21 @@ jobs:
       - name: Install
         run: uv sync --locked
 
+      # Aligner bias checks: minibwa for short reads, minimap2 for long reads (pinned release binaries).
+      - name: Install aligners
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.7 -R lh3/minibwa -p "minibwa-*_x64-linux.tar.bz2" -D "$RUNNER_TEMP"
+          gh release download v2.31 -R lh3/minimap2 -p "minimap2-*_x64-linux.tar.bz2" -D "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/bin"
+          for f in "$RUNNER_TEMP"/*_x64-linux.tar.bz2; do tar -xjf "$f" -C "$RUNNER_TEMP"; done
+          cp "$RUNNER_TEMP"/minibwa-*_x64-linux/minibwa "$RUNNER_TEMP"/minimap2-*_x64-linux/minimap2 "$RUNNER_TEMP/bin/"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/minimap2" --version
+          "$RUNNER_TEMP/bin/minibwa" version || "$RUNNER_TEMP/bin/minibwa" 2>&1 | head -3
+
       - name: Test
+        env:
+          REQUIRE_ALIGNERS: "1"
         run: uv run pytest -vv

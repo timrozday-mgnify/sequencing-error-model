@@ -16,6 +16,16 @@ def templates(n: int, seed: int) -> tuple[list[str], list[int]]:
     return seqs, [int(m) for m in rng.integers(1, 3, size=n)]
 
 
+def test_indel_events() -> None:
+    # ACGT, a 2-base deletion inside the TTTT run, TG, a GG insertion before C, CA.
+    read = gen.Read("ACGTTGGGCA", "".join(chr(33 + q) for q in range(10, 20)), "4M2D2M2I2M", np.zeros(0))
+    table = gen.indel_events([("ACGTTTTGCA", read, 1)])
+    # The deleted Ts take the next read base's Q (14); the insertion is placed at C, whose Q is 18.
+    assert table.counts == Counter({("D", 2, 4, 14): 1, ("I", 2, 1, 18): 1})
+    masked = gen.indel_events([("ACGTTTTGCA", replace(read, masked=frozenset({4})), 1)])
+    assert masked.counts == Counter({("I", 2, 1, 18): 1})
+
+
 def test_reads_are_alignment_consistent() -> None:
     model = recovery.example_spec()
     seqs, mates = templates(300, seed=1)

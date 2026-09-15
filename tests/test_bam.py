@@ -7,6 +7,7 @@ import pysam
 from sequencing_error_model import generate as gen
 from sequencing_error_model import recovery
 from sequencing_error_model import spec as spec_io
+from sequencing_error_model.observations import CountTable
 from sequencing_error_model.sources import bam
 
 
@@ -59,11 +60,41 @@ def test_records_reproduce_generator_tuples(tmp_path: Path) -> None:
     assert got.counts == expected.counts
 
 
+def _subs(table: CountTable) -> int:
+    return sum(n for k, n in table.counts.items() if ">" in str(k[-1]) and "-" not in str(k[-1]))
+
+
+def test_pileup_and_masks(tmp_path: Path) -> None:
+    path, ref, *_ = _write(tmp_path, 300)
+    counts = bam.pileup(path, ref)
+    table = gen.observations(bam.records(path, ref), (2, 2), 1)
+    # The pileup counts the same draws as the tuples, in reference orientation.
+    assert counts["chr"].sum() == sum(table.counts.values())
+    genome = ref.read_text().split("\n")[1]
+    matches = counts["chr"][np.arange(len(genome)), ["ACGT".index(b) for b in genome]].sum()
+    assert matches == table.marginal("op").counts[("=",)]
+    depth = counts["chr"][:, :5].sum(axis=1)
+    p = int(depth.argmax())
+    bad = tmp_path / "bad.fa"  # a reference error at the deepest site
+    bad.write_text(f">chr\n{genome[:p]}{'C' if genome[p] == 'A' else 'A'}{genome[p + 1 :]}\n")
+    masked, report = bam.masks(bam.pileup(path, bad), bad, 0.5)
+    # The fixture has ~14% errors at depth ~4, so chance sites are masked too; the clonal cost is a later item.
+    assert masked["chr"][p] and report[0]["masked_sites"] == masked["chr"].sum()
+    before = gen.observations(bam.records(path, bad), (2, 2), 1)
+    after = gen.observations(bam.records(path, bad, masked=masked), (2, 2), 1)
+    assert _subs(before) - _subs(after) >= 0.8 * depth[p]
+    assert sum(before.counts.values()) - sum(after.counts.values()) >= depth[p]
+    assert bam.masks(counts, ref, None, min_contig_depth=1e6)[0] == {}
+    assert list(bam.records(path, ref, masked={})) == []
+
+
 def test_cli_fits_spec(tmp_path: Path) -> None:
     path, ref, *_ = _write(tmp_path, 200)
-    out = tmp_path / "spec"
+    out, report = tmp_path / "spec", tmp_path / "contigs.tsv"
     args = [str(path), str(ref), "--output", str(out), "--error-tokens", "QualityWindow(1)", "Context(1,1)"]
+    args += ["--mask-alt-freq", "0.5", "--contig-report", str(report)]
     assert bam.main([*args, "--quality-tokens", "QualityMarkov(1)", "Position(3)"]) == 0
     spec = spec_io.load(out)
     # The Q±1 window reaches the clipped base beside each aligned end: Q30 (forward) and Q21 (reverse).
     assert spec.provenance["mode"] == "reference" and spec.quality_alphabet == (2, 12, 21, 23, 30, 37)
+    assert spec.provenance["contigs_kept"] == 1 and report.read_text().startswith("contig\tlength\tmean_depth")
