@@ -49,6 +49,15 @@ jobs:
       - name: Parse regenerated outputs
         run: SKIVER_ANALYZE_DIR="$RUNNER_TEMP/out" uv run pytest -vv tests/test_skiver_analyze.py
 
+      # Committed fixtures come from this artifact: skiver's x86-64 release binary and an
+      # arm64 build count slightly differently, so only CI output diffs cleanly.
+      - name: Upload regenerated outputs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: skiver-analyze-${{ matrix.skiver }}
+          path: ${{ runner.temp }}/out/analyze.*.csv
+
       # Bootstrap CIs (hazard_rate, summary_error_rate, summary_phred, summary_gc_content) vary run to run.
       - name: Diff deterministic outputs against committed fixtures
         if: matrix.skiver == 'v0.3.2'

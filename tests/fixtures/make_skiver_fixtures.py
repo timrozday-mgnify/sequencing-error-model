@@ -64,7 +64,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     reads = out / "reads.fastq"
     reads.write_text(make_reads(random.Random(SEED)))
-    cmd = [skiver, "analyze", str(reads), "-k", "11", "-v", "13", "-c", "8", "-t", "1", "-o", str(out / "analyze")]
+    cmd = [skiver, "analyze", str(reads), "-k", "11", "-v", "13", "-c", "8", "-o", str(out / "analyze")]
     subprocess.run(cmd, check=True)
 
 

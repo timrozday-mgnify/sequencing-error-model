@@ -1,6 +1,10 @@
 # Standardised across the MIMICC/ENA repos (revs match
 # mimicc-ena-submission-assistant). When bumping a rev, bump it in all of them
 # together so a file formatted in one repo is not reformatted by another.
+
+# skiver fixtures must stay byte-identical to skiver's output (skiver-compat diffs them).
+exclude: ^tests/fixtures/skiver-v
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
