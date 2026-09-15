@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 is in progress (the generator and `sem-generate` landed); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
 
 ## 1. Goal
 
@@ -516,7 +516,12 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - per-position Q histograms are within TV < 0.05;
   - the marginal error rate is within 5%.
 
-### Phase 3: native generator (bases + qualities, single or paired) and recovery harness
+### Phase 3: native generator (bases + qualities, single or paired) and recovery harness (in progress)
+- ✓ `generate.py` (§5.3), vectorised across a batch's bases: sample the template-indexed Q track (head Q), draw head E outcomes from each base's Q window, then materialise bases, qualities and CIGAR. As in the fork, an insertion draws again at the same base (up to `max_ins_run`), so head E rows are per draw. Deletions drop q_t. Inserted bases reuse q_t until `InsertionQuality` exists. Non-ACGT template bases pass through as N matches. `Homopolymer` now stores its fitted flank in `meta` so generation rebuilds the same window.
+  - `align` / `observations` re-derive head E tuples from template + read + CIGAR. The Q window is template-indexed from the read; a deleted base takes the next read base's Q (the fork's dump gives deletions no Q), so windows touching a deletion differ from the generator's track. **Open:** settle the deletion-Q convention with `reference` tuples (phase 5).
+  - CLI `sem-generate` keeps the fork's `skiver-generate` flags and `@name cigar:CIGAR` output; `--model` is a spec directory (no presets or `.pt`). genome-blender switches via its generate command setting.
+  - Tests: CIGAR/sequence/quality lengths agree and read-derived qualities equal the Q track at every non-deleted base; refitting both heads from the generator's own CIGARs recovers the marginal error rate (5%), per-Q rates (10%) and Q lag/context effects (r > 0.9); the CLI is deterministic per seed and matches the header contract.
+- Still to do in phase 3 (below): insert-size sampling for standalone paired output (genome-blender already supplies pairs), the recovery-harness metrics module and the `workflow_dispatch` full-scale run.
 - `generate.py` implementing §5.3. Qualities are always emitted from head Q, and `--no-quality` is kept only for compatibility. It keeps the `skiver-generate` CLI contract so genome-blender can switch without code changes, and adds an alignment-consistency self-test.
 - Paired-end output with an insert-size distribution stored in the spec. The generator is the truth-known fixture source for every mode: overlapping pairs for `pe-overlap`, reads plus their true CIGARs for `reference`, reads for skiver.
 - A mode-agnostic recovery harness: generate from a known spec, run one mode's source and fitters, compare with the spec. Each mode plugs in as it lands. Metrics:
