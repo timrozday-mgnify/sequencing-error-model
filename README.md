@@ -3,9 +3,12 @@
 > Working name. Early planning stage: there is no usable functionality yet.
 
 Train sequencing error models from [skiver](https://github.com/GZHoffie/skiver)
-(k,v)-mer outputs, which need no reference genome or alignment. Optional extra evidence
-sources — raw FASTQ quality profiles, paired-end overlaps, self-assembled references,
-ONT duplex reads, GATK/DADA2 error tables — fill the gaps skiver can't cover. The trained models
+(k,v)-mer outputs, which need no reference genome or alignment. Models are
+quality-aware: they estimate the error profile of a base from its reported quality and the
+surrounding bases and qualities (quality is a feature, never treated as the true error rate),
+and generated reads carry both bases and qualities. Optional extra evidence sources —
+paired-end overlaps, self-assembled references, ONT duplex reads, GATK/DADA2 error tables —
+fill the gaps skiver can't cover. The trained models
 can then be used to simulate reads, either with the built-in generator or by
 exporting them to widely used read simulators (ART/art_modern, InSilicoSeq, Badread,
 PBSIM3, NEAT, ...).
