@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phase 0 (repo, CI and PR policy) is done; phase 1 is in progress (skiver analyze parsers, fixtures, `skiver-compat`, FASTQ quality statistics and the observation schema landed); everything else is planned.
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (default-mode inputs) are done; phase 2 is in progress (`spec.py` landed); everything else is planned.
 
 ## 1. Goal
 
@@ -431,7 +431,7 @@ Each phase lands as one or more PRs with green CI. Exit criteria are testable.
 ### Phase 0: repository, CI and PR policy ✓
 uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), Linting, Testing and Release workflows, PR template, and a `main` ruleset requiring PRs with passing `lint` + `test`.
 
-### Phase 1: default-mode inputs (in progress)
+### Phase 1: default-mode inputs ✓
 - ✓ `sources/skiver_analyze.py`: typed, header-validated parsers for all v0.3.x analyze CSVs. `summary_phred.csv`'s counting convention is documented (§5.6).
 - ✓ `sources/fastq_quality.py`: streaming quality-process statistics from raw FASTQ(.gz), per mate (one call per mate, several lanes allowed). Labelled in code and spec as a feature/output source, never as error evidence. Collects sparse counters for:
   - per-position Q histograms (from the read start);
@@ -441,10 +441,10 @@ uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), L
 - ✓ `observations.py`: the sparse tuple schema shared by all sources. A `CountTable` is a sparse count over a subset of one field vocabulary (`op`, `context`, `locus`, `q`/`q±i`, `t`, `pos_start`/`pos_end`, `strand`, `mate`, `gc`, `length`); fewer fields means a marginal of the joint model. Tables declare their unit (base, value, read, error event) and whether they are truth-bearing, and the constructor rejects an `op` field on non-truth tables, so quality-only sources can't carry error labels. Positions and `t` are 1-based value/read positions throughout (skiver's k + t is rebased). `skiver_analyze.tables` and `fastq_quality.tables` convert both default-mode sources; the fitted-parameter files (`summary_error_rate.csv`, `survival_rate.csv`) stay on `SkiverAnalyze` as passthrough, and `kvmer.csv` keys failing skiver's filter are dropped.
 - ✓ **Fixtures.** A tiny synthetic genome plus reads with known injected errors *and qualities* (`tests/fixtures/make_skiver_fixtures.py`, seeded), analysed by the skiver v0.3.2 x86-64 release binary (taken from the `skiver-compat` artifact; an arm64 build counts slightly differently). The CSVs are committed (`tests/fixtures/skiver-v0.3.2/`, ~130 KB); the reads are regenerated, not committed.
 - ✓ **CI job `skiver-compat`.** Downloads skiver release binaries (matrix: v0.3.1, v0.3.2, latest), regenerates the fixtures, runs the parser tests on them and diffs the deterministic files (bootstrap CIs vary run to run) against the committed fixtures. It runs on PR only when `sources/skiver_*` changes, plus a weekly schedule to catch new releases.
-- **Exit:** every analyze file and the FASTQ statistics round-trip into the schema; unsupported versions fail with a clear error.
+- ✓ **Exit:** every analyze file and the FASTQ statistics round-trip into the schema; unsupported versions fail with a clear error.
 
-### Phase 2: model spec, both heads, default-mode fitting
-- `spec.py` (JSON + npz, schema-versioned, quality alphabet, provenance, `generative`/`identified` flags).
+### Phase 2: model spec, both heads, default-mode fitting (in progress)
+- ✓ `spec.py`: an `ErrorModelSpec` directory of `spec.json` (schema version, quality alphabet, provenance with required `mode`, component tokens, `generative`/`identified` flags, meta) and `arrays.npz` (parameters and cached marginals; object arrays are rejected and loading never unpickles). Tokens are validated against the §5.4 component names and the heads each may appear in, plus `GC`, `Weibull` and `InsertionQuality` from this phase; the shared `Latent(S)` layer sits outside both heads. Argument arity is left to each fitter. Loading rejects other schema versions, missing arrays and unreferenced arrays.
 - Head Q fitters: `QualityMarkov(m)`, `Position`, `Mate`, `Context` on observed bases, insertion-quality sub-head (base-profile prior in default mode).
 - Head E fitters:
   - latent-position `Context(L,R)` from `kvmer.csv` with the true-base mask;
