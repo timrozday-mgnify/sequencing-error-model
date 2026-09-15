@@ -11,6 +11,11 @@ def test_marginal() -> None:
     assert t.marginal().counts == {(): 15}
 
 
+def test_expected_counts_are_fractional() -> None:
+    t = CountTable("x", ("q", "op"), "base", True, Counter({(2, "="): 0.25, (2, "A>C"): 0.75}))
+    assert t.marginal("q").counts == {(2,): 1.0}
+
+
 def test_op_needs_truth() -> None:
     with pytest.raises(ValueError, match="quality is never error truth"):
         CountTable("x", ("q", "op"), "base", False, Counter({(2, "!"): 1}))

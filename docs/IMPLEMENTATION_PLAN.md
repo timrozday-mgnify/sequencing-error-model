@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) is in progress (source, EM fit and recovery test landed; the real-run exit and the ErrorProfiler comparison remain); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
 
 ## 1. Goal
 
@@ -531,16 +531,18 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 - A small version runs in CI (a few seconds of reads); the full-scale version is a manual `workflow_dispatch` workflow.
 - **Exit:** re-deriving tuples from the generator's own CIGARs and refitting recovers the spec for both heads within the phase 2 tolerances; the alignment-consistency self-test passes.
 
-### Phase 4: `pe-overlap` mode
-- `sources/pe_overlap.py` (Illumina), streaming over paired FASTQ(.gz):
-  - place the overlap per pair gaplessly, handling read-through into adapters when the insert is shorter than the read. Placement uses bases only, never Q;
-  - emit one tuple per overlapping template base: both mates' bases and quality windows, cycle positions, mate, strand, and the consensus context;
-  - where mates disagree, the template base is latent. Symmetric EM with head E over both mates' windows attributes the error, never the higher Q;
-  - record the overlap exposure per read position, so position effects are not biased by the insert-size distribution;
-  - drop and count pairs whose discordance implies an indel, or whose overlap is below a minimum length.
-- Tables declare `pe-overlap` truth and substitution-only op classes; the spec flags indel and PCR/library components as not identified.
-- Recovery test on generated pairs with known errors (phase 3). Reads are regenerated, not committed.
-- Reported, not blocking: run ErrorProfiler on the same data and compare its substitution × Q tables.
+### Phase 4: `pe-overlap` mode (in progress)
+- ✓ `sources/pe_overlap.py` (Illumina), streaming over paired FASTQ(.gz):
+  - ✓ place the overlap per pair gaplessly, handling read-through into adapters when the insert is shorter than the read. Placement uses bases only, never Q (lowest mismatch fraction over ≥ `min_overlap` bases, then longest);
+  - ✓ emit one head E row per mate per overlapping base, in the mate's own orientation: Q window, cycle position, mate, strand, and the consensus context (N where mates disagree, the mate's own bases outside the overlap);
+  - ✓ where mates disagree, the template base is latent. Soft EM with head E over both mates' rows attributes the error, starting from a coin flip, never the higher Q. Rows carry expected (fractional) counts, and `fit.error.fit(init=)` warm-starts each refit;
+  - ✓ the rows are the overlap exposure per read position, so position effects are fitted conditional on what the overlap covers;
+  - ✓ drop and count pairs whose discordance implies an indel (a breakpoint plus a shift of ≤ 3 removes ≥ 3 mismatches, checked before the mismatch cap) or whose best overlap is shorter than `min_overlap` or above 20% mismatches. A tight cap (NGmerge's 10%) dropped the error-rich pairs and biased rates down 8% in recovery.
+  - ✓ head Q is fitted from every base of every pair, placed or not, on observed bases. Fitting it on kept overlaps only biased it (per-position TV 0.067), because the dropped pairs are the low-Q ones.
+- ✓ The spec records `identified_ops: ["substitution"]` and gets −inf indel logits, so generation from it emits no indels; PCR/library errors cancel and are absent. `recovery.compare(substitutions_only=True)` compares on that support; `recovery.paired_draw` feeds the harness pairs from `generate.fragments`.
+- ✓ Recovery test on generated pairs (3000 pairs, ~3.5% errors) passes the phase 2 tolerances. Reads are regenerated, not committed. At ~1% errors the per-Q rates settle within 10% only by ~10k pairs; there, Q37 (rate 0.002) still comes out 14% high, probably L2 shrinkage of the rarest window weights. **Open.**
+- CLI: `python -m sequencing_error_model.sources.pe_overlap R1 R2 --output SPEC` writes a spec whose provenance carries the pair statistics.
+- Still to do: the real Illumina run; reported, not blocking: run ErrorProfiler on the same data and compare its substitution × Q tables.
 - **Exit:**
   - on generated pairs, the substitution part of head E (context, `QualityWindow`, position, mate) and head Q are recovered within the phase 2 tolerances;
   - on one real Illumina run, a fitted spec and a report are produced.
