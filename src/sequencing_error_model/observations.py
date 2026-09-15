@@ -9,6 +9,9 @@ Quality is never error truth (plan §1): the `op` field is only allowed on table
 truth-bearing sources (`truth=True`), so a table built from reported qualities cannot
 carry error labels.
 
+Counts are non-negative numbers. Fractional counts are expected counts, e.g. `pe-overlap`'s EM attribution
+of a mate disagreement.
+
 Field vocabulary (positions are 1-based):
 
 - `op`: "=" (base matched, or observation survived), "!" (error of unrecorded type),
@@ -69,7 +72,7 @@ class CountTable:
             raise ValueError(f"{self.source}: op labels need a truth-bearing source; quality is never error truth")
         op = self.fields.index("op") if "op" in self.fields else None
         for key, n in self.counts.items():
-            if len(key) != len(self.fields) or not isinstance(n, int) or n < 0:
+            if len(key) != len(self.fields) or not isinstance(n, int | float) or n < 0:
                 raise ValueError(f"{self.source}: bad entry {key!r}: {n!r} for fields {self.fields}")
             if op is not None and key[op] not in OP_VALUES:
                 raise ValueError(f"{self.source}: unknown op {key[op]!r}")

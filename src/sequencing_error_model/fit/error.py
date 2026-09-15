@@ -245,13 +245,22 @@ def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], tab
 
 
 def fit(
-    table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2: float = 1.0, seed: int = 0
+    table: CountTable,
+    tokens: Sequence[str],
+    alphabet: Sequence[int],
+    *,
+    l2: float = 1.0,
+    seed: int = 0,
+    init: Sequence[Component] | None = None,
 ) -> tuple[Component, ...]:
     """Fit head E components (in `tokens` order) by penalised maximum likelihood.
 
     `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge. `seed` initialises
-    the `QualityxContext` factors (zero is a saddle point).
+    the `QualityxContext` factors (zero is a saddle point). `init` warm-starts from components fitted with the
+    same tokens on a table with the same rows (EM refits).
     """
+    if init is not None and [c.token for c in init] != list(tokens):
+        raise ValueError(f"init tokens {[c.token for c in init]} differ from {list(tokens)}")
     components = [Component(t) for t in tokens]
     _check(components)
     counts, d = _labelled(table, components, alphabet)
@@ -271,6 +280,11 @@ def fit(
     mask, totals = _mask(d), counts.sum(axis=1)
     start = np.zeros(split + 15 * rank * _K)
     start[n_lin:split] = np.random.default_rng(seed).normal(scale=0.1, size=k_q * rank)
+    if init is not None:
+        start[:n_lin] = np.vstack([c.params[p].reshape(-1, _K) for c in init for p in _shapes(c, d)]).ravel()
+        for c in init:
+            if c.name == "QualityxContext":
+                start[n_lin:] = np.r_[c.params["quality"].ravel(), c.params["context"].ravel()]
     xq, xc = _onehots(d) if rank else (x[:, :0], x[:, :0])
 
     def objective(flat: Array) -> tuple[float, Array]:

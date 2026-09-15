@@ -26,11 +26,12 @@ import numpy as np
 from sequencing_error_model import spec as spec_io
 from sequencing_error_model.fit import error, quality
 from sequencing_error_model.fit.quality import Array
-from sequencing_error_model.generate import Read, _flank, generate, observations
+from sequencing_error_model.generate import Read, _flank, fragments, generate, insert_sizes, observations
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component, ErrorModelSpec
 
 Mode = Callable[[list[str], list[Read], list[int], ErrorModelSpec], ErrorModelSpec]
+Draw = Callable[[np.random.Generator, int], tuple[list[str], list[int]]]
 TOLERANCES = {"rate": 0.05, "rate_by_q": 0.10, "q_position_tv": 0.05}
 _K = len(error.CATEGORIES)
 
@@ -141,14 +142,20 @@ def compare(
     mates: Sequence[int],
     rng: np.random.Generator,
     q_reads: int = 20000,
+    substitutions_only: bool = False,
 ) -> Report:
     """Metrics of `fitted` against `truth` on reads generated from `templates`; Q-track statistics use at least
-    `q_reads` sampled tracks per spec."""
+    `q_reads` sampled tracks per spec. `substitutions_only` compares both heads E conditional on no indel, the
+    support of `pe-overlap`."""
     alphabet = np.asarray(truth.quality_alphabet)
     true_reads = generate(truth, templates, mates, rng)
     table = _tuples(truth, templates, true_reads, mates)
     n = np.array(list(table.counts.values()), float)
     p_true, p_fit = (error.probabilities(s.error_head, truth.quality_alphabet, table) for s in (truth, fitted))
+    if substitutions_only:
+        p_true, p_fit = (
+            np.pad(p[:, :5] / p[:, :5].sum(axis=1, keepdims=True), ((0, 0), (0, _K - 5))) for p in (p_true, p_fit)
+        )
     with np.errstate(divide="ignore", invalid="ignore"):
         kl = np.where(p_true > 0, p_true * np.log(p_true / p_fit), 0.0).sum(axis=1)
     e_true, e_fit = n * (1 - p_true[:, 0]), n * (1 - p_fit[:, 0])
@@ -196,18 +203,34 @@ def recover(
     seed: int = 0,
     mode: Mode = cigar_mode,
     lengths: tuple[int, int] = (30, 41),
+    draw: Draw | None = None,
+    substitutions_only: bool = False,
 ) -> tuple[ErrorModelSpec, Report]:
-    """Generate `n_reads` from `truth`, fit with `mode`, and compare on `n_reads // 2` held-out reads."""
+    """Generate `n_reads` from `truth`, fit with `mode`, and compare on `n_reads // 2` held-out reads.
+
+    `draw(rng, n)` gives n templates and their mates (default: independent random reads of `lengths`)."""
     rng = np.random.default_rng(seed)
 
-    def draw(n: int) -> tuple[list[str], list[int]]:
+    def single(rng: np.random.Generator, n: int) -> tuple[list[str], list[int]]:
         templates = ["".join(rng.choice(list("ACGT"), size=rng.integers(*lengths))) for _ in range(n)]
         return templates, [int(m) for m in rng.integers(1, 3, size=n)]
 
-    templates, mates = draw(n_reads)
+    draw = draw or single
+    templates, mates = draw(rng, n_reads)
     fitted = mode(templates, generate(truth, templates, mates, rng), mates, truth)
-    held, held_mates = draw(max(n_reads // 2, 1))
-    return fitted, compare(truth, fitted, held, held_mates, rng)
+    held, held_mates = draw(rng, max(n_reads // 2, 2))
+    return fitted, compare(truth, fitted, held, held_mates, rng, substitutions_only=substitutions_only)
+
+
+def paired_draw(read_length: int, insert_mean: float, insert_sd: float, genome_length: int = 100_000) -> Draw:
+    """A `draw` of interleaved mate 1, mate 2 templates from `generate.fragments` on a random genome."""
+
+    def draw(rng: np.random.Generator, n: int) -> tuple[list[str], list[int]]:
+        genome = "".join(rng.choice(list("ACGT"), size=genome_length))
+        pairs = fragments([("g", genome)], insert_sizes(insert_mean, insert_sd), n // 2, read_length, rng)
+        return [t for _, r1, r2 in pairs for t in (r1, r2)], [1, 2] * (n // 2)
+
+    return draw
 
 
 def main(argv: Sequence[str] | None = None) -> int:
