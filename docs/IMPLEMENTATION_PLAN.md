@@ -1,26 +1,51 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (default-mode inputs) are done; phase 2 is in progress (`spec.py` landed); everything else is planned.
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py` landed); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
 
 ## 1. Goal
 
 A Python package and CLI that:
 
-1. **learns** a sequencing error model from skiver outputs, with no reference genome or alignment required. Skiver is the primary evidence source; optional additional sources (§4.3) fill the gaps skiver can't cover;
+1. **learns** a sequencing error model from any of three independent kinds of evidence, the **evidence modes** (§1.1): paired-end overlap, alignment to a reference or self-assembly, and k-mer consensus (skiver). Two of the three need no external reference. Every mode trains the same kind of model (§5), so models from different modes can be compared directly;
 2. **models bases and qualities jointly** (§5). The core quantity is the error profile of a base *given its own quality score, the surrounding bases and qualities*, and other context such as read position, mate, strand and read-level state;
 3. **generates** reads with that model, outputting **both bases and quality scores**, and keeping the `FASTA in → FASTQ + CIGAR out` contract that genome-blender already uses; and
 4. **exports** the model to the native formats of popular, maintained read simulators, so it plugs into existing pipelines (including the metagenome wrappers CAMISIM and MeSS).
 
-**Quality scores are never treated as evidence of error.** A reported Q is a feature that may covary with the true error rate, and an output the generator must reproduce. Error labels only come from truth-bearing sources: skiver consensus, mate overlap, alignment to a self-assembled or control reference, duplex reads, and so on.
+**Quality scores are never treated as evidence of error.** A reported Q is a feature that may covary with the true error rate, and an output the generator must reproduce. Error labels only come from truth-bearing sources: mate overlap, alignment to a reference or self-assembly, skiver consensus, duplex reads, and so on.
 
-It runs in two modes:
+Out of scope: signal-level simulation (squigulator, seq2squiggle), variant/mutation models, abundance/community modelling (CAMISIM and MeSS already do this), and error *correction*. Quality recalibration is produced as a diagnostic, not as a read-rewriting tool.
 
-| Mode | Input | skiver build |
+### 1.1 Evidence modes
+
+| Mode | Truth for error labels | Input | External reference? | Platforms |
+|---|---|---|---|---|
+| **`pe-overlap`** | Agreement of R1 and R2 where they overlap | paired FASTQ | No | Illumina (inserts short enough to overlap) |
+| **`reference`** | Alignment to a reference: an external genome, a spike-in or mock community (PhiX, lambda, ZymoBIOMICS), or a polished self-assembly of the sample | FASTQ + reference or contigs + BAM/CRAM | Yes, but the sample's own assembly counts | all |
+| **`kmer`** | skiver (k,v)-mer consensus | skiver outputs + raw FASTQ | No | all |
+
+The `kmer` mode has two skiver builds:
+
+| Build | Input | skiver build |
 |---|---|---|
 | **default** | `skiver analyze` CSVs (+ raw FASTQ for the quality model) | unmodified upstream release, pinned (currently **v0.3.2**) |
 | **enhanced** | `skiver dump` per-observation outputs (plus the default inputs) | modified skiver: a new, minimal fork of GZHoffie/skiver, seeded from the `timrozday-mgnify/skiver` fork (§12, decision 5) |
 
-Out of scope: signal-level simulation (squigulator, seq2squiggle), variant/mutation models, abundance/community modelling (CAMISIM and MeSS already do this), and error *correction*. Quality recalibration is produced as a diagnostic, not as a read-rewriting tool.
+"Default mode" and "enhanced mode", here and in the repo, mean the `kmer` mode on these two builds.
+
+**One model, three kinds of evidence.** All modes reduce to the same observation schema (§7) and fit the same two heads with the same component vocabulary (§5.4). They differ only in which components they identify (§5.6, §8). That makes cross-mode comparison a validation tool:
+
+- **`pe-overlap` and `reference` are built first** (phases 4–5). They observe the exact error position together with per-observation quality windows, so fitting from them is direct: no latent edit position and no marginal matching.
+- **They then check the `kmer` mode** (phase 6), at two levels:
+  - *evidence*: on the same reads, the marginal tables skiver reports (spectrum, P(error | Q), position curve, GC, clustering) are tabulated from overlap and alignment observations and compared with skiver's CSVs;
+  - *model*: the fitted specs are compared per component and on held-out likelihood of each other's observations.
+- **Their truth assumptions fail differently**, so agreement between two modes is stronger evidence than either alone:
+  - `pe-overlap` cancels errors both mates share (PCR, library and cluster errors) and sees only substitutions, only inside the overlap;
+  - `reference` includes PCR errors and indels, but inherits reference errors, strain divergence and aligner scoring bias;
+  - `kmer` includes PCR errors, needs consensus coverage and drops errors its outlier filter hides.
+
+  Comparisons are restricted to the support two modes share (genomes, op classes, read positions). Gaps expected from these differences are reported as estimates, not failures. For example, the `reference` minus `pe-overlap` substitution rate estimates the PCR/library error contribution.
+
+Reference-free training stays the project's niche (§4.4). The `reference` mode is a mode in its own right and the validation anchor for the other two.
 
 ---
 
@@ -61,7 +86,7 @@ The current fork adds `skiver dump` (`src/dump.rs`) with `--raw`, `--base`, `--s
 | `survival_observations.tsv` | Per-observation first-error time |
 | `windows.bin` | Read-ordered 13-byte records (~430 MB, 75× smaller than the TSV). Enables read-level latent-state HMM fitting, but carries **no qualities** |
 
-Candidate *new* outputs for the new minimal fork (§9, phase 7):
+Candidate *new* outputs for the new minimal fork (§9, phase 10):
 
 - **key-side qualities**, so the quality window extends left of t=1;
 - a per-window quality summary in `windows.bin`, so a read-level latent state can drive both Q and errors;
@@ -118,14 +143,14 @@ Maintenance data is from the GitHub API on 2026-09-15. "Q coupling" describes ho
 | Simulator | Reads | Last push / ★ | Error model format | Q coupling | Where it's used | Export fidelity from our model |
 |---|---|---|---|---|---|---|
 | **ART** / **art_modern** | Illumina (+ MGI, AVITI, Onso profiles) | art_modern 2026-07 / 39 (original ART unmaintained, still ubiquitous) | Text quality profiles (per-position Q distributions, optionally per base); indel rates as CLI flags (`-ir/-dr/-ir2/-dr2`) | Q sampled per position, then substitution probability = 10^(−Q/10), i.e. assumes perfectly calibrated Q; no neighbour or context effects | MeSS, CAMISIM, countless pipelines | Medium. Per-position Q marginals map well. Our calibration can't be expressed without distorting either the Q distribution or the error rate (§6.3). Context and Q-window effects are lost |
-| **InSilicoSeq** | Illumina (MiSeq/HiSeq/NextSeq/NovaSeq) | 2026-09 / 227 | `.npz` with `read_length`, `insert_size`, `mean_count_{forward,reverse}`, `quality_hist_{forward,reverse}`, `subst_choices_*` (per position × base), `ins_*`, `del_*` | Q-driven substitutions (to verify in phase 4) plus per-position substitution choices and indel rates | Metagenome benchmarking | Medium. Per-position Q histograms and substitution/indel tables are populated from marginals of both heads; same calibration caveat as ART |
+| **InSilicoSeq** | Illumina (MiSeq/HiSeq/NextSeq/NovaSeq) | 2026-09 / 227 | `.npz` with `read_length`, `insert_size`, `mean_count_{forward,reverse}`, `quality_hist_{forward,reverse}`, `subst_choices_*` (per position × base), `ins_*`, `del_*` | Q-driven substitutions (to verify in phase 7) plus per-position substitution choices and indel rates | Metagenome benchmarking | Medium. Per-position Q histograms and substitution/indel tables are populated from marginals of both heads; same calibration caveat as ART |
 | **NEAT v4** | Illumina | 2026-08 / 72 | gzip-pickle dict `{error_model1, error_model2, qual_score_model1, qual_score_model2}` (`SequencingErrorModel` + quality Markov model per mate) | Errors from Q-derived probabilities; Q from a Markov model | Variant-calling benchmarks | Medium. The Q head maps onto NEAT's quality Markov model (order 1, per mate). Needs NEAT's classes to pickle |
 | **Mason2** (SeqAn) | Illumina/454/Sanger | seqan 2026-08 / 502 | CLI parameters only (mismatch/indel probabilities, begin/end ramps, quality mean/sd for correct and wrong bases) | Separate Q mean/sd for correct vs erroneous bases | Aligner benchmarks | Low (parametric), but trivial to emit. The correct/wrong Q split comes from the joint model |
 | **wgsim** | Illumina | 2021 / 288 (unmaintained) | CLI base error rate | none | CAMISIM | Low. Emit a rate only, for CAMISIM compatibility |
 | **Badread** | ONT/PacBio | 2026-07 / 301 | Error model: text, one line per 7-mer `KMER,p;ALT,p;...` (≤ 25 alternatives); Q model: `CIGAR;count;q:p,...` keyed by local CIGAR window | **Q conditioned on the local error pattern** (CIGAR window around the base) | Long-read tool benchmarks | **High.** 7-mer → alternatives materialises the base-context part; P(Q \| local CIGAR window) is a marginal of the joint model. Neighbour-Q and position effects are lost |
 | **PBSIM3** | PacBio/ONT | 2025-04 / 117 | ERRHMM text (`IP`/`EP`(match,sub,ins,del)/`TP` per accuracy level) or QSHMM (quality HMM; errors from Q) | ERRHMM: none (qualities `!`). QSHMM: latent-state Q process, errors from Q | MeSS; top of the 2026 ONT simulator benchmark for length/Q realism | Medium. Export **QSHMM** for Q-bearing output (maps our latent state + Q head) and ERRHMM for error-only use. Sequence context is lost |
 | **NanoSim** | ONT | 2026-03 / 311 | Directory of pickled KDEs + text Markov/histogram files (`_error_markov_model`, `_match_markov_model`, `*_hist`, `_error_rate.tsv`, quality models) from alignments | Quality models conditioned on match/error state | CAMISIM (`nanosim3`) | Low–medium. Only the error/quality Markov parts are estimable; length KDEs must come from a base model. Lowest priority |
-| **ReSeq** | Illumina | 2021 paper / GitHub (maintenance to check) | Binary stats file from `reseq illuminaPE` statistics step (format to confirm in phase 5) | **Errors conditioned on Q**, position, errors so far in the read, reference base and recent dominant error; Q conditioned on previous Q, position, mate, tile, sequence quality and reference base; per-site systematic errors; stored as 2-D margins | Illumina tool benchmarks | Medium–high if the format is writable: head Q and centre-Q head E map closely. Preceding-sequence context is not modelled by ReSeq and is lost |
+| **ReSeq** | Illumina | 2021 paper / GitHub (maintenance to check) | Binary stats file from `reseq illuminaPE` statistics step (format to confirm in phase 8) | **Errors conditioned on Q**, position, errors so far in the read, reference base and recent dominant error; Q conditioned on previous Q, position, mate, tile, sequence quality and reference base; per-site systematic errors; stored as 2-D margins | Illumina tool benchmarks | Medium–high if the format is writable: head Q and centre-Q head E map closely. Preceding-sequence context is not modelled by ReSeq and is lost |
 | **CycSim** | ONT/HiFi/Cyclone | 2025 preprint, GigaScience 2026 | k-mer sliding-window error model + error-state transition matrix, learned from BAM (format to confirm) | Q assigned after errors are placed | Long-read mapper parameter tuning | Medium: base context and error clustering map; Q process thin. Candidate, not committed |
 | **genome-blender** | all | internal | `skiver-generate` subprocess contract | full joint model | This project's current consumer | Full: it uses our native generator |
 
@@ -152,6 +177,8 @@ The design consequence: **every source reduces to the same observation schema**,
 
 Sources can be fitted alone or jointly, and disagreement between them is a first-class diagnostic.
 
+The first two rows of the table below are now evidence modes of their own (`pe-overlap` and `reference`, §1.1); spike-in and control references are handled by the `reference` mode.
+
 | Source | Truth used for errors | Reference needed? | Adds what skiver lacks | Limitations | Maintained |
 |---|---|---|---|---|---|
 | **Paired-end overlap discordance**: ErrorProfiler (yaotianran/ErrorProfiler), or our own implementation over NGmerge/fastp merges | Mate agreement in the overlap | No | Exact **cycle position × centre Q × neighbouring Q × substitution × context × R1/R2**, jointly, with both mates' qualities at the same template base. PCR errors cancel because both mates share them, so it isolates sequencer error | Illumina only; needs short inserts (fully overlapping for ErrorProfiler); substitutions only; which mate erred is ambiguous (resolve by symmetric EM over both mates' Q, **not** by trusting the higher Q); covers the read ends of both mates | ErrorProfiler: 2025 preprint, code on GitHub; NGmerge 2025-11; fastp 2026-09 |
@@ -164,13 +191,14 @@ Sources can be fitted alone or jointly, and disagreement between them is a first
 | **k-mer spectrum** (GenomeScope2) | k-mer histogram model | No | An independent global rate check | Single rate, isolate-like genomes only (poor for metagenomes) | 2025-10 |
 | **Error-corrector diffs** (Lighter, Rcorrector; BFC unmaintained since 2016) | Corrected read | No | Per-read substitution calls with Q, position and mate | Miscorrection and under-correction are coverage-dependent and unmeasured, and correctors often use Q themselves, which would leak Q into the labels. **Not recommended** | Lighter/Rcorrector 2026-01 |
 
-**Recommendation**, ordered by the gap closed in the joint base × quality model per unit effort (matches §12, decision 6):
+**Recommendation** (matches §12, decision 6):
 
-1. **Paired-end overlap source.** The cheapest reference-free source that identifies **neighbouring-quality and quality × context effects** for Illumina, which default-mode skiver cannot.
-2. **Self-reference BAM source.** The most general gap-filler, especially for long reads (homopolymers, indel lengths, read-level quality/error regimes). It also gives a real-data **cross-check of skiver-derived models** on the same high-coverage genomes, which the fork only ever validated on synthetic data.
-3. **ONT duplex/simplex source.** The best reference-free long-read truth when duplex data exist.
-4. **Raw FASTQ quality profiling.** Low as *evidence* (it carries none), but a hard dependency for *generating* qualities in default mode, so it is still built early (phase 1) as a feature/output source.
-5. **Importers**: BQSR tables, DADA2 matrices, InterOp metrics, spike-in BAMs (a special case of item 2 with a known reference).
+1. **Paired-end overlap → `pe-overlap` mode.** The cheapest reference-free evidence that identifies **neighbouring-quality and quality × context effects** for Illumina, which default-mode skiver cannot.
+2. **Reference / self-assembly alignment → `reference` mode.** The most general evidence, especially for long reads (homopolymers, indel lengths, read-level quality/error regimes). It also gives a real-data **check of skiver-derived models** on the same high-coverage genomes, which the fork only ever validated on synthetic data.
+3. **`kmer` mode fitting** after both, so it is checked against them from the start.
+4. **ONT duplex/simplex source.** The best reference-free long-read truth when duplex data exist.
+5. **Raw FASTQ quality profiling.** Low as *evidence* (it carries none), but a hard dependency for *generating* qualities in every mode, so it was built first (phase 1) as a feature/output source.
+6. **Importers**: BQSR tables, DADA2 matrices, InterOp metrics.
 
 ### 4.4 Closest prior art and redundancy risks
 
@@ -184,8 +212,8 @@ Most parts of this project exist somewhere already. Only the combination below i
 | **LongISLND** | No | Yes | Per-k-mer error patterns | Position scaling | — |
 | **BEAR** (DRISEE) | **Yes** (artifactual duplicate reads) | Yes | None (per-position rates) | Mean Q of erroneous bases vs position | Q fitted to errors |
 | **skiver** (upstream) | **Yes** | **No** (QC only) | Marginal trinucleotide spectrum | Marginal P(error \| Q) | — |
-| **This project, default mode** | Yes | Yes | Two-sided, latent-position `Context(L,R)` | FASTQ Q Markov process | Centre-Q term by marginal matching; no Q window |
-| **This project, full model** | Yes (enhanced skiver, PE overlap) or BAM/duplex | Yes | Two-sided + `QualityxContext` | Q conditioned on true context, shared `Latent(S)` | Q first, then errors given the Q window; Q never a label |
+| **This project, `kmer` default mode** | Yes | Yes | Two-sided, latent-position `Context(L,R)` | FASTQ Q Markov process | Centre-Q term by marginal matching; no Q window |
+| **This project, full model** | Yes (`pe-overlap`, enhanced `kmer`) or `reference`/duplex | Yes | Two-sided + `QualityxContext` | Q conditioned on true context, shared `Latent(S)` | Q first, then errors given the Q window; Q never a label |
 
 **Clearly distinct:**
 
@@ -196,8 +224,8 @@ Most parts of this project exist somewhere already. Only the combination below i
 
 **Redundancy risks, each tied to a test:**
 
-1. **The reference-free advantage is narrower than it looks.** Skiver needs ≥ ~20× coverage on some genomes, roughly the genomes that also self-assemble. On a self-reference BAM, ReSeq, Badread, CycSim and NanoSim can train directly. Skiver's remaining advantages are speed, no aligner bias and no assembly errors used as truth. *Test:* the skiver-vs-BAM cross-check (phase 6, §12 decision 7).
-2. **Default mode is only modestly richer than existing profiles.** It is roughly Badread-level context plus an ART/NEAT-level quality process. *Test:* comparative exit criteria against BAM-trained baselines (phases 2–3, §12 decision 11).
+1. **The reference-free advantage is narrower than it looks.** Skiver needs ≥ ~20× coverage on some genomes, roughly the genomes that also self-assemble. On a self-reference BAM, ReSeq, Badread, CycSim and NanoSim can train directly. Skiver's remaining advantages are speed, no aligner bias and no assembly errors used as truth. *Test:* the `kmer`-vs-`reference` cross-check (phase 6, §12 decision 7).
+2. **Default mode is only modestly richer than existing profiles.** It is roughly Badread-level context plus an ART/NEAT-level quality process. *Test:* comparative checks against BAM-trained baselines (phases 5–6, §12 decision 11).
 3. **The richest components come from alignment-type evidence** (BAM, duplex) that existing profilers already use. PE overlap is the reference-free exception for Illumina. On those sources the contribution is the joint model and exporter hub, not the evidence.
 4. **Exports discard what is new** (§6.3). Exporter users get about what the simulator's own profiler gives, minus the alignment step. Only the native generator carries the full model.
 5. **Expressiveness isn't realism.** A simple Q-HMM (PBSIM3) won on quality realism in the 2026 ONT benchmark. Components must earn their place on held-out data (§12 decision 10).
@@ -297,7 +325,7 @@ These are computed from the fitted heads, not fitted separately:
 
 ### 5.6 Identifiability by data source
 
-| Parameter | default skiver (+ FASTQ) | enhanced skiver dump | PE overlap | self-reference BAM / duplex / spike-in |
+| Parameter | `kmer` default (+ FASTQ) | `kmer` enhanced | `pe-overlap` | `reference` / duplex |
 |---|---|---|---|---|
 | E: base context | ✓ (latent position, `kvmer.csv`) | ✓ | ✓ (short context) | ✓ |
 | E: centre Q | ✓ marginal only, joint with context by marginal matching (below) | ✓ | ✓ | ✓ |
@@ -314,7 +342,7 @@ These are computed from the fitted heads, not fitted separately:
 
 ## 6. Feasibility and limitations
 
-### 6.1 Learnable in default mode (unmodified skiver + raw FASTQ)
+### 6.1 Learnable in `kmer` default mode (unmodified skiver + raw FASTQ)
 
 | Model element | Source | Confidence |
 |---|---|---|
@@ -326,7 +354,7 @@ These are computed from the fitted heads, not fitted separately:
 | Head Q: per-position/mate Q distributions, Q Markov transitions, Q given observed context | raw FASTQ | High as a *quality process*; carries no information about errors |
 | GC dependence | `summary_gc_content.csv` | Medium |
 
-### 6.2 Not learnable, or only weakly, in default mode
+### 6.2 Not learnable, or only weakly, in `kmer` default mode
 
 - **Neighbouring-quality effects and quality × context interactions** in head E. Unmodified skiver never pairs errors with quality windows or with context-specific qualities. The effects are fixed at zero and flagged; closing this needs enhanced skiver or a truth-bearing source such as PE overlap.
 - **Joint effects of position, strand and mate with context or Q.** Each CSV is a separate marginal. They are combined log-additively, an assumption that is untestable without per-observation data.
@@ -336,7 +364,7 @@ These are computed from the fitted heads, not fitted separately:
 - **Read-level heterogeneity** jointly affecting Q and errors. Only the aggregate β is available.
 - **R1 vs R2** differences in errors are unobservable; R1 vs R2 qualities come from the FASTQ.
 
-### 6.3 Structural limitations (both modes)
+### 6.3 Structural limitations (the first two items are `kmer`-specific; the rest apply to all modes)
 
 - **Reference-free truth is the consensus.** Coverage ≥ ~20× on at least some genomes is needed. Strain heterogeneity, repeats and low-coverage metagenomes inflate or filter estimates, so the outlier filter matters. Document minimum-coverage guidance and surface `passes_filter` statistics in reports.
 - **FracMinHash subsampling** (`-c`) trades precision for memory. Low-error platforms need a low `c` or large inputs for stable context and quality-window tables.
@@ -352,12 +380,31 @@ These are computed from the fitted heads, not fitted separately:
 - **Simulator quirks.** PBSIM3 ERRHMM outputs `!` qualities (use QSHMM for Q-bearing exports). NEAT's model files are Python pickles of NEAT classes, a version-coupling risk. NanoSim's model directory mixes KDE pickles tied to its scikit-learn version.
 - **skiver upstream drift.** The CSV schema changed between releases (v0.3.x added GC and survival files). Parsers validate headers and pin supported version ranges; a CI matrix runs released skiver binaries.
 
-### 6.4 Verdict
+### 6.4 `pe-overlap` and `reference` modes
+
+**`pe-overlap`** identifies, per overlapping template base, substitution × two-sided context × centre and neighbouring Q of both mates × cycle position × mate. It does not identify:
+
+- **indels.** The overlap is placed gaplessly; pairs whose discordance implies an indel are dropped and counted;
+- **errors both mates share** (PCR, library, cluster-level), which cancel;
+- **the read middle** when inserts are long. Position coverage depends on the insert-size distribution, so position effects are fitted against the recorded overlap exposure;
+- **which mate erred** when they disagree. This is resolved by symmetric EM with head E over both mates' windows, never by trusting the higher Q;
+- **both mates erring to the same base** at one position. This is rare for Illumina and is bounded as a nuisance term.
+
+Overlap placement must not use Q, so Q cannot leak into the labels.
+
+**`reference`** identifies everything in the last column of §5.6, including indel lengths, homopolymer errors and per-read trajectories. Its risks:
+
+- **Reference errors become false errors.** External genomes diverge from the sample's strain, and self-assemblies carry consensus errors (ONT homopolymers especially). Mitigations: polish; mask sites whose minor-allele frequency is above a threshold; keep only high-coverage contigs; report per-contig rates so outliers show.
+- **Aligner scoring bias** between mismatches and indels (minimap2). This is measured by aligning generated reads with known CIGARs.
+- **Spike-ins** (PhiX, lambda) give exact truth, but from a different library prep than the sample.
+
+### 6.5 Verdict
 
 Feasible, in stages:
 
-- **Default mode** yields a context-aware error head with a centre-quality term, plus a realistic quality process. Generation outputs full FASTQ (bases + qualities) for the native generator. Credible Illumina exports and a context-preserving Badread export follow.
-- **The full base × quality-window model**, the one described in §5, needs per-observation quality windows. For Illumina, PE overlap supplies them reference-free; enhanced skiver and self-reference/duplex supply them for all platforms. Long-read realism (homopolymers, indel lengths, read-level regimes) needs the same.
+- **`pe-overlap`** (Illumina) and **`reference`** (all platforms) yield the full §5 model directly, within the scopes above. They are the quickest route to a working generator, and the yardstick for the `kmer` mode.
+- **`kmer` default mode** yields a context-aware error head with a centre-quality term, plus a realistic quality process. Generation outputs full FASTQ (bases + qualities) for the native generator. Credible Illumina exports and a context-preserving Badread export follow.
+- **The full base × quality-window model** from reference-free k-mer evidence needs per-observation quality windows, i.e. enhanced skiver. For Illumina, `pe-overlap` already supplies them reference-free; `reference` and duplex supply them for all platforms. Long-read realism (homopolymers, indel lengths, read-level regimes) needs the same.
 
 ---
 
@@ -368,23 +415,24 @@ src/sequencing_error_model/
   sources/skiver_analyze.py  # parse + validate v0.3.x analyze CSVs → marginal count tables (default mode)
   sources/skiver_dump.py     # streaming reader for fork dump TSV / windows.bin (enhanced mode)
   sources/fastq_quality.py   # quality process: per-position/mate Q, Q transitions, Q | observed context, lengths
-  sources/pe_overlap.py      # paired-end overlap discordance (with both mates' quality windows)
-  sources/bam.py             # self-reference / spike-in alignments → observation tuples (site masking)
+  sources/pe_overlap.py      # pe-overlap mode: mate discordance with both mates' quality windows
+  sources/bam.py             # reference mode: external / spike-in / self-assembly alignments → tuples (site masking)
   sources/ont_duplex.py      # simplex-vs-duplex alignments
   sources/importers.py       # GATK BQSR tables, DADA2 error matrices, InterOp metrics
   observations.py            # sparse (context window, Q window, covariates, op) → count tuples; truth label per source
   spec.py                    # ErrorModelSpec: versioned JSON manifest + .npz arrays (no pickle)
   fit/                       # quality head, error head, marginal matching, latent state, selection criteria
   select.py                  # greedy criterion-based component search over both heads
-  generate.py                # native generator: FASTA → FASTQ (bases + qualities) + CIGAR
+  compare.py                 # cross-mode comparison on shared support: count tables and fitted specs
+  generate.py                # native generator: FASTA → FASTQ (bases + qualities) + CIGAR, single or paired
   export/{art,iss,badread,pbsim3,neat,mason,wgsim,nanosim}.py
-  cli.py                     # sem fit | select | generate | export <sim> | report | inspect
+  cli.py                     # sem fit | select | compare | generate | export <sim> | report | inspect
 ```
 
 Principles:
 
 - **One simulator-neutral model spec** (`spec.py`), the only thing exporters and the generator read. It holds:
-  - provenance: sources, skiver version, mode, k, v, c, input hashes, base-profile fallback;
+  - provenance: evidence mode(s), sources, input hashes, base-profile fallback; for `kmer`, the skiver build and version, k, v, c;
   - the **quality alphabet** and binning;
   - **head Q** and **head E**: component tokens, parameters, per-component `generative` and `identified` flags (e.g. neighbouring-Q weights fixed in default mode);
   - the optional latent-state layer shared by both heads;
@@ -393,6 +441,7 @@ Principles:
   Stored as JSON + `.npz`: safe to load, diffable, language-agnostic. It is not a torch pickle.
 - **Sparse tuples first.** Every source reduces to deduplicated (context window, quality window, covariate bins, op) tuples with counts. Binned qualities make this compress hard for Illumina. When unique tuples exceed memory (long windows, ONT's full Q range), fitting falls back to streaming minibatches over the same schema. Marginal-only sources (skiver analyze, importers) enter the joint likelihood through their marginal constraints (§5.6).
 - **Joint fitting across sources.** The per-source log-likelihood of the model is marginalised onto each source's observed fields and summed, with optional per-source nuisance terms (skiver consensus misses, assembly errors, mate ambiguity). The report shows per-source disagreement before anything is pooled.
+- **Modes are compared on shared support.** `compare.py` restricts two sources' count tables to the fields, op classes, read positions and genomes both observe. It then compares the tables (evidence level) and the specs fitted from them (per component and held-out likelihood). Each mode pair declares its expected gaps (e.g. PCR errors are invisible to `pe-overlap`), and those gaps are reported as estimates.
 - **Fitting stack.** numpy/scipy (L-BFGS) for the default mode's small, marginal problems. torch (and optionally pyro for VI uncertainty) as an `enhanced` extra for per-observation windows, latent states and the optional `NeuralWindow`. Revisit if one stack proves sufficient.
 - **The generator is the reference implementation of §5.3.** It is vectorised per read (sample the Q track, then batched categorical ops) and emits bases, qualities and CIGAR. Exporters are validated against it.
 - **Exporters are thin, tested adapters.** Each declares:
@@ -406,32 +455,34 @@ Principles:
 
 ## 8. Mode capability matrix
 
-| Component | Default | Enhanced | Generative | Exporters that can use it |
-|---|---|---|---|---|
-| Global rate, op composition | ✓ | ✓ | ✓ | all |
-| Strand asymmetry | ✓ | ✓ | ✓ | InSilicoSeq (fwd/rev), native |
-| E: `Context(L,R)` | ✓ (latent position) | ✓ (exact position) | ✓ | Badread, native |
-| E: centre Q | ✓ (marginal matching) | ✓ | ✓ | all Q-coupled exporters via `--q-policy`, Mason2 (correct/wrong Q), native |
-| E: `QualityWindow(m)`, `QualityxContext` | – (fixed at 0) | ✓ (value window; key side needs fork addition) | ✓ | native only |
-| Q: per-position/mate Q, `QualityMarkov(m)` | ✓ (FASTQ) | ✓ | ✓ | ART, InSilicoSeq, NEAT (order 1), PBSIM3 QSHMM, native |
-| Q: conditioned on true context / errors | approx. (observed bases) | ✓ | ✓ | Badread Q model, NanoSim, native |
-| Position | ✓ (marginal) | ✓ (joint) | ✓ | ART, InSilicoSeq, NEAT, Mason (ramps), native |
-| GC | ✓ | ✓ | ✓ | native |
-| Clustering β | ✓ | ✓ | approx. | PBSIM3 (2-state approximation), native |
-| `Latent(S)` shared by E and Q | – | ✓ (needs Q in `windows.bin`) | ✓ | PBSIM3 QSHMM/ERRHMM, native |
-| Homopolymer / indel length | coarse | ✓ (needs new fork outputs) | ✓ | Badread (via k-mers), native |
-| Fragment overdispersion, R1/R2 | – | ✓ | training only / R1–R2 profiles | ART/ISS/NEAT R2 profiles |
+| Component | `pe-overlap` | `reference` | `kmer` default | `kmer` enhanced | Generative | Exporters that can use it |
+|---|---|---|---|---|---|---|
+| Global rate, op composition | substitutions only | ✓ | ✓ | ✓ | ✓ | all |
+| PCR/library errors | excluded (cancel) | included | included | included | – | (comparison diagnostic) |
+| Strand asymmetry | ✓ | ✓ | ✓ | ✓ | ✓ | InSilicoSeq (fwd/rev), native |
+| E: `Context(L,R)` | ✓ (exact position) | ✓ | ✓ (latent position) | ✓ (exact position) | ✓ | Badread, native |
+| E: centre Q | ✓ | ✓ | ✓ (marginal matching) | ✓ | ✓ | all Q-coupled exporters via `--q-policy`, Mason2 (correct/wrong Q), native |
+| E: `QualityWindow(m)`, `QualityxContext` | ✓ | ✓ | – (fixed at 0) | ✓ (value window; key side needs fork addition) | ✓ | native only |
+| Q: per-position/mate Q, `QualityMarkov(m)` | ✓ | ✓ | ✓ (FASTQ) | ✓ | ✓ | ART, InSilicoSeq, NEAT (order 1), PBSIM3 QSHMM, native |
+| Q: conditioned on true context / errors | ✓ (in overlap) | ✓ | approx. (observed bases) | ✓ | ✓ | Badread Q model, NanoSim, native |
+| Position | ✓ (overlap region, exposure-weighted) | ✓ | ✓ (marginal) | ✓ (joint) | ✓ | ART, InSilicoSeq, NEAT, Mason (ramps), native |
+| GC | ✓ | ✓ | ✓ | ✓ | ✓ | native |
+| Clustering β | within overlap | ✓ | ✓ | ✓ | approx. | PBSIM3 (2-state approximation), native |
+| `Latent(S)` shared by E and Q | – (short span) | ✓ | – | ✓ (needs Q in `windows.bin`) | ✓ | PBSIM3 QSHMM/ERRHMM, native |
+| Homopolymer / indel length | – | ✓ | coarse | ✓ (needs new fork outputs) | ✓ | Badread (via k-mers), native |
+| Fragment overdispersion, R1/R2 | R1/R2 ✓ | ✓ | – | ✓ | training only / R1–R2 profiles | ART/ISS/NEAT R2 profiles |
 
 ---
 
 ## 9. Phases
 
-Each phase lands as one or more PRs with green CI. Exit criteria are testable.
+Each phase lands as one or more PRs with green CI. Exit criteria are testable. The order follows §1.1: the model and generator (phases 2–3), then `pe-overlap` and `reference` (4–5), then `kmer`, checked against both (6).
 
 ### Phase 0: repository, CI and PR policy ✓
 uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), Linting, Testing and Release workflows, PR template, and a `main` ruleset requiring PRs with passing `lint` + `test`.
 
-### Phase 1: default-mode inputs ✓
+### Phase 1: inputs (skiver analyze, FASTQ quality, observation schema) ✓
+Landed before the evidence modes were added. The FASTQ statistics and the schema serve every mode; the skiver parsers are consumed in phase 6.
 - ✓ `sources/skiver_analyze.py`: typed, header-validated parsers for all v0.3.x analyze CSVs. `summary_phred.csv`'s counting convention is documented (§5.6).
 - ✓ `sources/fastq_quality.py`: streaming quality-process statistics from raw FASTQ(.gz), per mate (one call per mate, several lanes allowed). Labelled in code and spec as a feature/output source, never as error evidence. Collects sparse counters for:
   - per-position Q histograms (from the read start);
@@ -443,68 +494,101 @@ uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), L
 - ✓ **CI job `skiver-compat`.** Downloads skiver release binaries (matrix: v0.3.1, v0.3.2, latest), regenerates the fixtures, runs the parser tests on them and diffs the deterministic files (bootstrap CIs vary run to run) against the committed fixtures. It runs on PR only when `sources/skiver_*` changes, plus a weekly schedule to catch new releases.
 - ✓ **Exit:** every analyze file and the FASTQ statistics round-trip into the schema; unsupported versions fail with a clear error.
 
-### Phase 2: model spec, both heads, default-mode fitting (in progress)
+### Phase 2: model spec and both heads, fitted from exact-position observations (in progress)
 - ✓ `spec.py`: an `ErrorModelSpec` directory of `spec.json` (schema version, quality alphabet, provenance with required `mode`, component tokens, `generative`/`identified` flags, meta) and `arrays.npz` (parameters and cached marginals; object arrays are rejected and loading never unpickles). Tokens are validated against the §5.4 component names and the heads each may appear in, plus `GC`, `Weibull` and `InsertionQuality` from this phase; the shared `Latent(S)` layer sits outside both heads. Argument arity is left to each fitter. Loading rejects other schema versions, missing arrays and unreferenced arrays.
-- Head Q fitters: `QualityMarkov(m)`, `Position`, `Mate`, `Context` on observed bases, insertion-quality sub-head (base-profile prior in default mode).
-- Head E fitters:
-  - latent-position `Context(L,R)` from `kvmer.csv` with the true-base mask;
-  - centre-Q term by marginal matching against `summary_phred.csv` under the FASTQ exposure;
-  - position curve, strand, GC, Weibull passthrough.
-- Criterion-based selection per head (AIC/BIC on held-out keys and reads).
-- **Exit:** on simulated data with known context and quality effects:
-  - recovered context log-odds correlate with truth (r > 0.9 for dominant effects);
+- Provenance `mode` becomes the evidence mode (`pe-overlap`, `reference`, `kmer`, or a list for a joint fit), with a separate `skiver_build` (`default`/`enhanced`) for `kmer`. Update `spec.MODES` and its tests.
+- Head Q fitters: `QualityMarkov(m)`, `Position`, `Mate`, `Context`, insertion-quality sub-head. Input is FASTQ statistics (every mode, conditioned on observed bases) or per-observation tuples (conditioned on true bases, from `pe-overlap` and `reference`).
+- Head E fitters over exact-position tuples, the form `pe-overlap` and `reference` produce:
+  - `Context(L,R)` with the true-base mask;
+  - `QualityWindow(m)`, always including the centre-Q term, and `QualityxContext(rank)`;
+  - `Position`, `Mate`, `Strand`, `Homopolymer`, GC.
+
+  The `kmer` default fitters (latent edit position, marginal matching) are in phase 6.
+- Criterion-based selection per head (AIC/BIC on held-out reads).
+- **Exit:** on observation tuples sampled from a known spec:
+  - recovered context and quality-window log-odds correlate with truth (r > 0.9 for dominant effects);
   - the error rate implied per reported-Q bin is within 10% of truth;
   - per-position Q histograms are within TV < 0.05;
   - the marginal error rate is within 5%.
-- **Comparative check (not blocking, reported):** on a dataset with a reference, the default-mode model's held-out likelihood and marginals are compared with ReSeq (Illumina) and Badread (long reads) profiles trained on the aligned reads (§4.4, risk 2).
 
-### Phase 3: native generator (bases + qualities) and recovery harness
+### Phase 3: native generator (bases + qualities, single or paired) and recovery harness
 - `generate.py` implementing §5.3. Qualities are always emitted from head Q, and `--no-quality` is kept only for compatibility. It keeps the `skiver-generate` CLI contract so genome-blender can switch without code changes, and adds an alignment-consistency self-test.
-- A recovery harness: generate, run skiver (released binary), profile the generated FASTQ, fit, compare. Metrics:
+- Paired-end output with an insert-size distribution stored in the spec. The generator is the truth-known fixture source for every mode: overlapping pairs for `pe-overlap`, reads plus their true CIGARs for `reference`, reads for skiver.
+- A mode-agnostic recovery harness: generate from a known spec, run one mode's source and fitters, compare with the spec. Each mode plugs in as it lands. Metrics:
   - **errors:** TV/KL on op probabilities, marginal rate, position curve;
   - **qualities:** per-position Q TV, Q lag-1 autocorrelation, P(error | reported Q) calibration curve vs source, empirical-vs-reported Q curve.
 - A small version runs in CI (a few seconds of reads); the full-scale version is a manual `workflow_dispatch` workflow.
-- **Baseline harness.** The same metrics computed on real reads vs reads from (a) the native generator, (b) ReSeq for Illumina, (c) Badread, PBSIM3 and CycSim for long reads, each simulator trained by its own profiler on an alignment of the same sample. Add k-mer spectrum concordance and context-dependent substitution rates, the metrics of the 2026 ONT benchmark.
+- **Exit:** re-deriving tuples from the generator's own CIGARs and refitting recovers the spec for both heads within the phase 2 tolerances; the alignment-consistency self-test passes.
+
+### Phase 4: `pe-overlap` mode
+- `sources/pe_overlap.py` (Illumina), streaming over paired FASTQ(.gz):
+  - place the overlap per pair gaplessly, handling read-through into adapters when the insert is shorter than the read. Placement uses bases only, never Q;
+  - emit one tuple per overlapping template base: both mates' bases and quality windows, cycle positions, mate, strand, and the consensus context;
+  - where mates disagree, the template base is latent. Symmetric EM with head E over both mates' windows attributes the error, never the higher Q;
+  - record the overlap exposure per read position, so position effects are not biased by the insert-size distribution;
+  - drop and count pairs whose discordance implies an indel, or whose overlap is below a minimum length.
+- Tables declare `pe-overlap` truth and substitution-only op classes; the spec flags indel and PCR/library components as not identified.
+- Recovery test on generated pairs with known errors (phase 3). Reads are regenerated, not committed.
+- Reported, not blocking: run ErrorProfiler on the same data and compare its substitution × Q tables.
 - **Exit:**
-  - the self-consistency loop passes at v=13 for both heads, and the documented failure at small v is reproduced as a guarded error or warning;
+  - on generated pairs, the substitution part of head E (context, `QualityWindow`, position, mate) and head Q are recovered within the phase 2 tolerances;
+  - on one real Illumina run, a fitted spec and a report are produced.
+
+### Phase 5: `reference` mode and cross-mode comparison
+- `sources/bam.py`, streaming BAM/CRAM + reference → tuples:
+  - site masking by minor-allele frequency; MAPQ and secondary/supplementary filters; contig coverage filter; per-contig rate report;
+  - indel length, homopolymer run length, and per-read error *and quality* trajectories for `Latent(S)`.
+- One code path for three kinds of reference: an external genome, a spike-in or mock community, and a self-assembly. Ship documented recipes (assemble with metaSPAdes / metaFlye / myloasm / hifiasm-meta, polish, align with minimap2 or bwa-mem2) rather than wrapping assemblers.
+- Aligner bias check: align generated reads with known CIGARs and report how the aligner shifts op composition and indel placement.
+- `compare.py` (§7): evidence-level and model-level comparison on shared support. First use: `pe-overlap` vs `reference` on the same Illumina reads, which also estimates the PCR/library error contribution.
+- **Baseline harness.** The phase 3 metrics computed on real reads vs reads from (a) the native generator, (b) ReSeq for Illumina, (c) Badread, PBSIM3 and CycSim for long reads, each simulator trained by its own profiler on the same alignment. Add k-mer spectrum concordance and context-dependent substitution rates, the metrics of the 2026 ONT benchmark.
+- **Exit:**
+  - on generated reads aligned back to their genome, the full spec (including indel lengths and homopolymer effects) is recovered within the phase 2 tolerances, after correcting for the measured aligner bias;
+  - on one real Illumina dataset, `pe-overlap` and `reference` specs agree per component on shared support within tolerance, or the report explains each disagreement;
+  - `QualityWindow` beats the centre-Q-only head E on held-out likelihood, or the report shows it doesn't;
   - the baseline harness runs on at least one Illumina and one long-read dataset, and the report states where the native generator beats, matches or trails each baseline.
 
-### Phase 4: exporters, wave 1 (ART/art_modern, InSilicoSeq, Badread, PBSIM3)
+### Phase 6: `kmer` mode (default build), checked against `pe-overlap` and `reference`
+- Head E fitters for unmodified skiver:
+  - latent-position `Context(L,R)` from `kvmer.csv` with the true-base mask;
+  - centre-Q term by marginal matching against `summary_phred.csv` under the FASTQ exposure;
+  - position curve, strand, GC, Weibull passthrough.
+
+  Head Q uses the phase 2 FASTQ fitters.
+- **Evidence check.** On the same reads, tabulate from `pe-overlap` and `reference` tuples the marginals skiver reports: spectrum in trinucleotide context, P(error | Q), read-position curve, GC, and hazard/clustering. Use skiver's counting conventions where they can be emulated (§5.6; e.g. first-error stopping for P(error | Q)), otherwise compare rates. Compare with skiver's CSVs through `compare.py`. This tests skiver's evidence independently of the `kmer` fitters.
+- **Model check.** Compare the `kmer` default spec with the `pe-overlap` and `reference` specs per component (context log-odds, centre-Q curve, position, op composition), on held-out likelihood of their tuples, and on phase 3 metrics of generated reads.
+- **Synthetic recovery.** Generate, run skiver (released binary), profile the FASTQ, fit, compare with the spec.
+- **Exit:**
+  - the synthetic loop passes at v=13 within the phase 2 tolerances, and the documented failure at small v is reproduced as a guarded error or warning;
+  - on the phase 5 real datasets, skiver's marginals and the `kmer` spec are compared with both other modes on shared support, and the report states agreement per component, with expected gaps (PCR errors vs `pe-overlap`) given as estimates;
+  - reported, not blocking: the default-mode model's held-out likelihood and marginals vs ReSeq (Illumina) and Badread (long reads) profiles trained on the aligned reads (§4.4, risk 2).
+
+### Phase 7: exporters, wave 1 (ART/art_modern, InSilicoSeq, Badread, PBSIM3)
 - Each exporter:
   - implements `--q-policy`, where the simulator couples errors to Q;
   - supports a base-profile fallback;
   - emits a fidelity report.
 - Badread gets both the error model and the Q model. PBSIM3 gets QSHMM (Q-bearing) and ERRHMM.
-- **Round-trip tests.** Export, run the real simulator, run skiver and FASTQ profiling, refit, and compare both the error rate and the Q marginals to the spec within tolerance. Simulators come from bioconda in a separate `export-roundtrip` workflow (weekly + `workflow_dispatch` + PRs touching `export/`), so the core Testing workflow stays fast.
+- **Round-trip tests.** Export, run the real simulator, re-estimate, and compare both the error rate and the Q marginals to the spec within tolerance. Re-estimation uses the `reference` mode against the simulator's source genome (cheap and exact), plus the `kmer` mode where the default path must be exercised. Simulators come from bioconda in a separate `export-roundtrip` workflow (weekly + `workflow_dispatch` + PRs touching `export/`), so the core Testing workflow stays fast.
 - Unit tests validate generated files against each simulator's own loader where one is importable (InSilicoSeq `KDErrorModel`, Badread model parser). Confirm how InSilicoSeq couples substitutions to Q.
 - **Exit:** all four simulators run on exported models; under the chosen `--q-policy`, the preserved quantity is within 10% of the spec, and the violated one is quantified in the fidelity report.
 
-### Phase 5: exporters, wave 2, and wrapper recipes
+### Phase 8: exporters, wave 2, and wrapper recipes
 - NEAT v4 (quality Markov + error model; optional dependency), Mason2 (including correct/wrong-base Q parameters) and wgsim parameter sets, and NanoSim error and quality model parts on a base model.
 - Candidates, pending a format check: **ReSeq** (its Q process and Q-conditioned errors map closely onto both heads, a better Illumina target than ART if its stats file can be written) and **CycSim** (k-mer errors and error-state transitions for long reads). Drop either if its model file is not documented or stable.
 - Documented CAMISIM (`art`/`nanosim3`/`wgsim` config) and MeSS recipes pointing at exported profiles.
 - **Exit:** the same round-trip criterion (NanoSim: best-effort, documented gaps).
 
-### Phase 6: additional evidence sources
-In the order of §12 decision 6: PE overlap, self-reference BAM, ONT duplex, then importers. PE overlap is the first source that identifies `QualityWindow` effects reference-free; consider pulling it forward to directly after phase 3.
-
-- `sources/pe_overlap.py` (Illumina): observation tuples carrying both mates' quality windows at each overlapping template base, with symmetric EM for mate attribution.
-- `sources/bam.py`, a self-reference and spike-in source:
-  - site masking by minor-allele frequency;
-  - optional polishing-aware contig filtering;
-  - per-read error *and quality* trajectories for `Latent(S)`.
-
-  Ship a documented recipe (assemble, polish, minimap2) rather than wrapping assemblers.
+### Phase 9: further evidence sources and joint fitting
 - `sources/ont_duplex.py` (dorado duplex pairs, simplex Q tracks).
+- UMI/duplex consensus (fgbio) where libraries have UMIs.
 - `sources/importers.py` for GATK BQSR recalibration tables, DADA2 `learnErrors` matrices and InterOp error metrics.
-- A cross-validation report comparing skiver-derived and alignment-derived models, per head and per component, on the same high-coverage genomes (real data, not synthetic). This is the project's main redundancy test (§4.4, risk 1). A minimal version, using an off-the-shelf assemble-and-align recipe and existing profilers rather than `sources/bam.py`, should run as early as phase 3.
-- Multi-source joint fit with per-source disagreement diagnostics.
+- Multi-source joint fit with per-source disagreement diagnostics, reusing `compare.py`.
 - **Exit:**
-  - each source recovers a known model, including `QualityWindow` effects, on synthetic data;
-  - on at least one real Illumina and one real ONT metagenome, the report quantifies skiver vs other-source agreement per component;
-  - `QualityWindow` beats the centre-Q-only head E on held-out likelihood, or the report shows it doesn't.
+  - each source recovers a known model on synthetic data;
+  - on at least one real ONT metagenome, the report quantifies agreement between `reference`, `kmer` and duplex per component.
 
-### Phase 7: enhanced mode
+### Phase 10: enhanced `kmer` mode
 - `sources/skiver_dump.py`: a streaming aggregator from TSV and `windows.bin` into the observation schema (no 32 GB in memory). It reads `phred` from base observations and `qual_str` windows from raw observations.
 - Port the fork's composable components under the §5.4 names, with the generative/training-only split now resolved by head Q.
 - **New minimal fork** of GZHoffie/skiver (§12, decision 5): extend with distinct module(s), each output gated by a dump format version header:
@@ -515,14 +599,15 @@ In the order of §12 decision 6: PE overlap, self-reference BAM, ONT duplex, the
   - R1/R2 flag;
   - a binary/Parquet `--base` to replace the 32 GB TSV.
 - Offer the non-invasive ones upstream so more of the default mode improves over time.
-- **Exit:** enhanced models beat default models on held-out likelihood for both heads on real ONT and Illumina datasets; PBSIM3/Badread exports gain the latent-state and error-conditioned Q models.
+- **Exit:** enhanced models beat default models on held-out likelihood for both heads on real ONT and Illumina datasets, and agree more closely with `pe-overlap` and `reference` on shared support; PBSIM3/Badread exports gain the latent-state and error-conditioned Q models.
 
-### Phase 8: reports, packaging, release
+### Phase 11: reports, packaging, release
 - `sem report`: a single HTML page (plotly loaded once, no MathJax) with:
   - coverage/filter diagnostics;
   - both heads' fitted effects;
   - calibration (empirical vs reported Q, by context and position);
   - identifiability flags;
+  - cross-mode comparison;
   - per-export fidelity reports;
   - selection traces.
 - PyPI and bioconda recipes, plus a container image for Nextflow (nf-core-style module for the synthetic-metagenomic-benchmark pipeline).
@@ -538,6 +623,7 @@ In the order of §12 decision 6: PE overlap, self-reference BAM, ONT duplex, the
 | Golden fixtures from pinned skiver releases | `tests/fixtures/skiver-vX.Y.Z/` | every PR; regenerated by `skiver-compat` |
 | Small statistical recovery, both heads (fixed seeds, tolerance bands) | `tests/recovery/` | every PR, under ~2 min |
 | "Q is never a label" guard: a synthetic dataset with deliberately miscalibrated qualities, where the fitted error rate must follow the injected truth, not 10^(−Q/10) | `tests/recovery/` | every PR |
+| Cross-mode agreement: the same generated paired reads (with their genome) through `pe-overlap`, `reference` and `kmer`; fitted specs agree within tolerance on shared support | `tests/recovery/` | `pe-overlap` + `reference` every PR; with skiver in `skiver-compat` |
 | Exporter round-trips with real simulators (errors + qualities, per `--q-policy`) | `export-roundtrip` workflow | weekly, dispatch, PRs touching `export/` |
 | Full-scale recovery on real datasets | manual workflow or HPC | before releases |
 
@@ -551,7 +637,7 @@ The standard matches `EBI-Metagenomics/mimicc-ena-submission-assistant`: uv + Py
 - **Testing** (`test`): pytest.
 - **Release**: a `v*` tag checks that the tag matches the version, then tests, builds and creates a GitHub release with sdist + wheel.
 - **Ruleset on `main`**: PR required, required checks `lint` + `test` (strict, up to date), no force-push, no deletion. Approvals are not required while there is a single maintainer; raise to 1 when collaborators join.
-- To be added in later phases: `skiver-compat` (phase 1), `export-roundtrip` (phase 4), PyPI trusted publishing (phase 8).
+- To be added in later phases: `skiver-compat` (phase 1), `export-roundtrip` (phase 7), PyPI trusted publishing (phase 11).
 
 ---
 
@@ -562,12 +648,12 @@ The standard matches `EBI-Metagenomics/mimicc-ena-submission-assistant`: uv + Py
 3. **Fitting stack.** numpy/scipy core with a torch extra (recommended), or torch throughout like the fork.
 4. **Priority of wave-1 exporters.** Recommended order: Badread → InSilicoSeq → ART → PBSIM3 (context-rich first, then most-used Illumina tools).
 5. **Fork strategy.** Make a new fork of GZHoffie/skiver for enhanced outputs, base some of the changes on the current `timrozday-mgnify/skiver` fork but try to minimize modifications and if possible just extend with distinct module(s).
-6. **Evidence-source priority.** Recommended order: paired-end overlap, then self-reference BAM, ONT duplex, FASTQ quality, importers. Phase 6 could move ahead of phase 5 if long-read realism matters more than second-wave exporters.
-7. **Is skiver "primary"?** If the self-reference source turns out to dominate in accuracy, reposition skiver as the fast, reference-free default and alignment sources as the high-fidelity path. The cross-validation report (minimal version from phase 3, full version in phase 6) settles this with data. It is also the redundancy question (§4.4): if alignment sources dominate *and* existing profilers (ReSeq, Badread, CycSim) match the native generator on the same BAM, the project's value reduces to the joint Q model and the exporter hub, and scope should shrink accordingly.
+6. **Evidence-source priority** (decided 2026-09-15). `pe-overlap` and `reference` modes first, then `kmer` default mode checked against them, then ONT duplex, importers and enhanced `kmer`. Phase 9 could move ahead of phase 8 if long-read realism matters more than second-wave exporters.
+7. **Is skiver "primary"?** No longer assumed: `kmer` is one of three modes, checked against the other two in phase 6. If `reference` dominates in accuracy, position `kmer` as the fast, reference-free mode and `reference` as the high-fidelity path. The phase 6 comparison settles this with data. It is also the redundancy question (§4.4): if alignment sources dominate *and* existing profilers (ReSeq, Badread, CycSim) match the native generator on the same BAM, the project's value reduces to the joint Q model and the exporter hub, and scope should shrink accordingly.
 8. **Factorisation.** Q-then-errors (§5.2, recommended: head E is directly the reported error profile and allows two-sided quality windows) vs errors-then-Q (Badread-style; simpler for long-read exports). The alternative is derivable from the joint model either way, so this only decides which one is fitted.
 9. **Default `--q-policy`** for Q-coupled simulators: `preserve-quality` (recommended; realistic FASTQs for QC and aligner benchmarking) or `preserve-errors` (true error rates for assembly and variant benchmarking). It may be worth defaulting per use case.
-10. **Quality windows vs neural window.** Start with additive `QualityWindow(m)` + low-rank `QualityxContext` and add `NeuralWindow` only if phase 6 shows held-out gains large enough to justify an export-unfriendly model.
-11. **Baselines.** Which external simulators the baseline harness (phase 3) must include. Recommended: ReSeq for Illumina; Badread, PBSIM3 and CycSim for long reads. Also whether beating them should become a blocking exit criterion, rather than a reported one, before v0.1.0.
+10. **Quality windows vs neural window.** Start with additive `QualityWindow(m)` + low-rank `QualityxContext` and add `NeuralWindow` only if phase 5 shows held-out gains large enough to justify an export-unfriendly model.
+11. **Baselines.** Which external simulators the baseline harness (phase 5) must include. Recommended: ReSeq for Illumina; Badread, PBSIM3 and CycSim for long reads. Also whether beating them should become a blocking exit criterion, rather than a reported one, before v0.1.0.
 
 ## Sources
 

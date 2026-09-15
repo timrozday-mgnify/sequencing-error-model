@@ -1,6 +1,6 @@
 # CD: a pushed `vX.Y.Z` tag builds the sdist + wheel and attaches them to a
 # GitHub release. PyPI/bioconda publishing is deferred until the API is stable
-# (see docs/IMPLEMENTATION_PLAN.md, phase 8).
+# (see docs/IMPLEMENTATION_PLAN.md, phase 11).
 name: Release
 
 on:
