@@ -11,7 +11,13 @@ from sequencing_error_model.spec import Component, ErrorModelSpec, SpecError, lo
 def make(**overrides: Any) -> ErrorModelSpec:
     kwargs: dict[str, Any] = {
         "quality_alphabet": (2, 12, 23, 37),
-        "provenance": {"mode": "default", "sources": ["skiver_analyze", "fastq_quality"], "k": 31, "v": 13},
+        "provenance": {
+            "mode": "kmer",
+            "skiver_build": "default",
+            "sources": ["skiver_analyze", "fastq_quality"],
+            "k": 31,
+            "v": 13,
+        },
         "quality_head": (
             Component("QualityMarkov(1)", {"transitions": np.arange(16, dtype=np.int64).reshape(4, 4)}),
             Component("Position(4)", {"knots": np.linspace(0, 1, 4)}, meta={"from": ["start", "end"]}),
@@ -57,6 +63,12 @@ def test_round_trip(tmp_path: Path) -> None:
         ({"quality_alphabet": (37, 2)}, "quality alphabet"),
         ({"quality_alphabet": (2, 94)}, "quality alphabet"),
         ({"provenance": {}}, "mode"),
+        ({"provenance": {"mode": "default"}}, "mode"),
+        ({"provenance": {"mode": []}}, "mode"),
+        ({"provenance": {"mode": ["reference", "reference"]}}, "mode"),
+        ({"provenance": {"mode": "kmer"}}, "skiver_build"),
+        ({"provenance": {"mode": "kmer", "skiver_build": "fork"}}, "skiver_build"),
+        ({"provenance": {"mode": "pe-overlap", "skiver_build": "default"}}, "skiver_build"),
         ({"error_head": (Component("QualityMarkov(1)"),)}, "not a head E"),
         ({"quality_head": (Component("Contxt(2,2)"),)}, "not a head Q"),
         ({"error_head": (Component("Context(1,1)"), Component("Context(2,2)"))}, "repeats"),
@@ -67,6 +79,11 @@ def test_round_trip(tmp_path: Path) -> None:
 def test_invalid(overrides: dict[str, Any], match: str) -> None:
     with pytest.raises(SpecError, match=match):
         make(**overrides)
+
+
+@pytest.mark.parametrize("mode", ["pe-overlap", "reference", ["pe-overlap", "reference"]])
+def test_modes_without_skiver(mode: str | list[str]) -> None:
+    assert make(provenance={"mode": mode}).provenance["mode"] == mode
 
 
 def test_load_rejects_other_schema_and_stray_arrays(tmp_path: Path) -> None:
