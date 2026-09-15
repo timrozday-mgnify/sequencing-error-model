@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) is in progress (source, EM fit and recovery test landed; the real-run exit and the ErrorProfiler comparison remain); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
 
 ## 1. Goal
 
@@ -531,7 +531,7 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 - A small version runs in CI (a few seconds of reads); the full-scale version is a manual `workflow_dispatch` workflow.
 - **Exit:** re-deriving tuples from the generator's own CIGARs and refitting recovers the spec for both heads within the phase 2 tolerances; the alignment-consistency self-test passes.
 
-### Phase 4: `pe-overlap` mode (in progress)
+### Phase 4: `pe-overlap` mode (exit met; open items below)
 - ✓ `sources/pe_overlap.py` (Illumina), streaming over paired FASTQ(.gz):
   - ✓ place the overlap per pair gaplessly, handling read-through into adapters when the insert is shorter than the read. Placement uses bases only, never Q (lowest mismatch fraction over ≥ `min_overlap` bases, then longest);
   - ✓ emit one head E row per mate per overlapping base, in the mate's own orientation: Q window, cycle position, mate, strand, and the consensus context (N where mates disagree, the mate's own bases outside the overlap);
@@ -540,8 +540,10 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - ✓ drop and count pairs whose discordance implies an indel (a breakpoint plus a shift of ≤ 3 removes ≥ 3 mismatches, checked before the mismatch cap) or whose best overlap is shorter than `min_overlap` or above 20% mismatches. A tight cap (NGmerge's 10%) dropped the error-rich pairs and biased rates down 8% in recovery.
   - ✓ head Q is fitted from every base of every pair, placed or not, on observed bases. Fitting it on kept overlaps only biased it (per-position TV 0.067), because the dropped pairs are the low-Q ones.
 - ✓ The spec records `identified_ops: ["substitution"]` and gets −inf indel logits, so generation from it emits no indels; PCR/library errors cancel and are absent. `recovery.compare(substitutions_only=True)` compares on that support; `recovery.paired_draw` feeds the harness pairs from `generate.fragments`.
-- ✓ Recovery test on generated pairs (3000 pairs, ~3.5% errors) passes the phase 2 tolerances. Reads are regenerated, not committed. At ~1% errors the per-Q rates settle within 10% only by ~10k pairs; there, Q37 (rate 0.002) still comes out 14% high, probably L2 shrinkage of the rarest window weights. **Open.**
-- CLI: `python -m sequencing_error_model.sources.pe_overlap R1 R2 --output SPEC` writes a spec whose provenance carries the pair statistics.
+- ✓ Recovery test on generated pairs (3000 pairs, ~3.5% errors) passes the phase 2 tolerances. Reads are regenerated, not committed. At ~1% errors the per-Q rates settle within 10% only by ~10k pairs; there, Q37 (rate 0.002) still comes out 14% high. The cause was L2 shrinkage of the rarest window weights, which the `smooth` + `window_l2` defaults below reduce.
+- ✓ CLI: `python -m sequencing_error_model.sources.pe_overlap R1 R2 --output SPEC` writes a spec whose provenance carries the pair statistics.
+  - Defaults: head E `QualityWindow(1) Context(1,1) Position(4) Mate` with `--smooth 30 --window-l2 0.01`; head Q `QualityMarkov(1) Position(48) Mate Context(1,1)`.
+  - Usage and limits: [pe_overlap.md](pe_overlap.md).
 - ✓ Real-data placement guards, from two runs:
   - **SRR5240881** (MiSeq 2×150, V3-V4/V9 mock amplicons): 97.7% of pairs placed, 0.15% indel-flagged, and a mismatch rate of 0.01% where both mates have Q ≥ 30.
   - **ERR10889147** (HiSeq 2×125, genomic, long inserts): the first version placed about 25% of pairs, and most were false: 7–15% mismatches even at Q ≥ 30. Two Q-free fixes:
@@ -553,7 +555,7 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - On 1,000 held-out pairs, the fitted marginal substitution rate is 0.29% per mate (raw mate disagreement is 0.6% per overlap base).
   - The fitted rate mostly falls as reported Q rises: about 7% at Q14–18, 0.1–0.5% at Q27–33, 0.02% at Q34–37 and 0.001% at Q38–39. Empirical Q is below reported at low Q and above it at the top, consistent with PCR errors cancelling.
   - **Open, error head position:** the fitted `Position(4)` curve swings from 0 to 6% per 25-bp bin and differs between mates, while the raw disagreement rate is flat at 0.45–0.62% across positions. Fixed-length amplicon reads make `pos_start` and `pos_end` collinear, so the paired splines are unidentified and only L2 pins them. Needs one position axis when read lengths don't vary, or selection to reject it.
-  - **Open, head Q capacity:** on held-out reads the per-position Q TV median is 0.153 (max 0.60 at cycle 41) with `Position(4)`. With `Position(24)` it falls to 0.071 median, max 0.38. MiSeq's cycle-specific Q structure needs per-cycle terms or selection over n; the CLI defaults are too coarse for real runs.
+  - **Open, head Q capacity:** on held-out reads the per-position Q TV median is 0.153 (max 0.60 at cycle 41) with `Position(4)`. With `Position(24)` it falls to 0.071 median, max 0.38. MiSeq's cycle-specific Q structure needs per-cycle terms or selection over n. The CLI default is now `Position(48)` (median 0.060); cycles 40–41 remain open (see the head Q table below).
 - HiSeq-like simulation for a merge-rate target: 2×125 pairs from a gut genome (MGYG000175911) with the SRR5240881 spec. Insert mean 294, sd 50 makes ~10% of pairs overlap by ≥ 20 bases. Pilot on a random genome: 9.6% placed, as predicted. On MGYG000175911 (416 contigs), 20,000 pairs gave 10.5% placed and 22 indel-flagged, matching the theoretical 10.5%, so the placement guards cost nothing on this genome.
   - Fitting `pe-overlap` on these pairs takes 9.6 min, mostly head Q on all 5 M bases. On 1,000 held-out simulated pairs against the truth:
     - marginal substitution rate 1.07×, op TV 0.001, Q lag-1 autocorrelation 0.615 vs 0.614;
@@ -596,10 +598,16 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   | `QualityMarkov(1)`, `Position(48)`, mixed knots | 119 s | 0.082 | 0.314 | 0.340 |
 
   A second lag and linear knot spacing don't help; more log-spaced knots do. **Open:** cycles 40–41 still reach TV 0.32 at 48 knots, a narrow cycle-specific dip that a spline can't follow. It needs a per-cycle term or knots chosen by selection.
+- ✓ **Q smoothing of head E** (`fit.error.fit(smooth=, window_l2=)`, tables above) is the `pe-overlap` default.
 - Reported, not blocking: run ErrorProfiler on the same data and compare its substitution × Q tables.
+- **Open items**, carried forward:
+  - error head `Position` splines are unidentified on fixed-length reads;
+  - Q38–39 are still ~5.5× too high at ~10% merging;
+  - head Q misfits cycles 40–41 (TV 0.32);
+  - fitting cost (bin or subsample large runs; `Position(48)` doubles head Q time).
 - **Exit:**
-  - on generated pairs, the substitution part of head E (context, `QualityWindow`, position, mate) and head Q are recovered within the phase 2 tolerances;
-  - on one real Illumina run, a fitted spec and a report are produced.
+  - ✓ on generated pairs, the substitution part of head E (context, `QualityWindow`, position, mate) and head Q are recovered within the phase 2 tolerances (`tests/test_pe_overlap.py`);
+  - ✓ on one real Illumina run, a fitted spec and a report are produced (SRR5240881, above).
 
 ### Phase 5: `reference` mode and cross-mode comparison
 - `sources/bam.py`, streaming BAM/CRAM + reference → tuples:
