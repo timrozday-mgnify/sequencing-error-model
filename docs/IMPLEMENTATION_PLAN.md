@@ -542,7 +542,26 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 - ✓ The spec records `identified_ops: ["substitution"]` and gets −inf indel logits, so generation from it emits no indels; PCR/library errors cancel and are absent. `recovery.compare(substitutions_only=True)` compares on that support; `recovery.paired_draw` feeds the harness pairs from `generate.fragments`.
 - ✓ Recovery test on generated pairs (3000 pairs, ~3.5% errors) passes the phase 2 tolerances. Reads are regenerated, not committed. At ~1% errors the per-Q rates settle within 10% only by ~10k pairs; there, Q37 (rate 0.002) still comes out 14% high, probably L2 shrinkage of the rarest window weights. **Open.**
 - CLI: `python -m sequencing_error_model.sources.pe_overlap R1 R2 --output SPEC` writes a spec whose provenance carries the pair statistics.
-- Still to do: the real Illumina run; reported, not blocking: run ErrorProfiler on the same data and compare its substitution × Q tables.
+- ✓ Real-data placement guards, from two runs:
+  - **SRR5240881** (MiSeq 2×150, V3-V4/V9 mock amplicons): 97.7% of pairs placed, 0.15% indel-flagged, and a mismatch rate of 0.01% where both mates have Q ≥ 30.
+  - **ERR10889147** (HiSeq 2×125, genomic, long inserts): the first version placed about 25% of pairs, and most were false: 7–15% mismatches even at Q ≥ 30. Two Q-free fixes:
+    - an indel flag now needs the split alignment itself to pass the mismatch cap (unrelated mates had gained ≥ 3 mismatches from any shift, 525 of 2000 flagged);
+    - a pair is ambiguous when another offset more than `max_shift` away also has a mismatch fraction below `max_rival` = 0.35, which catches repeats and low-complexity sequence. This threshold is absolute: a margin over the best offset rejected error-rich true overlaps in recovery (17% of 40 bp pairs).
+  - After both fixes, 3% of ERR10889147 pairs place. Their Q ≥ 30 mismatch rate is still 1.6%, from about 0.3% of pairs that overlap a divergent copy of a repeat family longer than the read (they look like alpha-satellite). Bases alone can't flag these. They dominate only because true overlaps are so rare, so **long-insert genomic libraries are not `pe-overlap` evidence**; use amplicon or short-insert libraries, or the `reference` mode.
+- Fitting cost: collecting rows takes about 1 ms per pair; the fits dominate (1000 MiSeq pairs, 27 Q values: 30 s of EM refits for head E, 23 s for head Q). **Open:** bin or subsample before fitting large runs.
+- ✓ **Exit run** on SRR5240881, 20,000 pairs (12 min, dominated by fitting): 97.7% placed, 45 indel-flagged, 13,204 disagreements in 2.44 M overlap bases.
+  - On 1,000 held-out pairs, the fitted marginal substitution rate is 0.29% per mate (raw mate disagreement is 0.6% per overlap base).
+  - The fitted rate mostly falls as reported Q rises: about 7% at Q14–18, 0.1–0.5% at Q27–33, 0.02% at Q34–37 and 0.001% at Q38–39. Empirical Q is below reported at low Q and above it at the top, consistent with PCR errors cancelling.
+  - **Open, error head position:** the fitted `Position(4)` curve swings from 0 to 6% per 25-bp bin and differs between mates, while the raw disagreement rate is flat at 0.45–0.62% across positions. Fixed-length amplicon reads make `pos_start` and `pos_end` collinear, so the paired splines are unidentified and only L2 pins them. Needs one position axis when read lengths don't vary, or selection to reject it.
+  - **Open, head Q capacity:** on held-out reads the per-position Q TV median is 0.153 (max 0.60 at cycle 41) with `Position(4)`. With `Position(24)` it falls to 0.071 median, max 0.38. MiSeq's cycle-specific Q structure needs per-cycle terms or selection over n; the CLI defaults are too coarse for real runs.
+- HiSeq-like simulation for a merge-rate target: 2×125 pairs from a gut genome (MGYG000175911) with the SRR5240881 spec. Insert mean 294, sd 50 makes ~10% of pairs overlap by ≥ 20 bases. Pilot on a random genome: 9.6% placed, as predicted. On MGYG000175911 (416 contigs), 20,000 pairs gave 10.5% placed and 22 indel-flagged, matching the theoretical 10.5%, so the placement guards cost nothing on this genome.
+  - Fitting `pe-overlap` on these pairs takes 9.6 min, mostly head Q on all 5 M bases. On 1,000 held-out simulated pairs against the truth:
+    - marginal substitution rate 1.07×, op TV 0.001, Q lag-1 autocorrelation 0.615 vs 0.614;
+    - per-Q rates within 0.8–1.15× for most of Q12–30, with outliers at Q20 (0.34×), Q25 (1.74×) and Q27 (0.58×);
+    - Q31–39 overestimated 1.7–11×. Only 670 disagreements were seen, so the rarest-Q window weights are shrunk toward the mean rate (the recovery Q37 effect, now stronger).
+  - **Open:** with ~10% merging, high-Q rates need a stronger prior structure (e.g. a monotone or smooth Q effect) or far more pairs.
+  - **Open:** head Q per-position TV reaches 0.35 even with the truth's own tokens.
+- Reported, not blocking: run ErrorProfiler on the same data and compare its substitution × Q tables.
 - **Exit:**
   - on generated pairs, the substitution part of head E (context, `QualityWindow`, position, mate) and head Q are recovered within the phase 2 tolerances;
   - on one real Illumina run, a fitted spec and a report are produced.
