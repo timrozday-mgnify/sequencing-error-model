@@ -496,7 +496,7 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 
 ### Phase 2: model spec and both heads, fitted from exact-position observations (in progress)
 - ✓ `spec.py`: an `ErrorModelSpec` directory of `spec.json` (schema version, quality alphabet, provenance with required `mode`, component tokens, `generative`/`identified` flags, meta) and `arrays.npz` (parameters and cached marginals; object arrays are rejected and loading never unpickles). Tokens are validated against the §5.4 component names and the heads each may appear in, plus `GC`, `Weibull` and `InsertionQuality` from this phase; the shared `Latent(S)` layer sits outside both heads. Argument arity is left to each fitter. Loading rejects other schema versions, missing arrays and unreferenced arrays.
-- Provenance `mode` becomes the evidence mode (`pe-overlap`, `reference`, `kmer`, or a list for a joint fit), with a separate `skiver_build` (`default`/`enhanced`) for `kmer`. Update `spec.MODES` and its tests.
+- ✓ Provenance `mode` is the evidence mode (`pe-overlap`, `reference`, `kmer`, or a list of distinct modes for a joint fit), with `skiver_build` (`default`/`enhanced`) required exactly when `kmer` is among them (`spec.MODES`, `spec.SKIVER_BUILDS`).
 - Head Q fitters: `QualityMarkov(m)`, `Position`, `Mate`, `Context`, insertion-quality sub-head. Input is FASTQ statistics (every mode, conditioned on observed bases) or per-observation tuples (conditioned on true bases, from `pe-overlap` and `reference`).
 - Head E fitters over exact-position tuples, the form `pe-overlap` and `reference` produce:
   - `Context(L,R)` with the true-base mask;

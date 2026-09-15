@@ -21,7 +21,8 @@ import numpy as np
 import numpy.typing as npt
 
 SCHEMA_VERSION = 1
-MODES = ("default", "enhanced")
+MODES = ("pe-overlap", "reference", "kmer")  # evidence modes (§1.1)
+SKIVER_BUILDS = ("default", "enhanced")  # only for `kmer`
 MAX_Q = 93
 # Component name -> heads it may appear in (E: error, Q: quality). The shared `Latent(S)`
 # layer sits outside both heads.
@@ -63,7 +64,9 @@ class Component:
 @dataclass(frozen=True)
 class ErrorModelSpec:
     quality_alphabet: tuple[int, ...]  # the only Q values generation may emit
-    provenance: dict[str, Any]  # needs "mode"; sources, skiver version, k, v, c, input hashes, base profile
+    # needs "mode" (one of MODES, or a list for a joint fit) and, with `kmer`, "skiver_build";
+    # also sources, skiver version, k, v, c, input hashes, base profile
+    provenance: dict[str, Any]
     quality_head: tuple[Component, ...]
     error_head: tuple[Component, ...]
     latent: Component | None = None
@@ -73,8 +76,15 @@ class ErrorModelSpec:
         a = self.quality_alphabet
         if not a or list(a) != sorted(set(a)) or not all(type(q) is int and 0 <= q <= MAX_Q for q in a):
             raise SpecError(f"quality alphabet must be increasing integers in [0, {MAX_Q}], got {a}")
-        if self.provenance.get("mode") not in MODES:
-            raise SpecError(f"provenance mode must be one of {MODES}, got {self.provenance.get('mode')!r}")
+        mode = self.provenance.get("mode")
+        modes = mode if isinstance(mode, list) else [mode]
+        if not modes or len(set(map(str, modes))) != len(modes) or not all(m in MODES for m in modes):
+            raise SpecError(f"provenance mode must be one of {MODES} or a list of distinct ones, got {mode!r}")
+        build = self.provenance.get("skiver_build")
+        if ("kmer" in modes) != (build is not None) or (build is not None and build not in SKIVER_BUILDS):
+            raise SpecError(
+                f"provenance skiver_build must be one of {SKIVER_BUILDS} iff mode includes kmer, got {build!r}"
+            )
         for head, components in (("Q", self.quality_head), ("E", self.error_head)):
             names = [c.name for c in components]
             for c in components:
