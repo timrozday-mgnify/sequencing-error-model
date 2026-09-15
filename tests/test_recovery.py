@@ -44,6 +44,19 @@ def test_realign_is_optimal_and_left_aligned() -> None:
     assert hidden > 0  # the generator's CIGARs carry edits no alignment recovers
 
 
+def test_observable_left_aligns_on_the_reference() -> None:
+    # A reverse-strand read with one G of the GGG run deleted: the gap sits at the run's first base on the
+    # forward strand (6M1D7M there), so at its last base in read orientation.
+    window, forward = "GATCACGGGTCATG", "GATCACGGTCATG"
+    read = gen.Read(gen._revcomp(forward), "ABCDEFGHIJKLM", "", np.zeros(0, np.int64))
+    best, start, end = recovery.realign_observable(window, read, True, recovery.ALIGNER_SCORES["minibwa"])
+    assert (best.cigar, best.sequence, best.quality, start, end) == ("7M1D6M", read.sequence, read.quality, 0, 14)
+    # An insertion before the window's first base (1I14M forward) ends the read: clipped, as `sources.bam` does.
+    read = gen.Read(gen._revcomp("T" + window), "ABCDEFGHIJKLMNO", "", np.zeros(0, np.int64))
+    best = recovery.realign_observable(window, read, True, recovery.ALIGNER_SCORES["minibwa"])[0]
+    assert (best.cigar, best.sequence, best.clipped) == ("14M", read.sequence[:-1], ("", "O"))
+
+
 def test_cigar_mode_recovers_example_spec() -> None:
     truth = recovery.example_spec()
     fitted, report = recovery.recover(truth, n_reads=3000, seed=3)
