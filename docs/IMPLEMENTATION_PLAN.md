@@ -663,7 +663,7 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 
 ### Phase 5: `reference` mode and cross-mode comparison (in progress)
 - ✓ `sources/bam.py` core: primary, mapped, non-duplicate records with MAPQ ≥ `--min-mapq` (default 20) become (template, read, mate) triples in read orientation and go through `generate.observations`. `bam.fit` fits both heads from those tuples, and `recovery.cigar_mode` now calls it, so the recovery harness and the BAM source share one fit path. Test: generated reads written to a BAM with their true CIGARs (forward reads soft-clipped; plus secondary, low-MAPQ and duplicate copies) reproduce the generator's tuples exactly, indels included. CLI: `python -m sequencing_error_model.sources.bam BAM REF --output SPEC`.
-  - Soft-clipped bases are dropped, so positions count from the first aligned base; records with N/P ops and insertions after the last aligned base are skipped. `strand` still follows mate, as in `observations`. **Open:** count positions from the read's own ends and take strand from the alignment before fitting real runs.
+  - Soft-clipped bases (and an insertion after the last aligned base) give no rows but count toward `pos_start`/`pos_end` and fill Q windows at the aligned ends (`Read.clipped`); `strand` is the alignment's (`Read.strand`). The test checks both against reads clipped on either side. Hard clips aren't recoverable, and records with N/P ops are skipped.
 - Still to do in `sources/bam.py`:
   - site masking by minor-allele frequency; MAPQ and secondary/supplementary filters; contig coverage filter; per-contig rate report;
   - indel length, homopolymer run length, and per-read error *and quality* trajectories for `Latent(S)`.

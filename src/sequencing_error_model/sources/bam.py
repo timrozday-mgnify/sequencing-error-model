@@ -5,9 +5,12 @@ triple in the read's own orientation (reverse-strand records are reverse-complem
 through `generate.observations`, the path the recovery harness uses on the generator's own CIGARs, so a BAM
 written from generated reads reproduces those tuples exactly.
 
-ponytail: soft-clipped bases are dropped, so read positions count from the first aligned base and clipped
-ends contribute no rows; records with N or P ops are skipped, as is an insertion after the last aligned base.
-Site masking, coverage filters, per-contig reports and per-read trajectories are still to come (phase 5).
+Soft-clipped bases (and an insertion after the last aligned base) produce no rows, but they count toward read
+positions and fill Q windows at the aligned ends; `strand` is the alignment's. Hard clips are invisible, so
+positions of hard-clipped reads start at the first retained base.
+
+ponytail: records with N or P ops are skipped. Site masking, coverage filters, per-contig reports and
+per-read trajectories are still to come (phase 5).
 """
 
 import argparse
@@ -39,12 +42,7 @@ def records(bam: Path, reference: Path, min_mapq: int = 20) -> Iterator[tuple[st
         pysam.FastaFile(str(reference)) as fasta,
     ):
         for r in aln.fetch(until_eof=True):
-            ops, seq, qual, end = (
-                r.cigartuples,
-                r.query_alignment_sequence,
-                r.query_alignment_qualities,
-                r.reference_end,
-            )
+            ops, seq, qual, end = r.cigartuples, r.query_alignment_sequence, r.query_qualities, r.reference_end
             if (
                 r.is_unmapped
                 or r.is_secondary
@@ -61,14 +59,28 @@ def records(bam: Path, reference: Path, min_mapq: int = 20) -> Iterator[tuple[st
             cigar = [("M" if o > 6 else _OPS[o], n) for o, n in ops if o not in (4, 5)]  # =/X → M, drop clips
             if any(o in "NP" for o, _ in cigar):
                 continue
-            template, q = fasta.fetch(r.reference_name, r.reference_start, end).upper(), list(qual)
+            template = fasta.fetch(r.reference_name, r.reference_start, end).upper()
+            a, b, full = r.query_alignment_start, r.query_alignment_end, list(qual)
+            before, q, after = full[:a], full[a:b], full[b:]
             if r.is_reverse:
-                template, seq, q, cigar = _revcomp(template), _revcomp(seq), q[::-1], cigar[::-1]
+                template, seq, cigar = _revcomp(template), _revcomp(seq), cigar[::-1]
+                before, q, after = after[::-1], q[::-1], before[::-1]
             if cigar and cigar[-1][0] == "I":
                 n = cigar.pop()[1]
-                seq, q = seq[:-n], q[:-n]
-            quals = "".join(chr(v + 33) for v in q)
-            yield template, Read(seq, quals, "".join(f"{n}{o}" for o, n in cigar), _NO_TRACK), 2 if r.is_read2 else 1
+                seq, q, after = seq[:-n], q[:-n], q[-n:] + after
+            read = Read(
+                seq,
+                _phred(q),
+                "".join(f"{n}{o}" for o, n in cigar),
+                _NO_TRACK,
+                (_phred(before), _phred(after)),
+                "-" if r.is_reverse else "+",
+            )
+            yield template, read, 2 if r.is_read2 else 1
+
+
+def _phred(q: Sequence[int]) -> str:
+    return "".join(chr(v + 33) for v in q)
 
 
 def window(error_tokens: Sequence[str], quality_tokens: Sequence[str]) -> tuple[tuple[int, int], int]:
@@ -114,7 +126,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     table = observations(islice(records(args.bam, args.reference, args.min_mapq), args.max_reads), flank, m, "bam")
     if not table.counts:
         p.error("no usable aligned reads")
-    alphabet = sorted({int(k[0]) for k in table.counts})  # type: ignore[call-overload]
+    # Q windows can reach clipped bases, whose Q never appears at a centre.
+    qs = {v for k in table.counts for f, v in zip(table.fields, k, strict=True) if f.startswith("q") and v is not None}
+    alphabet = sorted(int(v) for v in qs)  # type: ignore[call-overload]
     provenance = {"mode": "reference", "sources": [str(args.bam), str(args.reference)], "min_mapq": args.min_mapq}
     spec = fit(table, alphabet, args.error_tokens, args.quality_tokens, provenance)
     spec.save(args.output)
