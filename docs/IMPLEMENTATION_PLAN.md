@@ -559,8 +559,31 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     - marginal substitution rate 1.07×, op TV 0.001, Q lag-1 autocorrelation 0.615 vs 0.614;
     - per-Q rates within 0.8–1.15× for most of Q12–30, with outliers at Q20 (0.34×), Q25 (1.74×) and Q27 (0.58×);
     - Q31–39 overestimated 1.7–11×. Only 670 disagreements were seen, so the rarest-Q window weights are shrunk toward the mean rate (the recovery Q37 effect, now stronger).
-  - **Open:** with ~10% merging, high-Q rates need a stronger prior structure (e.g. a monotone or smooth Q effect) or far more pairs.
-  - **Open:** head Q per-position TV reaches 0.35 even with the truth's own tokens.
+  - Smoothing `QualityWindow` weights across the Q alphabet (`fit.error.fit(smooth=)`) was tried against this bias. Mean |log2(fitted / true rate)| over Q ≥ 30, head E fitted by EM on the same 20,000 pairs:
+
+    | smooth | first differences | second differences (kept) |
+    |---|---|---|
+    | 0 | 1.54 | 1.54 |
+    | 3 | – | 1.66 |
+    | 30 | 1.72 | 1.68 |
+    | 300 | 2.32 | 1.61 |
+
+    Q38–39 stay 8–14× too high at every setting, so the overestimate is bias, not sampling noise that borrowing strength could fix. First differences also flatten the curve, pulling well-observed bins toward sparse ones. On a synthetic table with a sparse Q40 bin, second differences do follow the trend (Q40 0.029 → 0.006, below Q30's 0.013), which the unit test pins.
+  - **Suspected cause:** L2 on every weight. The Q38–39 window weights must sit far below zero, and with few errors L2 pulls them back toward the overall rate; a curvature prior can't counter a pull on the level.
+  - Head Q per-position TV reaches 0.35 even with the truth's own tokens, but only at the knots: 0.36 at cycle 5 and 0.12 at 25–27, against 0.01–0.05 elsewhere. The truth's knots sit at 1, 5.3, 28.4 and 151 (fitted on 150-bp reads) and the refit's at 1, 5, 25 and 125, so two coarse splines disagree at their kinks.
+- ✓ **Finer default head Q.** Candidates fitted on 2,000 SRR5240881 pairs and scored by per-position Q TV on 1,000 held-out reads:
+
+  | head Q (with `Mate`, `Context(1,1)`) | fit | TV median | 95th | max |
+  |---|---|---|---|---|
+  | `QualityMarkov(1)`, `Position(4)` (old default) | 48 s | 0.177 | 0.465 | 0.593 |
+  | `QualityMarkov(1)`, `Position(12)` | 53 s | 0.106 | 0.404 | 0.570 |
+  | `QualityMarkov(1)`, `Position(24)` | 69 s | 0.071 | 0.334 | 0.383 |
+  | `QualityMarkov(1)`, `Position(48)` (**new default**) | 129 s | 0.060 | 0.233 | 0.322 |
+  | `QualityMarkov(2)`, `Position(24)` | 110 s | 0.074 | 0.359 | 0.396 |
+  | `QualityMarkov(1)`, `Position(24)`, mixed knots (log to cycle 10, then linear) | 77 s | 0.112 | 0.367 | 0.450 |
+  | `QualityMarkov(1)`, `Position(48)`, mixed knots | 119 s | 0.082 | 0.314 | 0.340 |
+
+  A second lag and linear knot spacing don't help; more log-spaced knots do. **Open:** cycles 40–41 still reach TV 0.32 at 48 knots, a narrow cycle-specific dip that a spline can't follow. It needs a per-cycle term or knots chosen by selection.
 - Reported, not blocking: run ErrorProfiler on the same data and compare its substitution × Q tables.
 - **Exit:**
   - on generated pairs, the substitution part of head E (context, `QualityWindow`, position, mate) and head Q are recovered within the phase 2 tolerances;

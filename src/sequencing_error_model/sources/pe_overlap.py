@@ -209,6 +209,7 @@ def fit(
     iterations: int = 30,
     tol: float = 1e-3,
     smooth: float = 0.0,
+    window_l2: float | None = None,
     seed: int = 0,
     sources: Sequence[str] = ("pe-overlap",),
 ) -> ErrorModelSpec:
@@ -228,7 +229,9 @@ def fit(
                 counts[r] = counts.get(r, 0.0) + float(c)
         expected = cast("Counter[Key]", Counter({k: v for k, v in counts.items() if v > 0}))
         table = CountTable("pe-overlap", fields_, "base", True, expected, meta)
-        error_head = error.fit(table, error_tokens, alphabet, smooth=smooth, seed=seed, init=error_head)
+        error_head = error.fit(
+            table, error_tokens, alphabet, smooth=smooth, window_l2=window_l2, seed=seed, init=error_head
+        )
         if not groups:
             break
         keys = Counter(dict.fromkeys((k for rows, _ in groups for k in rows), 1))
@@ -289,7 +292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("r2", type=Path, help="mate 2 FASTQ[.gz], in the same order")
     p.add_argument("--output", type=Path, required=True, metavar="SPEC_DIR")
     p.add_argument("--error-tokens", nargs="+", default=["QualityWindow(1)", "Context(1,1)", "Position(4)", "Mate"])
-    p.add_argument("--quality-tokens", nargs="+", default=["QualityMarkov(1)", "Position(4)", "Mate", "Context(1,1)"])
+    p.add_argument("--quality-tokens", nargs="+", default=["QualityMarkov(1)", "Position(48)", "Mate", "Context(1,1)"])
     p.add_argument("--max-pairs", type=int)
     p.add_argument("--min-overlap", type=int, default=20)
     p.add_argument("--iterations", type=int, default=30, help="maximum EM iterations")
