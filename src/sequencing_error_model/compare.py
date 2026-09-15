@@ -12,17 +12,28 @@ errors and strain variation. So comparisons are restricted to what both observe.
   estimates PCR/library substitutions, plus any residual variation or reference error.
 - `models(a, b, table)`: both specs' head E on one table, conditioned on no indel: op TV, rates, rate by Q, and
   each spec's log-likelihood per row.
+
+CLI (`python -m sequencing_error_model.compare`): one run's R1/R2 and its BAM, with the specs the two source CLIs
+fitted from them, give a JSON report of both levels (models on each mode's rows).
 """
 
+import argparse
+import json
+import sys
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
+from itertools import islice
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from sequencing_error_model import spec as spec_io
 from sequencing_error_model.fit import error, indel
+from sequencing_error_model.generate import _flank, observations
 from sequencing_error_model.observations import CountTable, Key
+from sequencing_error_model.sources import bam, pe_overlap
 from sequencing_error_model.spec import ErrorModelSpec
 
 
@@ -95,3 +106,58 @@ def models(a: ErrorModelSpec, b: ErrorModelSpec, table: CountTable, by: str = "q
         "values": values,
         "rates_by": [[float(n[key == v] @ (1 - x[key == v, 0]) / n[key == v].sum()) for v in values] for x in p],
     }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="python -m sequencing_error_model.compare", description="Compare pe-overlap and reference on one run."
+    )
+    p.add_argument("r1", type=Path, help="mate 1 FASTQ[.gz]")
+    p.add_argument("r2", type=Path, help="mate 2 FASTQ[.gz], in the same order")
+    p.add_argument("bam", type=Path, help="the same reads aligned (BAM/SAM/CRAM)")
+    p.add_argument("reference", type=Path, help="reference FASTA")
+    p.add_argument("--overlap-spec", type=Path, required=True, help="spec from sources.pe_overlap on R1/R2")
+    p.add_argument("--reference-spec", type=Path, required=True, help="spec from sources.bam on the BAM")
+    p.add_argument("--output", type=Path, required=True, metavar="JSON")
+    p.add_argument("--by", nargs="+", default=["q", "mate"], help="covariates for the evidence-level comparison")
+    p.add_argument("--min-exposure", type=float, default=100)
+    p.add_argument("--min-overlap", type=int, default=20)
+    p.add_argument("--min-mapq", type=int, default=20)
+    p.add_argument("--max-pairs", type=int)
+    p.add_argument("--max-reads", type=int)
+    p.add_argument("--mask-alt-freq", type=float, help="mask sites with a non-reference allele at this frequency")
+    args = p.parse_args(argv)
+    a, b = spec_io.load(args.overlap_spec), spec_io.load(args.reference_spec)
+    # One window for both tables, wide enough for both specs' head E.
+    heads = [a.error_head, b.error_head]
+    flanks = [_flank(h) for h in heads]
+    flank = (max(2, *(f[0] for f in flanks)), max(2, *(f[1] for f in flanks)))
+    m = max(h[0].args[0] for h in heads)
+
+    ev = pe_overlap.collect(
+        islice(pe_overlap.read_pairs(args.r1, args.r2), args.max_pairs), m, flank, min_overlap=args.min_overlap
+    )
+    overlap = pe_overlap.table(ev, a.error_head)
+    masked = None
+    if args.mask_alt_freq is not None:
+        masked = bam.masks(bam.pileup(args.bam, args.reference, args.min_mapq), args.reference, args.mask_alt_freq)[0]
+    reads = islice(bam.records(args.bam, args.reference, args.min_mapq, masked), args.max_reads)
+    reference = observations(reads, flank, m, "reference")
+    if not overlap.counts or not reference.counts:
+        p.error("no overlap rows" if not overlap.counts else "no usable aligned reads")
+
+    report = {
+        "sources": {"overlap_spec": str(args.overlap_spec), "reference_spec": str(args.reference_spec)},
+        "overlap_stats": asdict(ev.stats),
+        "mask_alt_freq": args.mask_alt_freq,
+        "evidence": evidence(overlap, reference, args.by, args.min_exposure),
+        "models": {"reference_rows": models(a, b, reference), "overlap_rows": models(a, b, overlap)},
+    }
+    args.output.write_text(json.dumps(report, indent=2))
+    e = report["evidence"]
+    print(json.dumps({k: e[k] for k in ("rate_a", "rate_b", "excess", "coverage")}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
