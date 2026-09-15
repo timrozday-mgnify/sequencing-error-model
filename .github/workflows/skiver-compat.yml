@@ -1,0 +1,58 @@
+name: skiver-compat
+
+# Regenerates the analyze fixtures with released skiver binaries and checks the
+# parsers still read them. Weekly so a new upstream release is caught.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/sequencing_error_model/sources/skiver_*"
+      - "tests/fixtures/**"
+      - "tests/test_skiver_*"
+      - ".github/workflows/skiver-compat.yml"
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  skiver-compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        skiver: [v0.3.1, v0.3.2, latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Download skiver ${{ matrix.skiver }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ matrix.skiver }}"
+          if [ "$tag" = latest ]; then tag=$(gh release view -R GZHoffie/skiver --json tagName -q .tagName); fi
+          gh release download "$tag" -R GZHoffie/skiver -p skiver -O "$RUNNER_TEMP/skiver"
+          chmod +x "$RUNNER_TEMP/skiver"
+          "$RUNNER_TEMP/skiver" --version
+
+      - name: Regenerate fixtures
+        run: uv run python tests/fixtures/make_skiver_fixtures.py "$RUNNER_TEMP/skiver" "$RUNNER_TEMP/out"
+
+      - name: Parse regenerated outputs
+        run: SKIVER_ANALYZE_DIR="$RUNNER_TEMP/out" uv run pytest -vv tests/test_skiver_analyze.py
+
+      # Bootstrap CIs (hazard_rate, summary_error_rate, summary_phred, summary_gc_content) vary run to run.
+      - name: Diff deterministic outputs against committed fixtures
+        if: matrix.skiver == 'v0.3.2'
+        run: |
+          for f in kvmer summary_error_spectrum summary_error_spectrum_dependence_on_t summary_read_position survival_rate; do
+            diff "tests/fixtures/skiver-v0.3.2/analyze.$f.csv" "$RUNNER_TEMP/out/analyze.$f.csv"
+          done
