@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py` landed); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py` and the head Q fitters landed); everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9).
 
 ## 1. Goal
 
@@ -497,7 +497,9 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 ### Phase 2: model spec and both heads, fitted from exact-position observations (in progress)
 - ✓ `spec.py`: an `ErrorModelSpec` directory of `spec.json` (schema version, quality alphabet, provenance with required `mode`, component tokens, `generative`/`identified` flags, meta) and `arrays.npz` (parameters and cached marginals; object arrays are rejected and loading never unpickles). Tokens are validated against the §5.4 component names and the heads each may appear in, plus `GC`, `Weibull` and `InsertionQuality` from this phase; the shared `Latent(S)` layer sits outside both heads. Argument arity is left to each fitter. Loading rejects other schema versions, missing arrays and unreferenced arrays.
 - ✓ Provenance `mode` is the evidence mode (`pe-overlap`, `reference`, `kmer`, or a list of distinct modes for a joint fit), with `skiver_build` (`default`/`enhanced`) required exactly when `kmer` is among them (`spec.MODES`, `spec.SKIVER_BUILDS`).
-- Head Q fitters: `QualityMarkov(m)`, `Position`, `Mate`, `Context`, insertion-quality sub-head. Input is FASTQ statistics (every mode, conditioned on observed bases) or per-observation tuples (conditioned on true bases, from `pe-overlap` and `reference`).
+- ✓ Head Q fitters (`fit/quality.py`): `QualityMarkov(m)` (required; holds the bias), `Position(n)` (linear splines over log distance from start and end), `Mate` and `Context(L,R)`, as one log-linear softmax over the quality alphabet fitted by L2-penalised L-BFGS (scipy) from a joint `CountTable` with a `q` field. `sample` draws Q tracks from the same design matrix, for tests now and the generator in phase 3. Recovery test: on tuples sampled from a known head, lag, context and mate effects correlate r > 0.9 and per-position Q histograms are within TV < 0.05.
+  - Still to do: the insertion-quality sub-head (needs insertion rows, so it waits for `reference` tuples), and a joint (lags × position × context) table from `fastq_quality`, whose current counters are separate marginals.
+- Input is FASTQ statistics (every mode, conditioned on observed bases) or per-observation tuples (conditioned on true bases, from `pe-overlap` and `reference`).
 - Head E fitters over exact-position tuples, the form `pe-overlap` and `reference` produce:
   - `Context(L,R)` with the true-base mask;
   - `QualityWindow(m)`, always including the centre-Q term, and `QualityxContext(rank)`;
