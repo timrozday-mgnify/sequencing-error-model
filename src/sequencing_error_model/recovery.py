@@ -409,9 +409,11 @@ def aligner_bias(
     (with any `IndelLength`) refitted from the aligned tuples against the truth on held-out reads (head Q kept).
 
     Generated CIGARs can hold edits no alignment recovers (a deletion and an insertion of one base in a
-    homopolymer run cancel), so the metrics are also reported against the observable truth: the true reads
-    `realign`ed end to end under the aligner's own scores (`ALIGNER_SCORES`, first affine gap of each), indels
-    left-aligned (`*_observable`, plus indel rates and lengths by run). That isolates the aligner's heuristics
+    homopolymer run cancel), so the metrics are also reported against the observable truth: each whole true read
+    `realign`ed under the aligner's own scores (`ALIGNER_SCORES`, first affine gap of each) to the genome around
+    its true span, with free template ends, indels left-aligned (`*_observable`, plus indel rates and lengths by
+    run). The true span's ends aren't observable either: an indel next to a read end can score the same or worse
+    than a shifted end. That isolates the aligner's heuristics
     (seeding, bands, clipping); `edits_hidden` and `observable_rate_ratio` size what even the optimal alignment
     doesn't show."""
     lengths = lengths or ALIGNER_READS[aligner]
@@ -439,10 +441,19 @@ def aligner_bias(
     scores = ALIGNER_SCORES[aligner]
     aligned = list(bam.records(sam, reference, min_mapq, unclip=scores if unclip else None))
     a_templates, a_reads, a_mates = (list(x) for x in zip(*aligned, strict=True)) if aligned else ([], [], [])
-    observable = [realign(t, r, scores)[0] for t, r in zip(templates, reads, strict=True)]
+    margin = bam._UNCLIP_MARGIN
+    observed = []  # (forward start, forward end, template, read)
+    for s, k, rev, r in zip(start, size, reverse, reads, strict=True):
+        lo, hi = max(0, int(s) - margin), min(genome_length, int(s + k) + margin)
+        window = _revcomp(genome[lo:hi]) if rev else genome[lo:hi]
+        best, s0, s1 = realign(window, r, scores, free_template_ends=True)
+        span = (hi - s1, hi - s0) if rev else (lo + s0, lo + s1)
+        observed.append((*span, window[s0:s1], best))
+    o_templates, observable = [o[2] for o in observed], [o[3] for o in observed]
     true_table, aligned_table = _tuples(truth, templates, reads, mates), _tuples(truth, a_templates, a_reads, a_mates)
-    observable_table = _tuples(truth, templates, observable, mates)
-    true_records, observable_records = (list(zip(templates, x, mates, strict=True)) for x in (reads, observable))
+    observable_table = _tuples(truth, o_templates, observable, mates)
+    true_records = list(zip(templates, reads, mates, strict=True))
+    observable_records = list(zip(o_templates, observable, mates, strict=True))
 
     def op_rates(table: CountTable) -> dict[str, float]:
         oi, c = table.fields.index("op"), Counter[str]()
@@ -463,7 +474,8 @@ def aligner_bias(
     ]
     true_counts = bam.count_alleles(placed, {"g": genome_length})["g"]
     observable_counts = bam.count_alleles(
-        [(*p[:5], o, 1) for p, o in zip(placed, observable, strict=True)], {"g": genome_length}
+        [("g", s, e, bool(rev), t, o, 1) for (s, e, t, o), rev in zip(observed, reverse, strict=True)],
+        {"g": genome_length},
     )["g"]
     aligned_counts = bam.pileup(sam, reference, min_mapq, scores if unclip else None).get(
         "g", np.zeros_like(true_counts)
