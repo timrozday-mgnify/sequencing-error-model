@@ -5,7 +5,9 @@ description = "Train sequencing error models from skiver (k,v)-mer outputs and e
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = []
+dependencies = [
+    "numpy>=2.4.6",
+]
 
 [dependency-groups]
 dev = [
@@ -28,7 +30,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.11"
+# ponytail: matches CI/.python-version; numpy>=2.5 stubs use 3.12 syntax. ruff still targets py311.
+python_version = "3.12"
 strict = true
 
 [tool.pytest.ini_options]
