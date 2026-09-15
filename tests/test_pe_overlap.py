@@ -22,6 +22,10 @@ def test_place_finds_offset_read_through_and_indels() -> None:
         s, indel = pe_overlap.place(r1, mutated)
         assert s is None or indel, size
     assert pe_overlap.place("ACGT" * 10, "") == (None, False)
+    # Unrelated mates (long inserts) are neither placed nor mistaken for indels.
+    for _ in range(50):
+        r1, r2 = ("".join(rng.choice(list("ACGT"), size=125)) for _ in range(2))
+        assert pe_overlap.place(r1, r2) == (None, False)
 
 
 def test_cli_fits_spec_from_fastq(tmp_path: Path) -> None:

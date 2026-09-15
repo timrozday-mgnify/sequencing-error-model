@@ -101,12 +101,15 @@ def place(
         inside = (k >= 0) & (k < len(b))
         return np.asarray(np.r_[0, np.cumsum(np.where(inside, diff[i, np.clip(k, 0, len(b) - 1)], True))])
 
-    c0, gain = mismatches(s), 0
+    c0 = mismatches(s)
+    best_split = int(c0[-1])
     for shift in (*range(-max_shift, 0), *range(1, max_shift + 1)):
         c1 = mismatches(s + shift)
         split = np.minimum(c0 + c1[-1] - c1, c1 + c0[-1] - c0)  # one side at s, the other shifted
-        gain = max(gain, int(c0[-1] - split.min()))
-    if gain >= min_gain:  # checked before the mismatch cap: an indel mid-overlap fails every gapless offset
+        best_split = min(best_split, int(split.min()))
+    # Checked before the gapless cap (an indel mid-overlap fails every gapless offset), but the split alignment
+    # must pass the cap itself: unrelated mates, ~50% mismatched at their best offset, gain from any shift.
+    if c0[-1] - best_split >= min_gain and best_split <= max_mismatch * len(i):
         return s, True
     return (s if frac.min() <= max_mismatch else None), False
 
