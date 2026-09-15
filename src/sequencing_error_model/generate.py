@@ -230,6 +230,53 @@ def align(template: str, read: Read) -> tuple[list[tuple[int, str]], list[int | 
     return rows, tq
 
 
+def _filled(template: str, read: Read) -> tuple[list[tuple[int, str]], list[int | None], int]:
+    """`align` rows, the read-indexed Q track with deleted bases filled and clipped bases added, and the number
+    of leading clipped bases (template base t sits at track index t + that)."""
+    rows, tq = align(template, read)
+    filled, nxt = list(tq), None
+    for t in reversed(range(len(tq))):
+        filled[t] = nxt = tq[t] if tq[t] is not None else nxt
+    for t in range(1, len(filled)):
+        filled[t] = filled[t] if filled[t] is not None else filled[t - 1]
+    before, after = ([ord(c) - 33 for c in s] for s in read.clipped)
+    return rows, [*before, *filled, *after], len(before)
+
+
+def indel_events(records: Iterable[tuple[str, Read, int]], source: str = "generator") -> CountTable:
+    """One count per indel event: kind, length, the template homopolymer run at the event, and the Q there.
+
+    Consecutive insertions before one template base are one insertion; consecutive deleted template bases are
+    one deletion, placed at its first base. `run` is the full run length of that template base (unbounded, so
+    not limited to a context window) and `q` its filled Q, as in `observations`. Events at template bases other
+    than A, C, G, T, or at `masked` indices, are skipped.
+    """
+    counts: Counter[Key] = Counter()
+    for template, read, _ in records:
+        rows, filled, before = _filled(template, read)
+        seq = template.upper()
+        events: list[tuple[str, int, int]] = []  # (kind, template base, length)
+        for t, op in rows:
+            kind = "I" if op[0] == "-" else "D" if op[-1] == "-" else None
+            last = events[-1] if events else None
+            if kind is None:
+                continue
+            if last and last[0] == kind and last[1] + (0 if kind == "I" else last[2]) == t:
+                events[-1] = (kind, last[1], last[2] + 1)
+            else:
+                events.append((kind, t, 1))
+        for kind, t, n in events:
+            if seq[t] not in "ACGT" or t in read.masked or filled[t + before] is None:
+                continue
+            lo, hi = t, t
+            while lo > 0 and seq[lo - 1] == seq[t]:
+                lo -= 1
+            while hi + 1 < len(seq) and seq[hi + 1] == seq[t]:
+                hi += 1
+            counts[(kind, n, hi - lo + 1, filled[t + before])] += 1
+    return CountTable(source, ("indel", "indel_length", "run", "q"), "error", True, counts)
+
+
 def observations(
     records: Iterable[tuple[str, Read, int]], flank: tuple[int, int], m: int, source: str = "generator"
 ) -> CountTable:
@@ -246,18 +293,11 @@ def observations(
     fields += ("context", "pos_start", "pos_end", "mate", "strand", "gc", "op")
     counts: Counter[Key] = Counter()
     for template, read, mate in records:
-        rows, tq = align(template, read)
-        filled, nxt = list(tq), None
-        for t in reversed(range(len(tq))):
-            filled[t] = nxt = tq[t] if tq[t] is not None else nxt
-        for t in range(1, len(filled)):
-            filled[t] = filled[t] if filled[t] is not None else filled[t - 1]
+        rows, filled, before = _filled(template, read)
         padded, gc = "." * left + template.upper() + "." * right, gc_bin(template)
-        before, after = ([ord(c) - 33 for c in s] for s in read.clipped)
-        filled = [*before, *filled, *after]
         strand = read.strand or ("-" if mate == 2 else "+")
         for t, op in rows:
-            i = t + len(before)
+            i = t + before
             if template[t].upper() not in "ACGT" or filled[i] is None or t in read.masked:
                 continue
             window = tuple(

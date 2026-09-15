@@ -23,6 +23,8 @@ Field vocabulary (positions are 1-based):
 - `t`: position in the skiver value.
 - `pos_start`, `pos_end`: position from the read start, from the read end.
 - `strand` ("+", "-"), `mate` (1, 2), `gc` ((lo, hi) GC % bin), `length` (read length).
+- `indel` ("I", "D"), `indel_length` (bases in one indel event), `run` (template homopolymer run length at the
+  event); error labels like `op`, so they also need a truth-bearing source.
 """
 
 import re
@@ -40,7 +42,9 @@ ERROR_OPS = (
 OP_VALUES = frozenset(("=", "!", *ERROR_OPS))
 # What one count is: a base, a skiver value observation, a read, or an error event with no exposure.
 UNITS = frozenset(("base", "value", "read", "error"))
-_FIELD = re.compile(r"op|context|locus|q|q[+-][1-9]\d*|t|pos_start|pos_end|strand|mate|gc|length")
+_FIELD = re.compile(
+    r"op|context|locus|q|q[+-][1-9]\d*|t|pos_start|pos_end|strand|mate|gc|length|indel|indel_length|run"
+)
 
 Key = tuple[Hashable, ...]
 
@@ -68,7 +72,7 @@ class CountTable:
             raise ValueError(f"{self.source}: unknown or repeated fields in {self.fields}")
         if self.unit not in UNITS:
             raise ValueError(f"{self.source}: unit must be one of {sorted(UNITS)}, got {self.unit!r}")
-        if "op" in self.fields and not self.truth:
+        if {"op", "indel"} & set(self.fields) and not self.truth:
             raise ValueError(f"{self.source}: op labels need a truth-bearing source; quality is never error truth")
         op = self.fields.index("op") if "op" in self.fields else None
         for key, n in self.counts.items():
