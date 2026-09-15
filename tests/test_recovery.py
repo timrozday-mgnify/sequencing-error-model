@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +50,25 @@ def test_cigar_mode_recovers_example_spec() -> None:
     assert [c.token for c in fitted.error_head] == [c.token for c in truth.error_head]
     assert report.failures() == [], report.scalars
     assert abs(report.scalars["q_lag1_fit"] - report.scalars["q_lag1_true"]) < 0.05, report.scalars
+
+
+def test_indel_components_isolate_homopolymer_and_context() -> None:
+    truth = recovery.example_spec()
+    rng = np.random.default_rng(0)
+    templates = ["".join(rng.choice(list("ACGT"), size=40)) for _ in range(2000)]
+    mates = [1] * len(templates)
+    table = recovery._tuples(truth, templates, gen.generate(truth, templates, mates, rng), mates)
+    assert set(recovery.indel_components(truth, truth, table).values()) == {1.0}
+
+    head = list(truth.error_head)
+    runs, ctx = (head[i].params["weights"].copy() for i in (2, 1))
+    runs[2:, 5:] = 0.0  # no homopolymer effect on indels
+    ctx[0, 0, 9] = 1.0  # deletions after A
+    head[2] = replace(head[2], params={"weights": runs})
+    head[1] = replace(head[1], params={"weights": ctx})
+    moved = recovery.indel_components(truth, replace(truth, error_head=tuple(head)), table)
+    assert moved["D run 3+"] < 0.5 and moved["I run 3+"] < 0.5 and moved["I run 1"] > 0.9
+    assert moved["D -1A"] > 1.5 * moved["D -1C"] and 0.9 < moved["I -1A"] / moved["I -1C"] < 1.1
 
 
 def test_cli_writes_report(tmp_path: Path) -> None:

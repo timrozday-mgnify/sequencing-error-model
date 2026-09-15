@@ -273,6 +273,37 @@ def indel_profile(records: Sequence[tuple[str, Read, int]], max_length: int = 4)
     }
 
 
+def indel_components(a: ErrorModelSpec, b: ErrorModelSpec, table: CountTable) -> dict[str, float]:
+    """Per-component indel check (plan phase 5): expected deletion (D) and insertion (I) counts under head E of
+    `b` over those under `a`, on `table`'s rows, grouped by the centre base's homopolymer run inside the context
+    window (`Homopolymer`: "D run 3+") and by the base at each context offset (`Context`: "I -1G"). On random
+    templates the other components average out of each group, so a ratio away from 1 is that component's indel
+    effect moved; the phase 2 per-Q tolerance (10%) applies."""
+    n = np.array(list(table.counts.values()), float)
+    expected = {}
+    for name, s in (("a", a), ("b", b)):
+        p = error.probabilities(indel.split(s.error_head)[0], a.quality_alphabet, table)
+        expected[name] = {"D": n * p[:, 9], "I": n * p[:, 5:9].sum(axis=1)}
+    f0 = table.meta["flank"][0]
+    contexts = [str(k[table.fields.index("context")]) for k in table.counts]
+    runs = []
+    for c in contexts:
+        left = len(c[: f0 + 1]) - len(c[: f0 + 1].rstrip(c[f0]))
+        right = len(c[f0:]) - len(c[f0:].lstrip(c[f0]))
+        runs.append(_RUNS[min(left + right - 1, 3) - 1])
+    groups = {f"run {r}": np.array(runs) == r for r in _RUNS}
+    chars = np.array([list(c) for c in contexts])
+    for i in range(chars.shape[1]):
+        for base in "ACGT":
+            groups[f"{i - f0:+d}{base}"] = chars[:, i] == base
+    return {
+        f"{kind} {g}": round(float(expected["b"][kind][sel].sum() / expected["a"][kind][sel].sum()), 3)
+        for kind in ("D", "I")
+        for g, sel in groups.items()
+        if sel.any()
+    }
+
+
 def _refit_error(truth: ErrorModelSpec, table: CountTable, records: Sequence[tuple[str, Read, int]]) -> ErrorModelSpec:
     """The truth with head E (and any `IndelLength`) refitted with its tokens from `table` and `records`."""
     body, length_head = indel.split(truth.error_head)
@@ -499,6 +530,9 @@ def aligner_bias(
     report = compare(truth, fitted, held, held_mates, rng, q_reads=len(held))
     against_observable = compare(observable_fit, fitted, held, held_mates, rng, q_reads=len(held))
     identified = compare(truth, observable_fit, held, held_mates, rng, q_reads=len(held))
+    held_table = _tuples(truth, held, generate(truth, held, held_mates, rng), held_mates)
+    components = indel_components(truth, fitted, held_table)
+    components_observable = indel_components(observable_fit, fitted, held_table)
 
     def by_q(r: Report) -> list[float]:
         ratio = np.array(r.curves["rate_by_q_fit"]) / np.array(r.curves["rate_by_q_true"])
@@ -552,6 +586,11 @@ def aligner_bias(
         "op_tv_observable": against_observable.scalars["op_tv"],
         "rate_by_q_ratio_observable": by_q(against_observable),
         "failures_observable": error_failures(against_observable),
+        "indel_components": components,
+        "indel_components_observable": components_observable,
+        "indel_component_failures_observable": {
+            k: v for k, v in components_observable.items() if abs(v - 1) > TOLERANCES["rate_by_q"]
+        },
     }
 
 
