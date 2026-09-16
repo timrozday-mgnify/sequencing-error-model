@@ -29,7 +29,7 @@ def test_distances_rank_simulators() -> None:
     real, same, noisy = _profile(1), _profile(2), _profile(3, error_rate_scale=3.0)
     assert noisy.summary()["error_rate"] > 1.5 * real.summary()["error_rate"]
     near, far = baseline.distances(real, same), baseline.distances(real, noisy)
-    for metric in ("rate", "substitution_rate", "rate_by_q", "rate_by_cycle", "edits_per_read_tv", "kmer_absent"):
+    for metric in ("rate", "substitution_rate", "rate_by_q", "rate_by_cycle", "read_error_rate_tv", "kmer_absent"):
         assert near[metric] < far[metric] / 2, metric
         assert baseline.verdict(near[metric], far[metric]) == "beats"
     # Error scaling leaves the Q process alone.
