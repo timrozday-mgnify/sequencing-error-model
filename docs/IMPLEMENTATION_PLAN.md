@@ -797,21 +797,26 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     - Training: pairs 1–20,000 aligned with minibwa. The native spec is the `reference` spec above (`QualityWindow(1) Context(1,1) Homopolymer Mate`, fitted with `--unclip`). ReSeq 1.1 (bioconda container, amd64 under emulation, 1 min) got `--adapterFile` with the TruSeq pair, because its adapter auto-detection fails on adapter-trimmed reads. Its coverage bias fit didn't converge at 1.2× depth, so it simulated uniform coverage.
     - Evaluation: held-out pairs 20,001–100,000 against 80,000 simulated pairs each (native `--insert-mean 369 --insert-sd 66`, the training alignment's), all aligned with minibwa and profiled with `--unclip 2 8 12 2`, 2 min per run.
 
-    | metric | real | native | native, `Position(4)` | ReSeq | distance: native / `Position(4)` / ReSeq | `Position(4)` vs ReSeq |
-    |---|---|---|---|---|---|---|
-    | error rate | 0.776% | 0.832% | 0.819% | 0.849% | 0.070 / 0.054 / 0.089 | beats |
-    | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 3.0 / 3.2 | 3.0 / 3.3 | 3.2 / 2.3 | 0.137, 0.006 / 0.146, 0.060 / 0.206, 0.308 | beats |
-    | rate by reported Q | | | | | 0.140 / 0.141 / 0.243 | beats |
-    | rate by 10-cycle bin | | | | | 0.122 / **0.074** / 0.094 | **beats** (was trails) |
-    | substitution rate by trinucleotide | | | | | 0.180 / 0.176 / 0.245 | beats |
-    | Q by 10-cycle bin (TV) | mean Q 32.36 | 32.30 | 32.30 | 32.13 | 0.010 / 0.010 / 0.018 | matches |
-    | Q lag-1 autocorrelation | 0.200 | 0.175 | 0.175 | 0.188 | 0.026 / 0.026 / 0.012 | trails |
-    | per-read error rate (TV) | median < 0.2%, p90 2.7% | 0.7%, 1.9% | 0.7%, 1.9% | < 0.2%, 2.7% | 0.373 / 0.368 / 0.076 | trails |
-    | k-mer spectrum (TV) | | | | | 0.057 / 0.054 / 0.045 | matches (within the 0.01 floor; was trails at 0.012) |
-    | reference-absent k-mers | 11.5% | 15.4% | 15.0% | 13.1% | 0.288 / 0.263 / 0.132 | trails |
+    | metric | real | native | `Position(4)` | `Position(8)` | ReSeq | distance: native / `Position(4)` / `Position(8)` / ReSeq | `Position(8)` vs ReSeq |
+    |---|---|---|---|---|---|---|---|
+    | error rate | 0.776% | 0.832% | 0.819% | 0.798% | 0.849% | 0.070 / 0.054 / **0.028** / 0.089 | beats |
+    | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 3.0 / 3.2 | 3.0 / 3.3 | 2.9 / 3.6 | 3.2 / 2.3 | D 0.137 / 0.146 / 0.093 / 0.206; I 0.006 / 0.060 / 0.143 / 0.308 | beats |
+    | rate by reported Q | | | | | | 0.140 / 0.141 / **0.108** / 0.243 | beats |
+    | rate by 10-cycle bin | | | | | | 0.122 / 0.074 / **0.056** / 0.094 | beats |
+    | substitution rate by trinucleotide | | | | | | 0.180 / 0.176 / 0.168 / 0.245 | beats |
+    | Q by 10-cycle bin (TV) | mean Q 32.36 | 32.30 | 32.30 | 32.30 | 32.13 | 0.010 / 0.010 / 0.010 / 0.018 | matches |
+    | Q lag-1 autocorrelation | 0.200 | 0.175 | 0.175 | 0.175 | 0.188 | 0.026 / 0.026 / 0.026 / 0.012 | trails |
+    | per-read error rate (TV) | median < 0.2%, p90 2.7% | 0.7%, 1.9% | 0.7%, 1.9% | 0.7%, 1.9% | < 0.2%, 2.7% | 0.373 / 0.368 / 0.360 / 0.076 | trails |
+    | k-mer spectrum (TV) | | | | | | 0.057 / 0.054 / 0.051 / 0.045 | matches (within the 0.01 floor) |
+    | reference-absent k-mers | 11.5% | 15.4% | 15.0% | 14.6% | 13.1% | 0.288 / 0.263 / 0.241 / 0.132 | trails |
 
     - **Beats** on per-base error structure: rates by Q and trinucleotide context, and indel rates.
-    - **Rate by cycle** trailed because the first spec had no `Position` in head E (the Q21 cycle effect above). Refitting head E as `QualityWindow(1) Context(1,1) Position(4) Homopolymer Mate` on the same training records (14 min; +0.00022 nats per row, +1,290 on 5.98 M training rows), with head Q unchanged and generation repeated with the same seed, cuts that distance from 0.122 to 0.074. It now beats ReSeq (0.094). Every other metric moves by less than the verdict margin; the insertion distance (0.006 → 0.060) rests on about 750 insertion bases, so without a noise floor it reads as noise. `Position(8)` isn't tried.
+    - **Rate by cycle** trailed because the first spec had no `Position` in head E (the Q21 cycle effect above). Refitting head E as `QualityWindow(1) Context(1,1) Position(4) Homopolymer Mate` on the same training records (14 min; +0.00022 nats per row, +1,290 on 5.98 M training rows), with head Q unchanged and generation repeated with the same seed, cuts that distance from 0.122 to 0.074. It now beats ReSeq (0.094).
+    - `Position(8)` (19 min; +0.00035 nats per training row) goes further: rate by cycle 0.056, error rate 0.028, and rate by reported Q 0.108 (from 0.140), so part of the Q curve's miss was cycle confounded with Q.
+      - Held-out head E log-likelihood on pairs 20,001–50,000 (9.0 M rows, same `--unclip` and window) agrees: +1,568 nats for `Position(4)` and +2,538 for `Position(8)` over no `Position`. The extra knots generalise.
+      - The insertion distance grows (0.006 → 0.060 → 0.143), but it rests on about 750 insertion bases per read set, so without a noise floor it reads as noise; deletions improve (0.137 → 0.093).
+      - Per-read heterogeneity doesn't move (0.373 → 0.360).
+      - Default for Illumina `reference` specs: `Position(8)` over `Position(4)`. The `pe-overlap` default stays `Position(4)`: fixed-length amplicon reads leave its position axes collinear (phase 4).
     - **Trails** on per-read error heterogeneity, the largest gap. Real mismatches per read (NM) are overdispersed (variance/mean 4.0; 59% of reads have none, against 33% under Poisson). ReSeq reaches 3.4 through its errors-so-far conditioning. The native generator draws errors independently given Q, so it gives 1.05, and its lag-1 Q (0.175 vs 0.200) doesn't carry enough read-level clustering. The spread-out errors break more k-mers, which drives the k-mer spectrum and reference-absent k-mer gaps. That is the deferred per-read trajectory model (`Latent(S)`).
     - Not yet measured: a sampling-noise floor (real vs real halves), which matters for the rare indels (600–750 indel bases per read set).
   - ✓ **Long-read run** (2026-09-16): SRR30993108, *E. coli* K-12, PromethION R10.4.1 (kit14, 5 kHz, dorado sup v5), 62,469 reads, mean 7.9 kb. Reference NC_000913.3 (MG1655). Reads 1–5,000 train and reads 30,001–35,000 (39.7 Mb) are held out, all aligned with minimap2 `-ax map-ont`, profiled without `--unclip` (its DP is unbanded) and with `--cycle-bin 500`, 5.5 min for five read sets.
