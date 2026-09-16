@@ -100,9 +100,8 @@ def _tuples(model: ErrorModelSpec, templates: Sequence[str], reads: Sequence[Rea
     e, q = _flank(model.error_head), _flank(model.quality_head)
     m = max(model.error_head[0].args[0], model.quality_head[0].args[0])
     per_event = indel.split(model.error_head)[1] is not None
-    return observations(
-        zip(templates, reads, mates, strict=True), (max(e[0], q[0]), max(e[1], q[1])), m, per_event=per_event
-    )
+    flank, read_ids = (max(e[0], q[0]), max(e[1], q[1])), model.latent is not None
+    return observations(zip(templates, reads, mates, strict=True), flank, m, per_event=per_event, read_ids=read_ids)
 
 
 def cigar_mode(templates: list[str], reads: list[Read], mates: list[int], truth: ErrorModelSpec) -> ErrorModelSpec:
@@ -110,10 +109,11 @@ def cigar_mode(templates: list[str], reads: list[Read], mates: list[int], truth:
     return bam.fit(
         _tuples(truth, templates, reads, mates),
         truth.quality_alphabet,
-        [c.token for c in truth.error_head],
-        [c.token for c in truth.quality_head],
+        [c.token for c in truth.error_head if c.name != "Latent"],
+        [c.token for c in truth.quality_head if c.name != "Latent"],
         {"mode": "reference", "sources": ["generator-cigar"]},
         indel_events(zip(templates, reads, mates, strict=True)) if indel.split(truth.error_head)[1] else None,
+        0 if truth.latent is None else truth.latent.args[0],
     )
 
 

@@ -21,11 +21,13 @@ def make(**overrides: Any) -> ErrorModelSpec:
         "quality_head": (
             Component("QualityMarkov(1)", {"transitions": np.arange(16, dtype=np.int64).reshape(4, 4)}),
             Component("Position(4)", {"knots": np.linspace(0, 1, 4)}, meta={"from": ["start", "end"]}),
+            Component("Latent(2)", {"weights": np.zeros((2, 4))}),
         ),
         "error_head": (
             Component("Context(2,2)", {"weights": np.random.default_rng(0).normal(size=(5, 4, 10))}),
             Component("QualityWindow(1)", {"weights": np.zeros((3, 10))}, identified=False),
             Component("FragmentOverdispersion", {"phi": np.array(50.0)}, generative=False),
+            Component("Latent(2)", {"weights": np.zeros((2, 10))}),
         ),
         "latent": Component("Latent(2)", {"transitions": np.eye(2)}),
         "marginals": {"rate": np.array([0.001])},

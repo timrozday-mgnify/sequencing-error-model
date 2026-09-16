@@ -25,6 +25,7 @@ Field vocabulary (positions are 1-based):
 - `strand` ("+", "-"), `mate` (1, 2), `gc` ((lo, hi) GC % bin), `length` (read length).
 - `indel` ("I", "D"), `indel_length` (bases in one indel event), `run` (template homopolymer run length at the
   event); error labels like `op`, so they also need a truth-bearing source.
+- `read` (index of the read in its source), `latent` (read-level class of `Latent(S)`, 0-based).
 """
 
 import re
@@ -43,7 +44,7 @@ OP_VALUES = frozenset(("=", "!", *ERROR_OPS))
 # What one count is: a base, a skiver value observation, a read, or an error event with no exposure.
 UNITS = frozenset(("base", "value", "read", "error"))
 _FIELD = re.compile(
-    r"op|context|locus|q|q[+-][1-9]\d*|t|pos_start|pos_end|strand|mate|gc|length|indel|indel_length|run"
+    r"op|context|locus|q|q[+-][1-9]\d*|t|pos_start|pos_end|strand|mate|gc|length|indel|indel_length|run|read|latent"
 )
 
 Key = tuple[Hashable, ...]
