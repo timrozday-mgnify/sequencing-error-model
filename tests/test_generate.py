@@ -26,6 +26,15 @@ def test_indel_events() -> None:
     assert masked.counts == Counter({("I", 2, 1, 18): 1})
 
 
+def test_observations_skip_no_calls() -> None:
+    # Real reads carry N calls: an N substitution or insertion gives no row, the other draws are kept.
+    read = gen.Read("ANGTNCA", "IIIIIII", "4M1I2M", np.zeros(0))
+    ops = Counter[str]()
+    for key, n in gen.observations([("ACGTCA", read, 1)], (1, 1), 0).counts.items():
+        ops[str(key[-1])] += n
+    assert ops == Counter({"=": 5})
+
+
 def test_reads_are_alignment_consistent() -> None:
     model = recovery.example_spec()
     seqs, mates = templates(300, seed=1)

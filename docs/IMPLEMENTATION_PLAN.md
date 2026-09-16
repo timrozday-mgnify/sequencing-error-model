@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, and the aligner bias check against an observable truth with a soft-clipping correction have landed. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
+Status: **draft, revised 2026-09-15**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) have landed; the baseline harness remains. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
 
 ## 1. Goal
 
@@ -748,13 +748,50 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     - Evidence level, by (Q, mate): overlap 4.24% vs reference 5.21%, **excess 0.97%** (truth 1%; tolerance 20%).
     - Model level, on the reference table: excess 1.11% (tolerance 30%), op TV 0.014, and the reference-fitted head E has the higher log-likelihood.
   - ✓ CLI: `python -m sequencing_error_model.compare R1 R2 BAM REF --overlap-spec A --reference-spec B --output report.json` takes the specs the two source CLIs fitted from one run and writes both levels (`evidence` by `--by`, default Q and mate; `models` on each mode's rows), with optional `--mask-alt-freq`. Both tables share one context flank and Q window, wide enough for both specs' head E. Test: 300 generated pairs (50 bp, insert 70 ± 4, no library errors) written as FASTQ and a BAM go through both source CLIs and `compare`; the evidence excess is within 10% of the reference rate (observed 0.02% on 4.0%).
-  - **Open:** running it on a real near-clonal Illumina run (phase 5 exit); per-component comparison (context log-odds, position curve) beyond rates; expected-gap declarations for other mode pairs (`kmer`, phase 6).
+  - **Open:** per-component comparison (context log-odds, position curve) beyond rates; expected-gap declarations for other mode pairs (`kmer`, phase 6); standardise `evidence` by a read-position bin as well (below); `--unclip` in `compare` (its reference rows use the aligner's clips).
+- ✓ **Real near-clonal run** (2026-09-16): SRR24523812, *Phocaeicola vulgatus* NMBE-5 isolate (SAMN35060538), MiSeq 2×150, reads adapter-trimmed to 1–151 bp, Q binned to 14/21/27/32/36. No assembly is deposited, so the reference is a shovill (SPAdes) assembly of all 8.0 M pairs: 184 contigs, 4.81 Mb, N50 119 kb. The comparison uses 100,000 pairs from mid-run (pairs 1,000,001–1,100,000), aligned with minibwa: 99.8% of reads mapped, 1.7% soft-clipped, NM 0.76% per aligned base, median insert 365.
+  - Real reads carry N calls, which the generator never emits. `generate.observations` now skips a draw whose read base is not A/C/G/T, as it skips masked sites; head E has no category for a no-call.
+  - Per-contig raw error rates are 0.73–1.1%, the high-depth contigs (up to 107×, repeats) included, so there is no divergent-repeat signal.
+  - `pe-overlap` places 8.5% of pairs (inserts ≤ ~280): 8,537 overlaps, 4,562 disagreements, 71 indel-flagged. Fitting: 47 min for 20,000 pairs, 104 min for 100,000 (head Q on every base dominates). `reference` (`--unclip`) on 40,000 reads, 6.0 M rows: 95 min. Both ran concurrently with other fits.
+  - **`QualityWindow` vs centre Q** (exit item), head E fitted on pairs 1–20,000 and scored on held-out pairs 80,001–100,000:
+
+    | mode | held-out rows | ll/row, `QualityWindow(0)` | (1) | (2) | gain over (0), nats: (1) / (2) |
+    |---|---|---|---|---|---|
+    | `reference` (`Context(1,1) Homopolymer Mate`) | 5.86 M | −0.031787 | −0.031449 | −0.031246 | +1,977 / +3,163 |
+    | `pe-overlap` (`Context(1,1) Position(4) Mate`, EM) | 162 k | −0.034692 | −0.034505 | −0.034375 | +30 / +51 |
+
+    `pe-overlap` rows are scored with disagreements split by a coin flip, the same table for every model. Each window step adds ~140 weights, so the `reference` gain is not overfitting; the `pe-overlap` gain is small on ~1,700 held-out overlaps. `QualityWindow(2)` beats the default (1) in both modes; selection over m should decide the default.
+  - **Evidence level** (`compare`, by Q and mate). `reference` shows 1.31× the overlap rate (0.757% vs 0.575%), and the ratio is Q-dependent (Q21 3.1–3.5×, Q36 3.5–4.3×), so it is not a PCR excess, which adds a constant rate. Restricting the aligned reads to proper pairs with insert ≤ 280 (16,605 of 200,049 records), the reads `pe-overlap` can see, brings it to 1.05×:
+
+    | Q (mate 1 / 2) | overlap | reference, all | reference, insert ≤ 280 | ratio, insert ≤ 280 |
+    |---|---|---|---|---|
+    | 14 | 5.02% / 5.69% | 6.00% / 7.21% | 4.99% / 5.64% | 0.99 / 0.99 |
+    | 21 | 0.361% / 0.355% | 1.10% / 1.25% | 0.804% / 0.692% | 2.23 / 1.95 |
+    | 27 | 0.174% / 0.233% | 0.311% / 0.430% | 0.202% / 0.256% | 1.16 / 1.10 |
+    | 32 | 0.053% / 0.043% | 0.099% / 0.125% | 0.069% / 0.069% | 1.29 / 1.61 |
+    | 36 | 0.0087% / 0.0081% | 0.031% / 0.035% | 0.025% / 0.031% | 2.82 / 3.80 |
+
+  - Each remaining disagreement has a cause:
+    1. **Insert-size selection** (1.31× → 1.05×). Short-insert clusters have fewer errors at a given reported Q in this run. A `pe-overlap` spec from a long-insert library describes its short-insert subset.
+    2. **Cycle selection within a Q bin** (Q21). On short inserts, Q21's mismatch rate by 25-cycle bin is 1.78%, 1.81%, 0.80%, 0.70%, 0.44%, 0.25%; overlaps cover mostly the late cycles (0.25%, near the overlap's 0.36%). No Q21 mismatch recurs at a site (0 of 286). Q36 is flat across cycles (0.023–0.034%).
+    3. **A flat ~0.02 pp excess at Q27–36**: library/PCR errors (they cancel in the overlap) and reference differences. 16% of Q36 mismatches on short inserts (10% on all) recur at the same site and allele at ~6× depth, which is assembly consensus error or minor variants (~0.005 pp of the 0.019 pp); the rest are singletons.
+  - **Model level**, both specs' head E conditioned on no indel, on each mode's rows (`reference` spec from 40,000 reads of all inserts):
+
+    | `pe-overlap` spec | rows | op TV | rate ratio, reference / overlap spec | ll/row, overlap / reference spec |
+    |---|---|---|---|---|
+    | 20,000 pairs | reference, all | 0.0039 | 1.46 | −0.03726 / **−0.03510** |
+    | 20,000 pairs | overlap | 0.0031 | 1.35 | **−0.02506** / −0.02614 |
+    | 100,000 pairs | reference, all | 0.0035 | 1.62 | −0.03652 / **−0.03510** |
+    | 100,000 pairs | reference, insert ≤ 280 | 0.0024 | 1.66 | **−0.02041** / −0.02057 |
+    | 100,000 pairs | overlap | 0.0033 | 1.50 | **−0.02473** / −0.02607 |
+
+    Each spec wins on its own mode's rows, and the 100,000-pair overlap spec also wins on the short-insert reference rows, which the reference spec (fitted on all inserts) doesn't specialise to: the selection effect again. Rate ratios at model level (1.35–1.66) exceed the evidence-level 1.31, and the two overlap specs differ (0.55% vs 0.61% on overlap rows). Likely cause, not yet checked: on reference rows the overlap spec's `Position(4)` extrapolates to early cycles it rarely saw, where Q21 is 7× more error-prone.
 - **Baseline harness.** The phase 3 metrics computed on real reads vs reads from (a) the native generator, (b) ReSeq for Illumina, (c) Badread, PBSIM3 and CycSim for long reads, each simulator trained by its own profiler on the same alignment. Add k-mer spectrum concordance and context-dependent substitution rates, the metrics of the 2026 ONT benchmark.
 - **Exit:**
   - on generated reads aligned back to their genome, the full spec (including indel lengths and homopolymer effects) is recovered within the phase 2 tolerances, after correcting for the measured aligner bias. Redefined 2026-09-15 against the observable truth (aligner bias check above). Rates, indel lengths and indel rates by homopolymer run (within 10%) are met for minimap2, and for minibwa with `--unclip`, and so are `Homopolymer` and `Context` on indels (indel components above);
   - the clonal cost of each mask is reported, and masks that bias a head E component beyond the phase 2 tolerances on clonal reads are off by default;
-  - on one real near-clonal Illumina dataset (isolate, spike-in or amplicon mock), `pe-overlap` and `reference` specs agree per component on shared support within tolerance, or the report explains each disagreement;
-  - `QualityWindow` beats the centre-Q-only head E on held-out likelihood, or the report shows it doesn't;
+  - ✓ on one real near-clonal Illumina dataset (isolate, spike-in or amplicon mock), `pe-overlap` and `reference` specs agree per component on shared support within tolerance, or the report explains each disagreement (SRR24523812 above: rates are explained, by insert-size and cycle selection plus a flat library/reference excess; per-component comparison beyond rates is still open);
+  - ✓ `QualityWindow` beats the centre-Q-only head E on held-out likelihood, or the report shows it doesn't (SRR24523812: it does in both modes, and m=2 beats m=1);
   - the baseline harness runs on at least one Illumina and one long-read dataset, and the report states where the native generator beats, matches or trails each baseline.
 
 ### Phase 6: `kmer` mode (default build), checked against `pe-overlap` and `reference`

@@ -410,8 +410,8 @@ def observations(
     The Q window is template-indexed from the read: a deleted base takes the Q of the next read base (the
     previous one at the read end), so windows touching a deletion differ from the generator's Q track.
     A read's `clipped` bases shift `pos_start` / `pos_end` to the read's own ends and fill Q windows past the
-    aligned part; `strand` overrides the mate-based strand. Rows at template bases other than A, C, G, T, or
-    at `masked` template indices, are skipped. With `per_event` (head E with `IndelLength`), an indel event gives
+    aligned part; `strand` overrides the mate-based strand. Rows at template bases other than A, C, G, T, at
+    `masked` template indices, or with a read base other than A, C, G, T (an N call), are skipped. With `per_event` (head E with `IndelLength`), an indel event gives
     one row, its first inserted or deleted base, as the generator draws it.
     """
     left, right = flank
@@ -429,8 +429,8 @@ def observations(
             if per_event and kind and kind == k0 and t0 == t - (1 if kind == "D" else 0):
                 continue  # continuation of an indel event: `IndelLength` owns it
             i = t + before
-            if template[t].upper() not in "ACGT" or filled[i] is None or t in read.masked:
-                continue
+            if template[t].upper() not in "ACGT" or filled[i] is None or t in read.masked or op[-1] not in "=ACGT-":
+                continue  # the last: a no-call read base (N) is no head E category
             window = tuple(
                 filled[i + o] if 0 <= i + o < len(filled) else None for k in range(1, m + 1) for o in (-k, k)
             )
