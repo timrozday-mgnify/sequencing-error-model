@@ -14,6 +14,7 @@ Components and their params (trailing axis K):
 - `Mate`: `weights` [2, K]. Field `mate`.
 - `Context(L,R)`: `weights` [L+R+1, 5, K] over bases A, C, G, T and anything else ("." beyond a
   read end, N). Field `context`, whose table flank must cover (L, R).
+- `Latent(S)`: `weights` [S, K] by the read's class, shared with head E (`fit.latent`). Field `latent`.
 
 Input tables count (covariates, q). Per-observation tuples condition on true bases; FASTQ counts
 on observed bases (§6.2). Qualities are the modelled output here, never error evidence.
@@ -33,7 +34,7 @@ from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component
 
 Array = npt.NDArray[Any]
-COMPONENTS = ("QualityMarkov", "Position", "Mate", "Context")
+COMPONENTS = ("QualityMarkov", "Position", "Mate", "Context", "Latent")
 _BASE = np.full(256, 4, dtype=np.int64)
 _BASE[np.frombuffer(b"ACGT", np.uint8)] = np.arange(4)
 
@@ -46,6 +47,7 @@ class _Rows:
     mate: Array
     context: Array  # [R, L0+R0+1] base indices
     flank: tuple[int, int]
+    latent: Array
 
 
 def _shapes(c: Component, k: int) -> dict[str, tuple[int, ...]]:
@@ -56,6 +58,8 @@ def _shapes(c: Component, k: int) -> dict[str, tuple[int, ...]]:
         return {"start": (c.args[0],), "end": (c.args[0],)}
     if c.name == "Mate":
         return {"weights": (2,)}
+    if c.name == "Latent":
+        return {"weights": (c.args[0],)}
     left, right = c.args
     return {"weights": (left + right + 1, 5)}
 
@@ -77,6 +81,8 @@ def _design(c: Component, rows: _Rows, k: int) -> tuple[Array, Array]:
         return np.broadcast_to(np.arange(vals.shape[1]), vals.shape), vals
     if c.name == "Mate":
         return (rows.mate - 1)[:, None], np.ones((n_rows, 1))
+    if c.name == "Latent":
+        return rows.latent[:, None], np.ones((n_rows, 1))
     left, right = c.args
     window = rows.context[:, rows.flank[0] - left : rows.flank[0] + right + 1]
     return np.arange(window.shape[1]) * 5 + window, np.ones(window.shape)
@@ -101,14 +107,16 @@ def _check(components: Sequence[Component]) -> None:
     names = [c.name for c in components]
     if not names or names[0] != "QualityMarkov" or not set(names) <= set(COMPONENTS) or len(set(names)) != len(names):
         raise ValueError(f"head Q needs QualityMarkov(m) first, then distinct {COMPONENTS[1:]}, got {names}")
-    arity = {"QualityMarkov": 1, "Position": 1, "Mate": 0, "Context": 2}
+    arity = {"QualityMarkov": 1, "Position": 1, "Mate": 0, "Context": 2, "Latent": 1}
     for c in components:
-        if len(c.args) != arity[c.name] or (c.name == "Position" and c.args[0] < 2):
+        if len(c.args) != arity[c.name] or (c.name in ("Position", "Latent") and c.args[0] < 2):
             raise ValueError(f"bad arguments in {c.token!r}")
 
 
-def _table(table: CountTable, components: Sequence[Component], alphabet: Sequence[int]) -> tuple[Array, _Rows]:
-    """Validate `table` for `components`; return counts [R, K] and the covariate rows."""
+def _table(
+    table: CountTable, components: Sequence[Component], alphabet: Sequence[int]
+) -> tuple[Array, _Rows, dict[str, Any]]:
+    """Validate `table` for `components`; return counts [R, K], the covariate rows and the raw columns."""
     tokens = [c.token for c in components]
     k, qi = len(alphabet), table.fields.index("q")
     q_index: dict[Any, int] = {q: i for i, q in enumerate(alphabet)}
@@ -126,7 +134,12 @@ def _table(table: CountTable, components: Sequence[Component], alphabet: Sequenc
     m = components[0].args[0]
     need = {f"q-{i}" for i in range(1, m + 1)}
     for c in components:
-        need |= {"Position": {"pos_start", "pos_end"}, "Mate": {"mate"}, "Context": {"context"}}.get(c.name, set())
+        need |= {
+            "Position": {"pos_start", "pos_end"},
+            "Mate": {"mate"},
+            "Context": {"context"},
+            "Latent": {"latent"},
+        }.get(c.name, set())
     if missing := sorted(need - set(table.fields)):
         raise ValueError(f"{table.source}: head Q components {tuple(tokens)} need fields {missing}")
     flank: tuple[int, int] = tuple(table.meta.get("flank", (0, 0)))
@@ -146,19 +159,30 @@ def _table(table: CountTable, components: Sequence[Component], alphabet: Sequenc
         np.asarray(cols.get("mate", ones)),
         _BASE[np.frombuffer(context.encode(), np.uint8)].reshape(n_rows, -1),
         flank,
+        np.asarray(cols.get("latent", 0 * ones), np.int64),
     )
-    return counts, rows
+    return counts, rows, cols
 
 
-def fit(table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2: float = 1.0) -> tuple[Component, ...]:
+def fit(
+    table: CountTable,
+    tokens: Sequence[str],
+    alphabet: Sequence[int],
+    *,
+    l2: float = 1.0,
+    init: Sequence[Component] | None = None,
+) -> tuple[Component, ...]:
     """Fit head Q components (in `tokens` order) by penalised maximum likelihood.
 
-    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge.
+    `l2` is a Gaussian prior precision on every weight; it also pins the softmax gauge. `init` warm-starts from
+    components fitted with the same tokens on a table with the same rows (EM refits).
     """
+    if init is not None and [c.token for c in init] != list(tokens):
+        raise ValueError(f"init tokens {[c.token for c in init]} differ from {list(tokens)}")
     components = [Component(t) for t in tokens]
     _check(components)
     k = len(alphabet)
-    counts, rows = _table(table, components, alphabet)
+    counts, rows, _ = _table(table, components, alphabet)
     if any(c.name == "Position" for c in components):
         top = np.log(max(rows.pos_start.max(), rows.pos_end.max(), 2))
         components = [
@@ -177,7 +201,8 @@ def fit(table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2
         grad = x.T @ (totals[:, None] * np.exp(logits - logz[:, None]) - counts) + l2 * theta
         return float(nll), grad.ravel()
 
-    res = optimize.minimize(objective, np.zeros(x.shape[1] * k), jac=True, method="L-BFGS-B")
+    start = np.zeros(x.shape[1] * k) if init is None else _theta(init, k).ravel()
+    res = optimize.minimize(objective, start, jac=True, method="L-BFGS-B")
     if not res.success:
         warnings.warn(f"head Q fit did not converge: {res.message}", RuntimeWarning, stacklevel=2)
 
@@ -191,12 +216,26 @@ def fit(table: CountTable, tokens: Sequence[str], alphabet: Sequence[int], *, l2
     return tuple(out)
 
 
+def _row_log_likelihood(
+    components: Sequence[Component], alphabet: Sequence[int], table: CountTable
+) -> tuple[Array, dict[str, Any]]:
+    _check(components)
+    counts, rows, cols = _table(table, components, alphabet)
+    logits = _matrix(components, rows, len(alphabet)) @ _theta(components, len(alphabet))
+    return np.sum(counts * (logits - special.logsumexp(logits, axis=1, keepdims=True)), axis=1), cols
+
+
 def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> float:
     """Log-likelihood of `table`'s counts under fitted head Q components."""
-    _check(components)
-    counts, rows = _table(table, components, alphabet)
-    logits = _matrix(components, rows, len(alphabet)) @ _theta(components, len(alphabet))
-    return float(np.sum(counts * (logits - special.logsumexp(logits, axis=1, keepdims=True))))
+    return float(_row_log_likelihood(components, alphabet, table)[0].sum())
+
+
+def read_log_likelihood(
+    components: Sequence[Component], alphabet: Sequence[int], table: CountTable, n_reads: int
+) -> Array:
+    """Log-likelihood [n_reads] of `table`'s counts per value of its `read` field."""
+    ll, cols = _row_log_likelihood(components, alphabet, table)
+    return np.bincount(np.asarray(cols["read"], np.int64), weights=ll, minlength=n_reads)
 
 
 def sample(
@@ -205,14 +244,17 @@ def sample(
     reads: Sequence[str],
     mates: Sequence[int],
     rng: np.random.Generator,
+    latent: Array | None = None,
 ) -> list[Array]:
-    """Sample a Q track per read, position by position, vectorised across reads."""
+    """Sample a Q track per read, position by position, vectorised across reads; `latent` gives each read's class
+    when the components include `Latent(S)`."""
     _check(components)
     k, alpha = len(alphabet), np.asarray(alphabet)
     theta = _theta(components, k)
     m = components[0].args[0]
     flank = next(((c.args[0], c.args[1]) for c in components if c.name == "Context"), (0, 0))
     lengths, mate = np.array([len(s) for s in reads]), np.asarray(mates)
+    classes = np.zeros(len(reads), np.int64) if latent is None else np.asarray(latent, np.int64)
     top = int(lengths.max(initial=0))
     text = "".join("." * flank[0] + s.ljust(top, ".") + "." * flank[1] for s in reads)
     bases = _BASE[np.frombuffer(text.encode(), np.uint8)].reshape(len(reads), -1)
@@ -227,6 +269,7 @@ def sample(
             mate[act],
             bases[act, t : t + sum(flank) + 1],
             flank,
+            classes[act],
         )
         p = special.softmax(_matrix(components, rows, k) @ theta, axis=1)
         q[act, t] = np.minimum((rng.random((len(act), 1)) > p.cumsum(axis=1)).sum(axis=1), k - 1)

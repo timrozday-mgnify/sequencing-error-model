@@ -2,7 +2,8 @@
 
 Per batch of reads, vectorised across bases:
 
-1. sample the template-indexed Q track from head Q (conditioned on true bases);
+1. with `Latent(S)`, draw each read's class from the prior; sample the template-indexed Q track from head Q
+   (conditioned on true bases and that class);
 2. draw a head E outcome for every template base from its Q window;
 3. materialise the read: a match or substitution emits one base with q_t; an insertion emits the inserted
    base and draws again at the same base (at most `max_ins_run` insertions); a deletion emits nothing and
@@ -99,7 +100,11 @@ def generate(
         raise ValueError("max_ins_run must be at least 1")
     templates = [t.upper() for t in templates]
     alphabet = np.asarray(model.quality_alphabet)
-    tracks = quality.sample(model.quality_head, model.quality_alphabet, templates, mates, rng)
+    classes = None
+    if model.latent is not None:
+        prior = model.latent.params["prior"]
+        classes = rng.choice(len(prior), size=len(templates), p=prior / prior.sum())
+    tracks = quality.sample(model.quality_head, model.quality_alphabet, templates, mates, rng, classes)
     lengths = np.array([len(t) for t in templates], np.int64)
     n = int(lengths.sum())
     starts = np.r_[0, np.cumsum(lengths)[:-1]].astype(np.int64)
@@ -121,6 +126,7 @@ def generate(
         "mate": mate,
         "strand": (mate == 2).astype(np.int64),
         "gc": np.repeat([sum(gc_bin(t)) / 2 for t in templates], lengths),
+        "latent": np.repeat(np.zeros(len(templates), np.int64) if classes is None else classes, lengths),
     }
     for o in range(1, model.error_head[0].args[0] + 1):
         for j, name in ((within - o, f"q-{o}"), (within + o, f"q+{o}")):
@@ -404,6 +410,7 @@ def observations(
     m: int,
     source: str = "generator",
     per_event: bool = False,
+    read_ids: bool = False,
 ) -> CountTable:
     """Head E tuples from (template, read, mate) triples, one row per draw, as `fit.error` expects.
 
@@ -412,13 +419,15 @@ def observations(
     A read's `clipped` bases shift `pos_start` / `pos_end` to the read's own ends and fill Q windows past the
     aligned part; `strand` overrides the mate-based strand. Rows at template bases other than A, C, G, T, at
     `masked` template indices, or with a read base other than A, C, G, T (an N call), are skipped. With `per_event` (head E with `IndelLength`), an indel event gives
-    one row, its first inserted or deleted base, as the generator draws it.
+    one row, its first inserted or deleted base, as the generator draws it. `read_ids` adds a `read` field, the
+    record's index, for per-read fits (`Latent(S)`).
     """
     left, right = flank
     fields = ("q", *(f"q{s}{o}" for o in range(1, m + 1) for s in "-+"))
-    fields += ("context", "pos_start", "pos_end", "mate", "strand", "gc", "op")
+    fields += ("context", "pos_start", "pos_end", "mate", "strand", "gc", *(("read",) if read_ids else ()), "op")
     counts: Counter[Key] = Counter()
-    for template, read, mate in records:
+    for index, (template, read, mate) in enumerate(records):
+        rid = (index,) if read_ids else ()
         rows, filled, before = _filled(template, read)
         padded, gc = "." * left + template.upper() + "." * right, gc_bin(template)
         strand = read.strand or ("-" if mate == 2 else "+")
@@ -434,7 +443,8 @@ def observations(
             window = tuple(
                 filled[i + o] if 0 <= i + o < len(filled) else None for k in range(1, m + 1) for o in (-k, k)
             )
-            key = (filled[i], *window, padded[t : t + left + right + 1], i + 1, len(filled) - i, mate, strand, gc, op)
+            key = (filled[i], *window, padded[t : t + left + right + 1], i + 1, len(filled) - i, mate, strand, gc)
+            key += (*rid, op)
             counts[key] += 1
     return CountTable(source, fields, "base", True, counts, {"flank": flank})
 

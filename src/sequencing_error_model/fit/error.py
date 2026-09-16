@@ -21,6 +21,7 @@ Components and params (A = alphabet size, trailing axis K):
 - `GC(n)`: `knots` [n] over GC %, `weights` [n, K]: linear spline of the `gc` bin midpoint.
 - `QualityxContext(r)`: `quality` [A, r] and `context` [3, 5, r, K], a rank-r interaction of the centre Q
   with bases x_{t-1..t+1}.
+- `Latent(S)`: `weights` [S, K] by the read's class, shared with head Q (`fit.latent`). Field `latent`.
 
 Q enters only as a categorical feature, never as 10^(-Q/10): the calibration is learned.
 """
@@ -38,7 +39,9 @@ from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component
 
 CATEGORIES = ("=", ">A", ">C", ">G", ">T", "->A", "->C", "->G", "->T", "-")
-COMPONENTS = ("QualityWindow", "Context", "Homopolymer", "Position", "Mate", "Strand", "GC", "QualityxContext")
+COMPONENTS = (
+    *("QualityWindow", "Context", "Homopolymer", "Position", "Mate", "Strand", "GC", "QualityxContext", "Latent"),
+)
 _ARITY = {"QualityWindow": 1, "Context": 2, "Homopolymer": 0, "Position": 1, "Mate": 0, "Strand": 0, "GC": 1}
 _K = len(CATEGORIES)
 
@@ -49,7 +52,7 @@ def _check(components: Sequence[Component]) -> None:
         raise ValueError(f"head E needs QualityWindow(m) first, then distinct {COMPONENTS[1:]}, got {names}")
     for c in components:
         a = c.args
-        low = {"Position": 2, "GC": 2, "QualityxContext": 1}.get(c.name, 0)
+        low = {"Position": 2, "GC": 2, "QualityxContext": 1, "Latent": 2}.get(c.name, 0)
         if len(a) != _ARITY.get(c.name, 1) or (low and a[0] < low):
             raise ValueError(f"bad arguments in {c.token!r}")
 
@@ -58,6 +61,7 @@ def _fields(c: Component) -> set[str]:
     if c.name == "QualityWindow":
         return {"q"} | {f"q{s}{i}" for i in range(1, c.args[0] + 1) for s in "+-"}
     extra = {"Position": {"pos_start", "pos_end"}, "Mate": {"mate"}, "Strand": {"strand"}, "GC": {"gc"}}
+    extra["Latent"] = {"latent"}
     return {"context"} | extra.get(c.name, set()) | ({"q"} if c.name == "QualityxContext" else set())
 
 
@@ -111,7 +115,7 @@ def _shapes(c: Component, d: dict[str, Any]) -> dict[str, tuple[int, ...]]:
         return {"start": (c.args[0],), "end": (c.args[0],)}
     if c.name in ("Mate", "Strand"):
         return {"weights": (2,)}
-    if c.name == "GC":
+    if c.name in ("GC", "Latent"):
         return {"weights": (c.args[0],)}
     return {}  # QualityxContext is bilinear, handled by _interaction
 
@@ -141,6 +145,8 @@ def _design(c: Component, d: dict[str, Any]) -> tuple[Array, Array]:
         return (d["mate"] - 1)[:, None], np.ones((n, 1))
     if c.name == "Strand":
         return d["strand"][:, None], np.ones((n, 1))
+    if c.name == "Latent":
+        return np.asarray(d["latent"], np.int64)[:, None], np.ones((n, 1))
     if c.name == "GC":
         knots = c.params["knots"]
         vals = np.stack([np.interp(d["gc"], knots, e) for e in np.eye(len(knots))], axis=1)
@@ -260,13 +266,27 @@ def _labelled(
     return counts, d
 
 
-def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> float:
-    """Log-likelihood of a labelled table's counts under fitted head E components."""
+def _row_log_likelihood(
+    components: Sequence[Component], alphabet: Sequence[int], table: CountTable
+) -> tuple[Array, Any]:
     _check(components)
     counts, d = _labelled(table, components, alphabet)
     logits = np.where(_mask(d), -np.inf, _logits(components, d))
-    logp = logits - special.logsumexp(logits, axis=1, keepdims=True)
-    return float(np.sum(counts[counts > 0] * logp[counts > 0]))
+    logp = np.where(_mask(d), 0.0, logits - special.logsumexp(logits, axis=1, keepdims=True))
+    return (counts * logp).sum(axis=1), d
+
+
+def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> float:
+    """Log-likelihood of a labelled table's counts under fitted head E components."""
+    return float(_row_log_likelihood(components, alphabet, table)[0].sum())
+
+
+def read_log_likelihood(
+    components: Sequence[Component], alphabet: Sequence[int], table: CountTable, n_reads: int
+) -> Array:
+    """Log-likelihood [n_reads] of a labelled table's counts per value of its `read` field."""
+    ll, d = _row_log_likelihood(components, alphabet, table)
+    return np.bincount(np.asarray(d["read"], np.int64), weights=ll, minlength=n_reads)
 
 
 def fit(
@@ -375,7 +395,7 @@ def probabilities(components: Sequence[Component], alphabet: Sequence[int], tabl
 def probabilities_at(components: Sequence[Component], columns: dict[str, Any]) -> Array:
     """P(category) [R, K] from feature columns shaped like `_data`'s (the generator builds them as arrays):
     `k_q`, `flank`, `context` [R, L+R+1] base indices, `centre`, `q` and `q±i` alphabet indices (A beyond a
-    read end), `pos_start`, `pos_end`, `mate`, `strand` (1 for "-") and `gc` (bin midpoint)."""
+    read end), `pos_start`, `pos_end`, `mate`, `strand` (1 for "-"), `gc` (bin midpoint) and `latent` (class index)."""
     _check(components)
     logits = np.where(_mask(columns), -np.inf, _logits(components, columns))
     return np.asarray(special.softmax(logits, axis=1))
