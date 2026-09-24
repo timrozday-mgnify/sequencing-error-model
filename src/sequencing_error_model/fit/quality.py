@@ -35,6 +35,8 @@ from sequencing_error_model.spec import Component
 
 Array = npt.NDArray[Any]
 COMPONENTS = ("QualityMarkov", "Position", "Mate", "Context", "Latent")
+# Rows per objective chunk: the softmax temporaries are [CHUNK, alphabet], so peak memory does not grow with rows.
+CHUNK = 200_000
 _BASE = np.full(256, 4, dtype=np.int64)
 _BASE[np.frombuffer(b"ACGT", np.uint8)] = np.arange(4)
 
@@ -88,15 +90,27 @@ def _design(c: Component, rows: _Rows, k: int) -> tuple[Array, Array]:
     return np.arange(window.shape[1]) * 5 + window, np.ones(window.shape)
 
 
+def _csr(idxs: Sequence[Array], vals: Sequence[Array], n_rows: int, n_cols: int) -> sparse.csr_matrix:
+    """CSR from per-component slot indices and values, both [rows, slots], with a fixed slot count per row.
+
+    Column indices are int32: a design matrix has far fewer than 2**31 slots, and the index array is as big as
+    the data.
+    """
+    columns = np.hstack([np.asarray(i, np.int32) for i in idxs]) if idxs else np.zeros((n_rows, 0), np.int32)
+    data = np.hstack([np.asarray(v, float) for v in vals]) if vals else np.zeros((n_rows, 0))
+    indptr = np.arange(n_rows + 1, dtype=np.int32) * columns.shape[1]
+    return sparse.csr_matrix((data.ravel(), columns.ravel(), indptr), shape=(n_rows, n_cols))
+
+
 def _matrix(components: Sequence[Component], rows: _Rows, k: int) -> sparse.csr_matrix:
-    blocks, offset = [], 0
+    """The design matrix, built straight as CSR (see `fit.error._csr`)."""
+    idxs, vals_, offset = [], [], 0
     for c in components:
         idx, vals = _design(c, rows, k)
-        r = np.broadcast_to(np.arange(len(idx))[:, None], idx.shape)
-        blocks.append((vals.ravel(), r.ravel(), (offset + idx).ravel()))
+        idxs.append(offset + idx)
+        vals_.append(np.broadcast_to(vals, idx.shape))
         offset += sum(prod(s) for s in _shapes(c, k).values())
-    vals, r, col = (np.concatenate(x) for x in zip(*blocks, strict=True))
-    return sparse.csr_matrix((vals, (r, col)), shape=(len(rows.mate), offset))
+    return _csr(idxs, vals_, len(rows.mate), offset)
 
 
 def _theta(components: Sequence[Component], k: int) -> Array:
@@ -195,11 +209,15 @@ def fit(
 
     def objective(flat: Array) -> tuple[float, Array]:
         theta = flat.reshape(-1, k)
-        logits = x @ theta
-        logz = special.logsumexp(logits, axis=1)
-        nll = totals @ logz - np.sum(counts * logits) + 0.5 * l2 * np.sum(theta**2)
-        grad = x.T @ (totals[:, None] * np.exp(logits - logz[:, None]) - counts) + l2 * theta
-        return float(nll), grad.ravel()
+        nll, grad = 0.5 * l2 * float(np.sum(theta**2)), l2 * theta
+        for lo in range(0, x.shape[0], CHUNK):  # [rows, k] temporaries, so a whole fit's rows don't fit at once
+            sl = slice(lo, lo + CHUNK)
+            xs, cs, ts = x[sl], counts[sl], totals[sl]
+            logits = xs @ theta
+            logz = special.logsumexp(logits, axis=1)
+            nll += float(ts @ logz - np.sum(cs * logits))
+            grad = grad + xs.T @ (ts[:, None] * np.exp(logits - logz[:, None]) - cs)
+        return nll, grad.ravel()
 
     start = np.zeros(x.shape[1] * k) if init is None else _theta(init, k).ravel()
     res = optimize.minimize(objective, start, jac=True, method="L-BFGS-B")

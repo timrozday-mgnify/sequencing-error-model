@@ -34,7 +34,7 @@ from typing import Any
 import numpy as np
 from scipy import optimize, sparse, special
 
-from sequencing_error_model.fit.quality import _BASE, Array, _hat
+from sequencing_error_model.fit.quality import _BASE, Array, _csr, _hat
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component
 
@@ -42,6 +42,8 @@ CATEGORIES = ("=", ">A", ">C", ">G", ">T", "->A", "->C", "->G", "->T", "-")
 COMPONENTS = (
     *("QualityWindow", "Context", "Homopolymer", "Position", "Mate", "Strand", "GC", "QualityxContext", "Latent"),
 )
+# Rows per objective chunk: the softmax temporaries are [CHUNK, K], so peak memory does not grow with rows.
+CHUNK = 200_000
 _ARITY = {"QualityWindow": 1, "Context": 2, "Homopolymer": 0, "Position": 1, "Mate": 0, "Strand": 0, "GC": 1}
 _K = len(CATEGORIES)
 
@@ -155,14 +157,17 @@ def _design(c: Component, d: dict[str, Any]) -> tuple[Array, Array]:
 
 
 def _matrix(components: Sequence[Component], d: dict[str, Any]) -> sparse.csr_matrix:
-    blocks, offset = [], 0
+    """The design matrix, built straight as CSR: every row has the same slots, so `indptr` is a stride.
+
+    Going through COO would sort and de-duplicate 3 arrays of `rows x slots`, which is the fit's memory peak.
+    """
+    idxs, vals_, offset = [], [], 0
     for c in components:
         idx, vals = _design(c, d)
-        r = np.broadcast_to(np.arange(len(idx))[:, None], idx.shape)
-        blocks.append((vals.ravel(), r.ravel(), (offset + idx).ravel()))
+        idxs.append(offset + idx)
+        vals_.append(np.broadcast_to(vals, idx.shape))
         offset += sum(prod(s) for s in _shapes(c, d).values())
-    vals, r, col = (np.concatenate(x) for x in zip(*blocks, strict=True))
-    return sparse.csr_matrix((vals, (r, col)), shape=(len(d["centre"]), offset))
+    return _csr(idxs, vals_, len(d["centre"]), offset)
 
 
 def _centre(v: Array) -> Array:
@@ -346,23 +351,32 @@ def fit(
 
     def objective(flat: Array) -> tuple[float, Array]:
         smoothed = smooth * np.asarray(walk @ flat[:n_lin].reshape(-1, _K))
-        logits = np.asarray(x @ flat[:n_lin].reshape(-1, _K))
+        theta = flat[:n_lin].reshape(-1, _K)
+        u, v = flat[n_lin:split].reshape(k_q, rank), flat[split:].reshape(3, 5, rank, _K)
+        nll = 0.5 * float(flat @ (precision * flat)) + 0.5 * float(np.sum(flat[:n_lin] * smoothed.ravel()))
+        g_lin, g_u, g_v = np.zeros_like(theta), np.zeros((k_q, rank)), np.zeros((3, 5, rank, _K))
+        for lo in range(0, len(counts), CHUNK):  # [rows, K] temporaries, so a whole fit's rows don't fit at once
+            sl = slice(lo, lo + CHUNK)
+            cs, ms, ts = counts[sl], mask[sl], totals[sl]
+            logits = np.asarray(x[sl] @ theta)
+            if rank:
+                inter, uq, per_row = _interaction(u, v, xq[sl], xc[sl])
+                logits += inter
+            logits[ms] = -np.inf
+            top = logits.max(axis=1, keepdims=True)
+            logp = logits - top - np.log(np.exp(logits - top).sum(axis=1, keepdims=True))
+            logp[ms] = 0.0
+            nll -= float(np.sum(cs * logp))
+            g = ts[:, None] * np.where(ms, 0.0, np.exp(logp)) - cs
+            g_lin += np.asarray(x[sl].T @ g)
+            if rank:
+                g_u += np.asarray(xq[sl].T @ np.einsum("njk,nk->nj", per_row, g))
+                dv = np.asarray(xc[sl].T @ (uq[:, :, None] * g[:, None, :]).reshape(len(g), -1))
+                g_v += dv.reshape(3, 5, rank, _K)
+        grads = [g_lin.ravel() + smoothed.ravel()]
         if rank:
-            u, v = flat[n_lin:split].reshape(k_q, rank), flat[split:].reshape(3, 5, rank, _K)
-            inter, uq, per_row = _interaction(u, v, xq, xc)
-            logits += inter
-        logits[mask] = -np.inf
-        top = logits.max(axis=1, keepdims=True)
-        logp = logits - top - np.log(np.exp(logits - top).sum(axis=1, keepdims=True))
-        logp[mask] = 0.0
-        nll = -np.sum(counts * logp) + 0.5 * flat @ (precision * flat) + 0.5 * np.sum(flat[:n_lin] * smoothed.ravel())
-        g = totals[:, None] * np.where(mask, 0.0, np.exp(logp)) - counts
-        grads = [np.asarray(x.T @ g).ravel() + smoothed.ravel()]
-        if rank:
-            grads.append(np.asarray(xq.T @ np.einsum("njk,nk->nj", per_row, g)).ravel())
-            dv = np.asarray(xc.T @ (uq[:, :, None] * g[:, None, :]).reshape(len(g), -1))
-            grads.append(_centre(dv.reshape(3, 5, rank, _K)).ravel())
-        return float(nll), np.concatenate(grads) + precision * flat
+            grads += [g_u.ravel(), _centre(g_v).ravel()]  # _centre is linear, so centring the sum is the same
+        return nll, np.concatenate(grads) + precision * flat
 
     res = optimize.minimize(objective, start, jac=True, method="L-BFGS-B")
     if not res.success:
