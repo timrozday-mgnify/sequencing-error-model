@@ -840,6 +840,26 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 
       - Per-read heterogeneity: the TV falls from 0.360 to 0.134, and the median read is error-free, as in the real reads. The errors now cluster in fewer reads, so fewer k-mers break: reference-absent k-mers fall from 14.6 % to 12.3 % (real 11.5 %) and now beat ReSeq. ReSeq still has the heavier p90 tail (2.7 %, against 1.9 %); two classes don't reach it.
       - Worse: the error rate (−7 %), rate by cycle and deletions (1.9× real). The deletion distance rests on about 750 deletion bases per read set, and the second class's deletion weight (+1.63) is fitted from roughly a quarter of the training deletions. Training on 5,000 pairs instead of 20,000 confounds all three; a 20,000-pair EM fit (about 3 h at this speed) would separate data size from the class.
+    - ✓ **`Latent(2)` on the full training set** (2026-09-24). The same tokens, both heads fitted by EM on all 40,000 training records (pairs 1–20,000, `--unclip`; 3 h 10 min, peak under 18 GB after the fitter memory fix below). Everything else is as above. Classes: 61.9 % / 38.1 % (from 63 / 37), the second again the high-error one (match logit −0.73 relative to errors, from −1.16). It answers the open item: **the deficits were data size, not the class model.**
+
+      | metric | real | `Position(8)` | `Latent(2)` 5 k pairs | `Latent(2)` 20 k pairs | ReSeq |
+      |---|---|---|---|---|---|
+      | error rate | 0.776 % | 0.798 % (0.028) | 0.723 % (0.071) | **0.791 % (0.019)** | 0.849 % (0.089) |
+      | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 2.9 / 3.6 | 4.9 / 2.9 | 3.1 / 3.1 (D 0.162, I **0.018**) | 3.2 / 2.3 |
+      | rate by reported Q | | 0.108 | **0.083** | 0.115 | 0.243 |
+      | rate by 10-cycle bin | | **0.056** | 0.113 | 0.078 | 0.094 |
+      | substitution rate by trinucleotide | | **0.168** | 0.192 | 0.179 | 0.245 |
+      | Q by 10-cycle bin (TV) | mean Q 32.36 | 0.010 | 0.010 | 0.011 (32.29) | 0.018 |
+      | Q lag-1 autocorrelation | 0.200 | 0.175 (0.026) | 0.178 (0.023) | 0.178 (0.023) | 0.188 (**0.012**) |
+      | per-read error rate (TV) | p50 0.1 %, p90 2.7 % | 0.360 | **0.134** | 0.154 (p50 0.7 %, p90 2.7 %) | 0.076 |
+      | k-mer spectrum (TV) | | 0.051 | 0.047 | 0.047 | **0.045** |
+      | reference-absent k-mers | 11.5 % | 14.6 % (0.241) | **12.3 %** (0.070) | 13.3 % (0.146) | 13.1 % (0.132) |
+
+      - **The error rate is now the best of every spec and every baseline** (0.019, against `Position(8)` 0.028 and ReSeq 0.089): the −7 % at 5,000 pairs was the training size.
+      - **The deletion excess was too**: 4.9 → 3.1 ×10⁻⁵ (0.626 → 0.162), fitted from four times the deletions. Insertions reach 0.018, the best in the table.
+      - Rate by cycle improves (0.113 → 0.078) but still trails plain `Position(8)` (0.056), and rate by Q slips (0.083 → 0.115).
+      - Per-read heterogeneity keeps most of its gain (0.360 → 0.154) and the p90 tail now matches real exactly (2.7 %), but the median read is 0.7 % against real <0.2 %, and reference-absent k-mers give back ground (12.3 → 13.3 %). ReSeq (0.076) still leads on per-read spread.
+      - **Fitter memory** (2026-09-24). The first attempt at this fit peaked at 49 GB on a 24 GB machine and thrashed swap. The cost is per fit, not per L-BFGS evaluation: `_matrix` built the design matrix as COO triplets, so scipy sorted and de-duplicated three `rows × slots` arrays. Every row has the same slots, so `fit.quality._csr` now builds the CSR directly (`indptr` a stride, int32 column indices): on 20,000 records (3.5 M expanded rows) head E's peak falls from 7.52 GB to 5.51 GB with the log-likelihood unchanged (−123,329.57 vs −123,328.79). Both objectives also accumulate over 200,000-row chunks, which measured neutral at 4,000 records but bounds the `[rows, K]` temporaries at scale.
   - ✓ **Long-read run** (2026-09-16): SRR30993108, *E. coli* K-12, PromethION R10.4.1 (kit14, 5 kHz, dorado sup v5), 62,469 reads, mean 7.9 kb. Reference NC_000913.3 (MG1655). Reads 1–5,000 train and reads 30,001–35,000 (39.7 Mb) are held out, all aligned with minimap2 `-ax map-ont`, profiled without `--unclip` (its DP is unbanded) and with `--cycle-bin 500`, 5.5 min for five read sets.
     - **Badread 0.4.2:** `error_model` and `qscore_model` on the training PAF; `simulate` with the training reads' length (8,356 ± 10,166) and primary-alignment identity (97.8, max 99.9, sd 4.2), and default adapters, junk, random reads, chimeras and glitches.
     - **PBSIM3 3.0.5:** `--method sample --sample train.fq` (lengths and Q strings from the training reads), `--difference-ratio 39:24:36` (its recommendation for ONT).
