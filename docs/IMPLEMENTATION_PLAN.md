@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. It lowers the error rate on both platforms, which is still open. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
+Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
 
 ## 1. Goal
 
@@ -859,6 +859,19 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
       - **The deletion excess was too**: 4.9 → 3.1 ×10⁻⁵ (0.626 → 0.162), fitted from four times the deletions. Insertions reach 0.018, the best in the table.
       - Rate by cycle improves (0.113 → 0.078) but still trails plain `Position(8)` (0.056), and rate by Q slips (0.083 → 0.115).
       - Per-read heterogeneity keeps most of its gain (0.360 → 0.154) and the p90 tail now matches real exactly (2.7 %), but the median read is 0.7 % against real <0.2 %, and reference-absent k-mers give back ground (12.3 → 13.3 %). ReSeq (0.076) still leads on per-read spread.
+    - ✓ **`Latent(3)` on the full training set** (2026-09-24). The same tokens with three classes, EM on all 40,000 records (5 h 01 min). Classes 39 % / 41 % / 20 %, match logits 0.90 / 1.29 / −0.16, so the third is a distinctly worse class than either of the two `Latent(2)` finds. It buys per-read structure and costs rate:
+
+      | metric | real | `Latent(2)` 20 k | `Latent(3)` 20 k |
+      |---|---|---|---|
+      | error rate | 0.776 % | **0.791 % (0.019)** | 0.804 % (0.035) |
+      | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 3.1 / 3.1 (D **0.162**, I 0.018) | 3.3 / 3.2 (D 0.213, I **0.013**) |
+      | rate by reported Q | | 0.115 | **0.099** |
+      | rate by 10-cycle bin | | **0.078** | 0.085 |
+      | per-read error rate (TV) | p50 0.1 %, p90 2.7 % | 0.154 (p50 0.7 %, p90 2.7 %) | **0.114** (p50 0.1 %, p90 2.7 %) |
+      | reference-absent k-mers | 11.5 % | 13.3 % (0.146) | **13.0 % (0.119)** |
+
+      - **The p90 tail item is met**: with three classes both the median read (0.1 %) and the p90 (2.7 %) match the real reads exactly, and the per-read TV falls to 0.114, the best of any native spec (ReSeq 0.076 still leads).
+      - It costs the error rate (0.019 → 0.035) and deletions (0.162 → 0.213), and gains rate by Q (0.115 → 0.099) and insertions (0.013, the best in either table). **Default stays `Latent(2)`** for Illumina: the rate is the headline metric and two classes hold it best; `Latent(3)` is the choice when per-read spread matters more.
       - **Fitter memory** (2026-09-24). The first attempt at this fit peaked at 49 GB on a 24 GB machine and thrashed swap. The cost is per fit, not per L-BFGS evaluation: `_matrix` built the design matrix as COO triplets, so scipy sorted and de-duplicated three `rows × slots` arrays. Every row has the same slots, so `fit.quality._csr` now builds the CSR directly (`indptr` a stride, int32 column indices): on 20,000 records (3.5 M expanded rows) head E's peak falls from 7.52 GB to 5.51 GB with the log-likelihood unchanged (−123,329.57 vs −123,328.79). Both objectives also accumulate over 200,000-row chunks, which measured neutral at 4,000 records but bounds the `[rows, K]` temporaries at scale.
   - ✓ **Long-read run** (2026-09-16): SRR30993108, *E. coli* K-12, PromethION R10.4.1 (kit14, 5 kHz, dorado sup v5), 62,469 reads, mean 7.9 kb. Reference NC_000913.3 (MG1655). Reads 1–5,000 train and reads 30,001–35,000 (39.7 Mb) are held out, all aligned with minimap2 `-ax map-ont`, profiled without `--unclip` (its DP is unbanded) and with `--cycle-bin 500`, 5.5 min for five read sets.
     - **Badread 0.4.2:** `error_model` and `qscore_model` on the training PAF; `simulate` with the training reads' length (8,356 ± 10,166) and primary-alignment identity (97.8, max 99.9, sd 4.2), and default adapters, junk, random reads, chimeras and glitches.
@@ -898,10 +911,28 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 
       - Per-read heterogeneity: the TV halves (0.739 → 0.355), with the median read right (0.5 %) and a much longer tail (p90 4.3 %, real 5.3 %). PBSIM3 (0.091) and Badread (0.221) are still closer.
       - The error rate falls further (1.44 % → 1.28 %, real 1.97 %). Errors cluster in fewer reads, so fewer k-mers break: reference-absent k-mers undershoot (11.7 %), where the native row was close by accident. Most of the loss is head E trained on 100 reads instead of 300, and the heavier real low-Q tail (7.0 % of bases at Q ≤ 10) that two classes don't reach. The per-read rate gap is now mostly a rate gap, not a spread gap.
+    - ✓ **`Latent(2)` on the full training set** (2026-09-24). Both heads fitted by EM on training reads 1–300, the same reads `IndelLength(8)` uses (2 h 45 min, after the fitter memory fix). Classes: 79.8 % / 20.2 % (from 77 / 23). The training-size diagnosis holds here too: **the error rate recovers from 1.28 % to 1.62 %** (real 1.97 %), the best of any native ONT row.
+
+      | metric | real | native | `Latent(2)` 100 reads | `Latent(2)` 300 reads | vs Badread / PBSIM3 / CycSim |
+      |---|---|---|---|---|---|
+      | error rate | 1.97 % | 1.44 % (0.317) | 1.28 % (0.431) | **1.62 % (0.197)** | matches / beats / matches |
+      | substitution / deletion / insertion | 0.83 / 0.57 / 0.57 % | 0.72 / 0.44 / 0.27 % | 0.65 / 0.40 / 0.24 % | 0.81 / 0.50 / 0.31 % (S **0.030**, D 0.125, I 0.616) | S beats all three; I trails Badread and CycSim |
+      | rate by reported Q | | 0.454 | 0.434 | **0.389** | beats / beats / beats |
+      | rate by 500-cycle bin | | 0.330 | 0.427 | **0.212** | matches / beats / matches |
+      | Q lag-1 autocorrelation | 0.947 | 0.932 (0.015) | 0.931 (0.017) | 0.939 (**0.009**) | beats / matches / beats |
+      | per-read error rate (TV) | p50 0.5 %, p90 5.3 % | 0.739 | 0.355 | 0.370 (p50 **0.5 %**, p90 6.1 %) | trails / trails / beats |
+      | k-mer spectrum (TV) | | 0.441 | 0.470 | 0.433 | trails / matches / trails |
+      | reference-absent k-mers | 14.2 % | 13.2 % (0.075) | 11.7 % (0.192) | **13.6 % (0.044)** | beats / trails / beats |
+
+      - It beats the 100-read fit on every metric except per-read TV (0.355 → 0.370, where the median is now exactly right and the p90 overshoots, 6.1 % against 5.3 %), and beats the no-class native row on all twelve.
+      - **Insertions remain the gap** (0.31 % against 0.57 %, distance 0.616), unchanged in character by more training data or by the class. They are the one metric where Badread (0.107) and CycSim (0.044) clearly lead.
+      - Per-read spread still trails PBSIM3 (0.091) and Badread (0.221), which inherit it from real reads rather than modelling it.
   - **Open:**
     - ✓ `Latent(S)` (per-read quality and error level), re-run on both rows;
-    - the error rate under `Latent(S)` on both platforms (Illumina −7 %, ONT 1.28 % against 1.97 %): refit on the full training sets, then try S = 3;
-    - the per-read p90 tail (`Latent(3)`) and the deletion excess, on a 20,000-pair fit;
+    - ✓ the error rate under `Latent(S)` on both platforms: refit on the full training sets (Illumina 0.791 % against 0.776 %, distance 0.019; ONT 1.62 % against 1.97 %, 0.197). Both deficits were training size, not the class model. `Latent(3)` tried on Illumina;
+    - ✓ the per-read p90 tail (`Latent(3)`) and the deletion excess, on a 20,000-pair fit: `Latent(3)` matches the real median and p90 exactly (TV 0.114), and the deletion excess was training size (4.9 → 3.1 ×10⁻⁵);
+    - `Latent(3)` on ONT (the 300-read fit takes about 4 h), where the remaining gaps are insertions and the p90 tail;
+    - ONT insertions (0.31 % against 0.57 %), which neither more training data nor the class moved;
     - head Q fitting cost on long reads (bin `pos_start`/`pos_end` geometrically, or fit on a Q-binned alphabet);
     - a sampling-noise floor.
 - **Exit:**
