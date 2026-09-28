@@ -1,0 +1,72 @@
+name: kmer-recovery
+
+# `kmer` default-mode synthetic recovery (plan §9 phase 6): generate clonal reads from the built-in example
+# spec, run a released `skiver analyze` on them, fit default mode from the CSVs plus the FASTQ, and compare with
+# the truth. Also reports the clonal cost of skiver's outlier filter. Needs a real binary, so it is not in the
+# Testing workflow; weekly so upstream drift is caught with the compat job.
+on:
+  workflow_dispatch:
+    inputs:
+      reads:
+        description: Number of training reads (held-out reads are half this)
+        default: "40000"
+      v:
+        description: skiver value length (the guard rejects tiny v)
+        default: "13"
+      seed:
+        description: Random seed
+        default: "0"
+  schedule:
+    - cron: "30 6 * * 1"
+
+jobs:
+  kmer-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Download skiver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view -R GZHoffie/skiver --json tagName -q .tagName)
+          gh release download "$tag" -R GZHoffie/skiver -p skiver -O "$RUNNER_TEMP/skiver"
+          chmod +x "$RUNNER_TEMP/skiver"
+          "$RUNNER_TEMP/skiver" --version
+
+      - name: Synthetic recovery
+        env:
+          READS: ${{ inputs.reads || '40000' }}
+          V: ${{ inputs.v || '13' }}
+          SEED: ${{ inputs.seed || '0' }}
+        run: |
+          uv run python -m sequencing_error_model.recovery --skiver "$RUNNER_TEMP/skiver" \
+            --reads "$READS" -v "$V" --seed "$SEED" --output kmer-recovery.json
+
+      # Reported, not blocking: a filter that removes nothing here is the result we want to see.
+      - name: Outlier-filter clonal cost
+        if: always()
+        env:
+          READS: ${{ inputs.reads || '40000' }}
+          V: ${{ inputs.v || '13' }}
+          SEED: ${{ inputs.seed || '0' }}
+        run: |
+          uv run python -m sequencing_error_model.recovery --skiver "$RUNNER_TEMP/skiver" --filter-cost \
+            --reads "$READS" -v "$V" --seed "$SEED" --output kmer-filter-cost.json
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: kmer-recovery-reports
+          path: kmer-*.json

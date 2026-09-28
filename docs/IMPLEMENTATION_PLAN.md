@@ -1054,7 +1054,34 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     and op TV; halving head E's `Context` term leaves a shrunk but still highly correlated context slope
     (0.5 < slope < 0.95, r > 0.9); `generated` reproduces a spec against itself; the CLI carries all three
     sections through.
-- **Synthetic recovery.** Generate, run skiver (released binary), profile the FASTQ, fit, compare with the spec. On clonal reads, run with skiver's outlier filter on (default) and off (`--use-all`), and report the keys, contexts and error mass the filter removes when there is no variation to remove.
+- ✓ **Synthetic recovery** (`recovery.skiver_recovery`, `recovery.outlier_filter_cost`, `--skiver` on the
+  `recovery` CLI, and the `kmer-recovery` workflow). Generate clonal single-end reads from a truth spec, run a
+  released `skiver analyze` on them, profile the same FASTQ, fit default mode, and compare with the truth on
+  held-out reads through the phase 3 `compare` (so the phase 2 tolerances and `Report.failures()` apply
+  unchanged). Mates are all 1: default mode identifies no mate effect (§6.2).
+  - **The default-mode fit is now a source** (`sources/kmer.py`), not just fitters: it composes the context head
+    from `kvmer.csv`, the raked centre-Q term, whichever of `Position(n)`/`Strand`/`GC(n)` the tokens ask for,
+    skiver's Weibull into `marginals`, and head Q from every FASTQ base (`fastq_quality.quality_table`, the
+    joint head Q table, extracted from what `pe-overlap` was already building inline and now shared with it).
+    It refuses a token default mode cannot identify, so a `Mate` term cannot be asked for by accident.
+  - **The small-v failure is a guard** (`sources/kmer._check_v`, lesson §3.1): below v = 4 the fit raises (v = 1
+    observes no errors at all), and below v = 13 it warns, naming the ~20 % shortfall measured at v = 6.
+  - **Outlier-filter clonal cost.** `filter_stats` reports the keys, consensus values, observations and error
+    mass `passes_filter` removes; `outlier_filter_cost` runs skiver twice on the *same* reads, with the filter on
+    and off, fits both, and compares them through `compare.components`, which is the per-head-E-component
+    quantification the exit asks for. Two skiver runs, not one: `--use-all` changes its summary CSVs too, and
+    those are what set the fitted level (§5.6). On the v0.3.2 fixture's clonal reads the filter removes nothing
+    at all (0 of 713 keys, 0 of 3780 error mass), so the cost there is zero; a real run is what tests the rest.
+  - `skiver_recovery` takes `extra` for `skiver analyze` arguments verbatim. Lesson §3.7 wants `--use-all -l 0`;
+    `use_all` covers the first, and `-l 0` is passed through rather than guessed at, since it is a flag of the
+    caller's binary.
+  - It also raises when the fitted quality alphabet differs from the truth's: `compare` indexes both heads with
+    the truth's alphabet, so a Q the generated reads never produced would silently misindex.
+  - Tests (`tests/test_kmer_source.py`, no binary needed): the CLI composes a spec from the committed v0.3.2
+    fixture plus the reads it was made from (regenerated from the same seed, not committed) and the generator
+    draws 150 bp reads from it; the v guard raises and warns; unidentifiable tokens are refused; and the whole
+    loop, including the filter-cost double run, runs against a stub binary that hands back that fixture, which
+    checks the plumbing while the real numbers come from the `kmer-recovery` workflow against a released binary.
 - **Exit:**
   - the synthetic loop passes at v=13 within the phase 2 tolerances, and the documented failure at small v is reproduced as a guarded error or warning;
   - the outlier filter's clonal cost is quantified per head E component;

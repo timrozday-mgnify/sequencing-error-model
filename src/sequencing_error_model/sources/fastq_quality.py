@@ -11,7 +11,7 @@ Profile each mate separately; pass all files (lanes) for one mate in a single ca
 
 import gzip
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
 from pathlib import Path
@@ -82,6 +82,35 @@ def profile_fastq(
         padded = PAD * left + seq + PAD * right
         p.context.update((padded[t : t + left + right + 1], qt) for t, qt in enumerate(q))
     return p
+
+
+def quality_fields(m: int) -> tuple[str, ...]:
+    """Head Q row fields for a Q window of `m` lags."""
+    return (*(f"q-{i}" for i in range(1, m + 1)), "pos_start", "pos_end", "mate", "context", "q")
+
+
+def quality_rows(seq: str, q: Sequence[int], mate: int, m: int, flank: tuple[int, int]) -> Iterator[Key]:
+    """Head Q rows for one read, in `quality_fields(m)` order: the lagged Q, both positions, the mate, the
+    *observed* context and the centre Q.
+
+    The joint table head Q is fitted from, not the marginals `tables` emits. `quality_table` counts these over
+    FASTQ files; `sources.pe_overlap` counts the same rows while it streams pairs it already holds.
+    """
+    left, right = flank
+    padded = PAD * left + seq.upper() + PAD * right
+    for p, centre in enumerate(q):
+        lags = tuple(q[p - k] if p >= k else None for k in range(1, m + 1))
+        yield (*lags, p + 1, len(q) - p, mate, padded[p : p + left + right + 1], centre)
+
+
+def quality_table(
+    *paths: Path, m: int, flank: tuple[int, int] = (2, 2), mate: int = 1, max_reads: int | None = None
+) -> CountTable:
+    """`quality_rows` counted over the first `max_reads` reads of `paths`: the table `fit.quality.fit` takes."""
+    counts: Counter[Key] = Counter()
+    for seq, q in islice(chain.from_iterable(map(read_fastq, paths)), max_reads):
+        counts.update(quality_rows(seq, list(q), mate, m, flank))
+    return CountTable("fastq_quality:quality", quality_fields(m), "base", False, counts, {"flank": flank})
 
 
 def tables(p: QualityProfile, mate: int | None = None) -> list[CountTable]:
