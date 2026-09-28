@@ -2,6 +2,7 @@ import json
 import re
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pysam
@@ -9,7 +10,9 @@ import pysam
 from sequencing_error_model import compare, recovery
 from sequencing_error_model import generate as gen
 from sequencing_error_model.fit import error
+from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.sources import bam, pe_overlap
+from sequencing_error_model.sources import skiver_analyze as sa
 
 PCR = 0.01  # library substitutions per fragment base, shared by both mates
 
@@ -99,9 +102,114 @@ def test_cli_reports_both_levels(tmp_path: Path) -> None:
     assert pe_overlap.main([*fastqs, "--output", str(spec_a), "--iterations", "2", *quality]) == 0
     assert bam.main([str(path), str(ref), "--output", str(spec_b), *quality]) == 0
     args = [*fastqs, str(path), str(ref), "--overlap-spec", str(spec_a), "--reference-spec", str(spec_b)]
-    assert compare.main([*args, "--output", str(report), "--min-exposure", "10"]) == 0
+    skiver = Path(__file__).parent / "fixtures" / "skiver-v0.3.2" / "analyze"
+    assert compare.main([*args, "--output", str(report), "--min-exposure", "10", "--skiver", str(skiver)]) == 0
     doc = json.loads(report.read_text())
+    # Different reads, so only the shape of the skiver section is checked here, not agreement.
+    for mode in ("overlap", "reference"):
+        assert set(doc["skiver"][mode]) == {
+            "phred", "gc_content", "read_position_start", "read_position_end", "spectrum", "hazard",
+        }  # fmt: skip
+        assert "skipped" not in doc["skiver"][mode]["phred"], doc["skiver"][mode]["phred"]
     assert doc["overlap_stats"]["pairs"] == 300 and doc["evidence"]["by"] == ["q", "mate"]
     # No library errors: the excess is small next to the rates themselves.
     assert abs(doc["evidence"]["excess"]) < 0.1 * doc["evidence"]["rate_b"], doc["evidence"]
     assert set(doc["models"]) == {"reference_rows", "overlap_rows"}
+
+
+def _rate_bins(table: CountTable, field: str, half: bool = False) -> list[sa.RateBin]:
+    """`summary_phred`/`summary_gc_content` rows at the table's own rate per value of `field`.
+
+    With `half`, each 10 % GC bin is written as skiver's two 5 % bins, at rates 0.8x and 1.2x the true one on
+    equal exposure, so the comparison has to pool them by exposure to get back the rate.
+    """
+    m = table.marginal(field, "op")
+    rows: dict[Key, list[float]] = {}
+    for (value, op), n in m.counts.items():
+        r = rows.setdefault((value,), [0.0, 0.0])
+        r[0] += n
+        r[1] += n * (op != "=")
+    bins = []
+    for (value,), (total, errors) in sorted(rows.items(), key=str):
+        lo, hi = value if isinstance(value, tuple) else (int(cast("int", value)), int(cast("int", value)))
+        rate = errors / total
+        halves = [(lo, (lo + hi) // 2, 0.8), ((lo + hi) // 2, hi, 1.2)] if half else [(lo, hi, 1.0)]
+        for a, b, scale in halves:
+            e = total / len(halves)
+            bins.append(
+                sa.RateBin(a, b, rate * scale, (0.0, 0.0), round(e * (1 - rate * scale)), round(e * rate * scale))
+            )
+    return bins
+
+
+def _position_rows(table: CountTable) -> list[sa.ReadPositionRow]:
+    rows = []
+    for field, start in (("pos_start", True), ("pos_end", False)):
+        for b in _rate_bins(table, field):
+            rows.append(sa.ReadPositionRow(b.lo, start, b.num_correct, b.num_error))
+    return rows
+
+
+def _spectrum_rows(pairs: list[tuple[str, gen.Read]]) -> list[sa.SpectrumRow]:
+    """`summary_error_spectrum` rows walked straight off the alignments, independently of `compare`."""
+    counts: dict[tuple[str, str, str], int] = {}
+    for template, read in pairs:
+        padded = "." + template.upper() + "."
+        for t, op in gen.align(template, read)[0]:
+            if op == "=":
+                continue
+            prev, nxt = (padded[t], padded[t + 1]) if op.startswith("-") else (padded[t], padded[t + 2])
+            counts[(op, prev, nxt)] = counts.get((op, prev, nxt), 0) + 1
+    return [sa.SpectrumRow(op, p, n, total, total) for (op, p, n), total in counts.items()]
+
+
+def test_skiver_marginals_recomputed_from_reference_truth() -> None:
+    """Every marginal skiver reports, rebuilt from the same reads' truth, lands back on skiver's own numbers."""
+    rng = np.random.default_rng(11)
+    genome = "".join(rng.choice(list("ACGT"), size=4000))
+    templates = [genome[s : s + 45] for s in rng.integers(0, len(genome) - 45, 800)]
+    mates = [1, 2] * (len(templates) // 2)
+    reads = gen.generate(recovery.example_spec(), templates, mates, rng)
+    pairs = list(zip(templates, reads, strict=True))
+    table = gen.observations(zip(templates, reads, mates, strict=True), (2, 2), 1, "reference")
+
+    analyze = sa.SkiverAnalyze(
+        k=11,
+        v=13,
+        error_rate=sa.ErrorRate(
+            0.01,
+            (0.0, 0.0),
+            0.01,
+            (0.0, 0.0),
+            0.01,
+            (0.0, 0.0),
+            0.9,
+            (0.0, 0.0),
+            20,
+            (0.0, 0.0),
+            20.0,
+            (0.0, 0.0),
+            0.9,
+            0.05,
+            0.05,
+        ),  # fmt: skip
+        hazard=[],
+        survival={},
+        spectrum=_spectrum_rows(pairs),
+        spectrum_by_t=[],
+        phred=_rate_bins(table, "q"),
+        gc_content=_rate_bins(table, "gc", half=True),
+        read_position=_position_rows(table),
+        kvmer=[],
+    )
+
+    found = compare.skiver_evidence(analyze, table, min_exposure=5)
+    for name in ("phred", "gc_content", "read_position_start", "read_position_end"):
+        m = found[name]
+        assert "skipped" not in m, (name, m)
+        assert abs(m["rate_ratio"] - 1) < 1e-4, (name, m)  # rounded bin counts, not a convention gap
+        assert m["coverage"][1] > 0.9, (name, m["coverage"])
+    s = found["spectrum"]
+    assert {"->A", "A>-"} <= set(s["ops"]), s["ops"]  # the insertion and deletion context conventions are exercised
+    assert s["tv"] < 1e-9 and s["r"] > 0.9999, s
+    assert found["hazard"]["table_op_proportions"]["substitution"] > 0.5, found["hazard"]
