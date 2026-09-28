@@ -13,10 +13,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sequencing_error_model.fit import error, kmer
+from sequencing_error_model import generate as gen
+from sequencing_error_model.fit import error, kmer, quality
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.sources import skiver_analyze
-from sequencing_error_model.spec import Component
+from sequencing_error_model.spec import Component, ErrorModelSpec
 
 K = len(error.CATEGORIES)
 ALPHABET = (kmer.DUMMY_Q,)
@@ -261,3 +262,152 @@ def test_rejects_tokens_and_tables_it_cannot_fit() -> None:
         kmer.fit(table, ["QualityWindow(0)", "Strand"])
     with pytest.raises(ValueError, match="does not fit in a 11-base key"):
         kmer.fit(table, ["QualityWindow(0)", "Context(12,0)"])
+
+
+def position_margins(
+    base: float, start: np.ndarray, end: np.ndarray, knots: np.ndarray, lengths: dict[int, float]
+) -> tuple[list[skiver_analyze.ReadPositionRow], np.ndarray]:
+    """The two `summary_read_position.csv` marginals of a known curve, plus its true shift per (position, length)."""
+    top = max(lengths)
+    at = quality._hat(np.arange(1, top + 1), knots)
+    shift = np.full((top + 1, top + 1), np.nan)  # [length, position]
+    for length in lengths:
+        for p in range(1, length + 1):
+            shift[length, p] = at[p - 1] @ start + at[length - p] @ end
+    rows = []
+    for from_start in (True, False):
+        for d in range(1, top + 1):
+            exposure = error_count = 0.0
+            for length, reads in lengths.items():
+                if d > length:
+                    continue
+                rate = 1 / (
+                    1 + np.exp(-(np.log(base / (1 - base)) + shift[length, d if from_start else length - d + 1]))
+                )
+                exposure, error_count = exposure + reads, error_count + reads * rate
+            if exposure:
+                rows.append(
+                    skiver_analyze.ReadPositionRow(d, from_start, int(exposure - error_count), int(error_count))
+                )
+    return rows, shift
+
+
+def test_position_curve_separates_the_two_ends() -> None:
+    """The start and end curves are fitted together: a row at p from one end is L - p + 1 from the other."""
+    knots = np.linspace(0.0, float(np.log(120)), 4)
+    start, end = np.array([0.8, 0.2, 0.0, 0.0]), np.array([0.0, 0.0, 0.3, 1.2])  # early bases and the read's tail
+    lengths = {n: 2_000_000.0 for n in (80, 100, 120)}
+    rows, shift = position_margins(0.01, start, end, knots, lengths)
+
+    got = kmer.position(rows, lengths, len(knots))
+    assert got.token == "Position(4)"
+    at = quality._hat(np.arange(1, max(lengths) + 1), knots)
+    errors = np.r_[0, np.ones(K - 1)]
+    for name, want in (("start", start), ("end", end)):
+        fitted = at @ (got.params[name] @ errors / (K - 1))
+        true = at @ want
+        np.testing.assert_allclose(fitted - fitted.mean(), true - true.mean(), atol=0.05)
+    # The joint shift, which is what the two marginals actually pin down, up to one overall constant.
+    both = np.array([[at[p - 1] @ start + at[length - p] @ end for p in range(1, length + 1)] for length in [100]])
+    fit_both = np.array(
+        [
+            [
+                at[p - 1] @ (got.params["start"] @ errors / (K - 1))
+                + at[length - p] @ (got.params["end"] @ errors / (K - 1))
+                for p in range(1, length + 1)
+            ]
+            for length in [100]
+        ]
+    )
+    np.testing.assert_allclose(fit_both - fit_both.mean(), both - both.mean(), atol=0.05)
+
+
+def test_position_curve_needs_read_lengths() -> None:
+    rows = [skiver_analyze.ReadPositionRow(1, True, 100, 1)]
+    with pytest.raises(ValueError, match="read-length distribution is empty"):
+        kmer.position(rows, {})
+    with pytest.raises(ValueError, match="no rows"):
+        kmer.position([], {100: 5.0})
+
+
+def test_strand_keeps_the_spectrum_asymmetry_per_category() -> None:
+    """Twice as many C>A errors on the forward strand, insertions even; the level stays with the raked fit."""
+    spectrum = [
+        skiver_analyze.SpectrumRow("C>A", "A", "A", 3000, 2000),
+        skiver_analyze.SpectrumRow("->G", "A", "A", 1000, 500),
+    ]
+    got = kmer.strand(spectrum)
+    weights = got.params["weights"]
+    np.testing.assert_allclose(weights.sum(axis=0), 0.0, atol=1e-12)  # centred over the two strands
+    delta = weights[1] - weights[0]
+    assert delta[error.CATEGORIES.index(">A")] == pytest.approx(np.log(1000.5 / 2000.5), rel=1e-3)
+    assert delta[error.CATEGORIES.index("->G")] == pytest.approx(0.0, abs=1e-3)
+    assert delta[0] == 0.0  # the match category, which the shift is relative to
+
+
+def test_gc_curve_follows_the_reported_rates() -> None:
+    """A rate rising log-linearly with GC comes back as a spline reproducing those log-odds."""
+    mids = np.arange(5, 100, 10)
+    rates = 1 / (1 + np.exp(-(-6 + 0.03 * mids)))
+    bins = [
+        skiver_analyze.RateBin(int(m) - 5, int(m) + 5, float(r), (0.0, 0.0), 100_000, int(100_000 * r))
+        for m, r in zip(mids, rates, strict=True)
+    ]
+    bins.append(skiver_analyze.RateBin(0, 10, 1e-6, (0.0, 0.0), 400, 0))  # no errors: no shape, no weight
+    got = kmer.gc(bins, 3)
+    knots = got.params["knots"]
+    fitted = np.stack([np.interp(mids, knots, e) for e in np.eye(3)], axis=1) @ (
+        got.params["weights"] @ np.r_[0, np.ones(K - 1)] / (K - 1)
+    )
+    want = np.log(rates / (1 - rates))
+    np.testing.assert_allclose(fitted - fitted.mean(), want - want.mean(), atol=0.05)
+
+
+def test_hazard_passes_skivers_own_numbers_through() -> None:
+    analyze = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    marginals = kmer.hazard(analyze.error_rate)
+    assert marginals["skiver_weibull"].tolist() == [analyze.error_rate.lambda_, analyze.error_rate.beta]
+    assert marginals["skiver_error_rate"][0] == analyze.error_rate.per_base_error_rate
+    assert marginals["skiver_op_proportions"].sum() == pytest.approx(1.0, abs=0.01)
+
+
+def test_the_default_mode_head_composes_and_generates() -> None:
+    """Raked head plus the three marginal components: one head E the generator and spec accept."""
+    analyze = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    kvmer = next(t for t in skiver_analyze.tables(analyze) if t.source.split(":")[1] == "kvmer")
+    context_head = kmer.fit(kvmer, ["QualityWindow(0)", "Context(1,1)"], flank=FLANK)
+    exposure = exposure_table(200, seed=11)
+    head = (
+        *kmer.fit_centre_q(context_head, analyze.phred, exposure, ["QualityWindow(0)", "Context(1,1)"], REAL_ALPHABET),
+        kmer.position(analyze.read_position, {150: 1600.0}),
+        kmer.strand(analyze.spectrum),
+        kmer.gc(analyze.gc_content, 3),
+    )
+    model = ErrorModelSpec(
+        REAL_ALPHABET,
+        {"mode": "kmer", "skiver_build": "default", "k": analyze.k, "v": analyze.v},
+        (Component("QualityMarkov(1)", {"bias": np.zeros(4), "lags": np.zeros((1, 5, 4))}),),
+        head,
+        marginals=kmer.hazard(analyze.error_rate),
+    )
+    rng = np.random.default_rng(3)
+    templates = ["".join(rng.choice(list("ACGT"), size=150)) for _ in range(200)]
+    reads = gen.generate(model, templates, [1] * len(templates), rng)
+    assert len(reads) == len(templates)
+    # The fitted position shape is in the head the generator draws from: more errors in the tail than at the start.
+    per_base = error.probabilities_at(
+        head,
+        {
+            "k_q": len(REAL_ALPHABET),
+            "flank": FLANK,
+            "context": np.zeros((150, 5), np.int64),
+            "centre": np.zeros(150, np.int64),
+            "q": np.full(150, 2, np.int64),
+            "pos_start": np.arange(1, 151),
+            "pos_end": np.arange(150, 0, -1),
+            "strand": np.zeros(150, np.int64),
+            "gc": np.full(150, 50.0),
+        },
+    )
+    edits = 1 - per_base[:, 0]
+    assert edits[-10:].mean() > edits[:10].mean(), (edits[:10], edits[-10:])

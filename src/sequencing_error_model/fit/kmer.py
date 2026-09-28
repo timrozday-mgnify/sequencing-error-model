@@ -28,6 +28,12 @@ error counts over those cells by IPF until both margins are reproduced, so a dif
 counted twice, and `fit_centre_q` fits the log-additive head E to the result. Neighbouring-Q and Q x context
 terms are not identifiable here and stay out of the model (plan §5.6, §6.2).
 
+**`position`, `strand`, `gc`, `hazard`: the remaining marginals.** Each of those CSVs is a separate marginal
+with no joint exposure to rake against, so they are combined log-additively, which §6.2 names as the
+assumption default mode cannot test. Each fits the *shape* of its own marginal as a log-odds shift on every
+error category and is recentred, so the level stays where `fit_centre_q` put it, and each component can simply
+be appended to that head. `hazard` is a passthrough of skiver's global Weibull for reports.
+
 ponytail: the per-locus `consensus_count_up_to_v*` columns also localise each observation's *first* mismatch,
 which would pin the latent position directly; they mix in the multi-edit values skiver drops from the op
 counts, so they are left out. Fold them in as an E-step prior if a recovery run shows position unidentifiable.
@@ -35,15 +41,15 @@ counts, so they are left out. Fold them in as an E-step prior if a recovery run 
 
 import warnings
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
 from sequencing_error_model.fit import error
-from sequencing_error_model.fit.quality import _BASE, Array
+from sequencing_error_model.fit.quality import _BASE, Array, _hat
 from sequencing_error_model.observations import CountTable, Key
-from sequencing_error_model.sources.skiver_analyze import RateBin
+from sequencing_error_model.sources.skiver_analyze import ErrorRate, RateBin, ReadPositionRow, SpectrumRow
 from sequencing_error_model.spec import Component
 
 DUMMY_Q = 0  # the one-value alphabet standing in for the centre Q `kvmer.csv` does not report
@@ -369,3 +375,142 @@ def fit_centre_q(
         raise ValueError(f"default mode identifies the centre Q only, so tokens start with QualityWindow(0): {tokens}")
     table = rake(context_head, phred, exposure, alphabet)
     return error.fit(table, tokens, alphabet, l2=l2, **kwargs)  # type: ignore[arg-type]
+
+
+def _logit(rate: Array, floor: float = 1e-9) -> Array:
+    r = np.clip(rate, floor, 1 - floor)
+    return np.asarray(np.log(r / (1 - r)))
+
+
+def _shift(basis: Array, target: Array, weight: Array, ridge: float) -> Array:
+    """Weighted ridge least squares of `target` on `basis` plus an intercept, which is dropped again.
+
+    The bases below are partitions of unity over their knots, so a constant is in their span: dropping the
+    intercept and then recentring the fitted curve on the same weights leaves the level where the raked fit put
+    it (`fit_centre_q`), and only the shape comes from this margin.
+    """
+    x = np.hstack([basis, np.ones((len(target), 1))])
+    a = x * np.sqrt(weight)[:, None]  # so a.T @ a is X' W X
+    return np.asarray(np.linalg.solve(a.T @ a + ridge * np.eye(x.shape[1]), x.T @ (target * weight)))[:-1]
+
+
+def _errors_only(shift: Array) -> Array:
+    """A per-slot log-odds shift as head E weights [slots, K]: every error category moves, the match does not."""
+    return np.outer(shift, np.r_[0.0, np.ones(len(error.CATEGORIES) - 1)])
+
+
+def position(
+    rows: Sequence[ReadPositionRow],
+    lengths: Mapping[int, float],
+    n_knots: int = 4,
+    *,
+    ridge: float = 1e-6,
+) -> Component:
+    """`Position(n)` from `summary_read_position.csv` and the FASTQ read-length distribution.
+
+    skiver reports two marginals of the same effect, error rate by distance from the read start and from the
+    read end, so the start and end curves are fitted *together*: a row at distance p from one end covers
+    distance L - p + 1 from the other, averaged over the read lengths that reach p. With one read length the
+    two are collinear and `ridge` splits the shape between them; length variation is what separates them.
+
+    The rates are `num_error / (num_correct + num_error)` over skiver's scan, which stops at each value's first
+    mismatch, so they are hazards: their shape is used, their level is not (see `_shift`). Rows are weighted by
+    their error count, the precision of a log-odds (a position with no errors carries no shape).
+
+    ponytail: `ridge` only shrinks the coefficients, so on a small run the knots near the read ends, where the
+    exposure is thinnest, wobble; on the v0.3.2 fixture (1600 reads) the first knot moves by ~0.7 in log-odds.
+    Add a curvature penalty along the knots, as `error._walk` does along the quality alphabet, if a real run's
+    curve comes out rough.
+    """
+    if not rows:
+        raise ValueError("summary_read_position.csv has no rows to fit a position curve from")
+    reads = np.array([lengths.get(n, 0.0) for n in range(1 + max(max(lengths, default=0), 1))], float)
+    if not reads.sum():
+        raise ValueError("the read-length distribution is empty, so the two position curves cannot be separated")
+    top = max(len(reads) - 1, max(r.index for r in rows), 2)
+    knots = np.linspace(0.0, float(np.log(top)), n_knots)
+    at = _hat(np.arange(1, top + 1), knots)  # [top, n_knots], the basis at each 1-based distance
+
+    def other_end(distance: int) -> Array:
+        """The basis at the distance from the *other* end, averaged over the lengths that reach `distance`."""
+        w = reads[distance:] if distance < len(reads) else np.zeros(0)
+        other = np.arange(len(reads) - distance) + 1  # L - distance + 1 for L = distance..
+        if not w.sum():
+            return np.zeros(n_knots)
+        return np.asarray(w @ at[np.minimum(other, top) - 1] / w.sum())
+
+    blocks, target, weight = [], [], []
+    for r in rows:
+        own, others = at[min(r.index, top) - 1], other_end(r.index)
+        blocks.append(np.r_[own, others] if r.from_start else np.r_[others, own])
+        target.append(_logit(np.array(r.num_error / max(r.num_correct + r.num_error, 1)))[()])
+        weight.append(float(r.num_error))
+    basis = np.vstack(blocks)
+    w = np.array(weight)
+    b = _shift(basis, np.array(target), w, ridge)
+    b[:n_knots] -= np.average(basis @ b, weights=w) if w.sum() else 0.0  # recentre, into the start block
+    return Component(
+        f"Position({n_knots})",
+        {"knots": knots, "start": _errors_only(b[:n_knots]), "end": _errors_only(b[n_knots:])},
+        meta={"source": "skiver summary_read_position.csv, shape only"},
+    )
+
+
+def strand(spectrum: Sequence[SpectrumRow], *, prior: float = 0.5) -> Component:
+    """`Strand` from `summary_error_spectrum.csv`'s forward/total split of the error counts.
+
+    Only errors are reported there, never the exposure, so the two strands are assumed equally covered: keys
+    are canonical, so this holds to the asymmetry of the k-mer orientation itself. The split is kept per error
+    category, which is where strand asymmetry shows (§6.1), and centred over the two strands so the level stays
+    with the raked fit. `prior` is a count added to both sides, so a category no error was seen on gives 0.
+    """
+    counts = np.full((2, len(error.CATEGORIES)), prior)
+    for row in spectrum:
+        cat = _target(row.op)[0]
+        counts[0, cat] += row.forward
+        counts[1, cat] += row.total - row.forward
+    delta = np.log(counts[1] / counts[0])
+    delta[0] = 0.0  # the match category carries no strand effect; the shift is relative to it
+    return Component(
+        "Strand",
+        {"weights": np.stack([-delta / 2, delta / 2])},
+        meta={"source": "skiver summary_error_spectrum.csv, equal strand exposure assumed"},
+    )
+
+
+def gc(bins: Sequence[RateBin], n_knots: int = 3, *, ridge: float = 1e-6) -> Component:
+    """`GC(n)` from `summary_gc_content.csv`: a spline of the reported per-bin rate, shape only (`_shift`)."""
+    usable = [b for b in bins if b.num_error > 0]
+    if not usable:
+        raise ValueError("summary_gc_content.csv reports no errors, so there is no GC shape to fit")
+    knots = np.linspace(0.0, 100.0, n_knots)
+    mid = np.array([(b.lo + b.hi) / 2 for b in usable])
+    basis = np.stack([np.interp(mid, knots, e) for e in np.eye(n_knots)], axis=1)
+    weight = np.array([float(b.num_error) for b in usable])
+    b = _shift(basis, _logit(np.array([b.per_base_error_rate for b in usable])), weight, ridge)
+    b -= np.average(basis @ b, weights=weight)
+    return Component(
+        f"GC({n_knots})",
+        {"knots": knots, "weights": _errors_only(b)},
+        meta={"source": "skiver summary_gc_content.csv, shape only"},
+    )
+
+
+def hazard(rate: ErrorRate) -> dict[str, Array]:
+    """skiver's fitted global rate and hazard, for the spec's `marginals`.
+
+    A passthrough, not a head E component: beta < 1 is error clustering along the read, which this model
+    expresses through `Latent(S)` or `FragmentOverdispersion`, and default mode identifies neither (§6.2). It is
+    carried so reports and exporters can state skiver's own numbers and compare them with the fitted head.
+    """
+    return {
+        "skiver_weibull": np.array([rate.lambda_, rate.beta]),
+        "skiver_error_rate": np.array([rate.per_base_error_rate, rate.mean_hazard_rate]),
+        "skiver_op_proportions": np.array(
+            [
+                rate.substitution_error_proportion,
+                rate.insertion_error_proportion,
+                rate.deletion_error_proportion,
+            ]
+        ),
+    }

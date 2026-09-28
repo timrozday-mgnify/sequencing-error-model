@@ -974,7 +974,32 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
       margin at r > 0.9999, and lands every cell's rate within 0.6 % on average; multiplying the two marginals
       into each cell instead is 51 % off overall and 131 % off on the correlated cells. Log-additivity is the
       assumption this rests on, and no test of it is possible in default mode (§6.1).
-  - position curve, strand, GC, Weibull passthrough.
+  - ✓ position curve, strand, GC, Weibull passthrough (`fit/kmer.py`: `position`, `strand`, `gc`, `hazard`).
+    Each of those CSVs is a marginal with no joint exposure to rake against, so they are combined
+    log-additively (the §6.2 assumption) as a log-odds shift on every error category, fitted by weighted ridge
+    least squares against the marginal's own levels and recentred, so the level stays with the raked centre-Q
+    fit and each component appends straight onto that head. Rows are weighted by their error count, the
+    precision of a log-odds, so a level with no errors contributes no shape.
+    - `Position(n)`: skiver reports error rate from the read start *and* from the read end, two marginals of one
+      effect, so both curves are fitted together against the FASTQ read-length distribution: a row at distance p
+      from one end is at L - p + 1 from the other, averaged over the lengths that reach p. With a single read
+      length the two are collinear and the ridge splits the shape; length variation separates them. Test:
+      margins built from a known curve over lengths 80/100/120 recover both curves to 0.05 in log-odds, and the
+      joint shift at a fixed length to 0.05.
+    - `Strand`: `summary_error_spectrum.csv` reports forward/total error counts but never the exposure, so equal
+      strand coverage is assumed (keys are canonical) and the split is kept per error category, centred over the
+      two strands. A half-count prior keeps a category with no errors at 0.
+    - `GC(n)`: a spline of the reported per-bin rate.
+    - `hazard`: skiver's lambda, beta, per-base and hazard rate and op proportions into the spec's `marginals`,
+      not a head E component: beta < 1 is clustering, which this model expresses through `Latent(S)` or
+      `FragmentOverdispersion`, and default mode identifies neither (§6.2). It is carried so reports can state
+      skiver's own numbers beside the fitted head's.
+    - Composition test: on the v0.3.2 fixture, the kvmer context head, the raked centre-Q fit and the three
+      marginal components form one head E that `ErrorModelSpec` accepts and the generator draws 150 bp reads
+      from, with the fitted position shape visible in its per-position error rate.
+    - Known roughness: the ridge shrinks coefficients but does not penalise curvature, so on a small run the
+      knots nearest the read ends wobble (~0.7 in log-odds at the first knot on the 1600-read fixture). Marked
+      in the code with the upgrade path (a curvature penalty as in `error._walk`).
 
   Head Q uses the phase 2 FASTQ fitters.
 - **Evidence check.** On the same reads, tabulate from `pe-overlap` and `reference` tuples the marginals skiver reports: spectrum in trinucleotide context, P(error | Q), read-position curve, GC, and hazard/clustering. Use skiver's counting conventions where they can be emulated (§5.6; e.g. first-error stopping for P(error | Q)), otherwise compare rates. Compare with skiver's CSVs through `compare.py`. This tests skiver's evidence independently of the `kmer` fitters.
