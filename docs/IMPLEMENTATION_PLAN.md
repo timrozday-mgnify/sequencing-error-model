@@ -1089,16 +1089,52 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - on the phase 5 near-clonal real datasets, skiver's marginals and the `kmer` spec are compared with both other modes on shared support, and the report states agreement per component, with expected gaps (PCR errors vs `pe-overlap`) given as estimates;
   - reported, not blocking: the default-mode model's held-out likelihood and marginals vs ReSeq (Illumina) and Badread (long reads) profiles trained on the aligned reads (§4.4, risk 2).
 
-### Phase 7: biological variation simulator and the size of the problem
+### Phase 7: biological variation simulator and the size of the problem (in progress)
 Test infrastructure only (§1 scope): it exists so separation methods have per-base truth.
-- `variation.py`: from a base genome, make strain haplotypes over a star or random tree at a target divergence (ANI), with SNPs (transition/transversion ratio) and short indels; add within-population minor alleles from a frequency spectrum; insert divergent repeat copies (the ERR10889147 failure). Output haplotype FASTAs, abundances per sample, and a truth-site table (consensus position, alleles, allele per haplotype, frequency per sample).
+- ✓ `variation.py`: from a base genome, strain haplotypes over a star or random tree at a target divergence
+  (ANI), with SNPs (transition/transversion ratio) and short indels; within-population minor alleles from a
+  frequency spectrum; divergent repeat copies (the ERR10889147 failure). Writes haplotype FASTAs, the consensus,
+  the truth-site table and the abundances per sample (`python -m sequencing_error_model.variation GENOME --output
+  DIR`).
+  - **`ani` is the pairwise identity of the deepest pair**, so root-to-tip divergence is `(1 - ani) / 2`. `star`
+    mutates the consensus independently per haplotype; `random` walks a random ultrametric binary topology, so
+    haplotypes share the alleles of the internal branches they descend from, which is the linkage phase 8 needs.
+    Each base draws one event at the branch's rate: a substitution (`ti_tv`, the ratio of transitions to *all*
+    transversions, so P(ti) = r / (1 + r)) or, with `indel_fraction`, a short indel of geometric length.
+  - **The truth-site table is derived from the haplotype sequences**, not recorded as they are built
+    (`_alleles`, walking each base's consensus index), so it cannot drift from them: SNPs where a mapped base
+    differs, insertions as runs of unmapped bases, deletions as gaps in the mapped indices, each left-anchored as
+    in VCF. A haplotype's own `Contig` carries that index per base, which is also what labels reads.
+  - **Minor alleles are realised per fragment**, not as extra haplotypes: a site at frequency f flips in a
+    molecule with probability f, where that haplotype still carries the consensus allele, so both mates of a pair
+    read the same allele and `pe-overlap` stays blind to it (§6.6). Frequencies are log-uniform over
+    `frequency`, which is the neutral 1/f spectrum. Marked in the code: alleles are linked within a molecule but
+    not across molecules; a per-molecule haplotype draw is the upgrade path when phase 8's linkage test needs one.
+  - **A repeat copy is structure, not an allele**, so it is appended to the consensus before haplotyping (every
+    haplotype carries both copies) and reported in its own table with its achieved identity.
+  - Tests (`tests/test_variation.py`): the star tree hits the target ANI within 0.002 and the random tree shares
+    two orders of magnitude more alleles between haplotypes than the star tree's coincidences; ti/tv and the
+    indel share come back; `_alleles` gives the exact rows for a hand-built SNP + insertion + deletion contig;
+    minor alleles reach their frequency and every carried allele appears in *both* mates; the repeat copy is
+    appended at its requested identity; the CLI writes all five files.
+  - Deferred: recombination (below), external haplotypes (below), indel minor alleles, and per-sample
+    minor-allele frequencies (one spectrum draw serves every sample).
   - No recombination at first. It weakens linkage, so it is added as a scenario once phase 8's linkage test needs a hard case.
 - External haplotypes: accept a reference plus VCF (msprime, SimBac) or haplotype FASTAs with a truth table (CAMISIM's sgEvolver strains), so richer population structure plugs in without a dependency.
-- `generate.fragments` samples haplotypes by abundance; read names carry the haplotype, and every base's truth is one of match, error or variant (the read's CIGAR against its haplotype, the haplotype against the consensus).
+- ✓ `variation.fragments` samples molecules by haplotype abundance (weighted by each contig's placements), so
+  read names carry the haplotype through the contig name `<haplotype>|<contig>`, and every fragment comes with
+  the *consensus counterpart* of each mate's template: the consensus base under each template base, `-` where
+  the haplotype inserted and `.` past the fragment (adapter read-through). `variation.truth` then labels every
+  read base match / variant / error / adapter from the CIGAR and that counterpart, which is the exit's round
+  trip: a read base differing from the consensus is an error or a variant, and the two are told apart by the
+  CIGAR, never by the bases. Mate conventions, adapters and the name format follow `generate.fragments`, which
+  is unchanged.
+  - ponytail: placement is variation's own (a weighted copy of `generate.fragments`' draw) rather than a hook in
+    the generator, so the abundance and minor-allele logic stays in one module.
 - **Scenario grid:** divergence (ANI 99.99, 99.9, 99, 98, 95%) × minor-strain fraction (0.5, 0.2, 0.05, 0.01) × per-genome coverage (10–200×) × minor-allele density × divergent repeats, single sample and a multi-sample abundance series; Illumina 2×150 with short and long inserts, and ONT/HiFi.
 - **Problem size.** Run each mode unmodified over the grid (`pe-overlap`; `reference` against an external relative, the majority-strain consensus and a self-assembly recipe; `kmer` default with its outlier filter) and report bias against the clonal truth per head E component: marginal rate, op composition, context log-odds, rate per reported Q, position. This is the baseline phase 8 must beat.
 - **Exit:**
-  - per-base truth round-trips: every read mismatch against the consensus is labelled error or variant, consistently with the CIGAR and haplotype;
+  - ✓ per-base truth round-trips: every read mismatch against the consensus is labelled error or variant, consistently with the CIGAR and haplotype (`variation.truth`, tested against an independent walk of the alignment);
   - the grid's clonal point reproduces the phase 4–6 recovery results;
   - the bias table exists for all three modes, and `pe-overlap` is shown variant-immune outside the repeat scenarios.
 
