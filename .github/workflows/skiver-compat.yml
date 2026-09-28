@@ -59,6 +59,12 @@ jobs:
           path: ${{ runner.temp }}/out/analyze.*.csv
 
       # Bootstrap CIs (hazard_rate, summary_error_rate, summary_phred, summary_gc_content) vary run to run.
+      #
+      # This diff is also flaky: skiver's *exposure* counts are not reproducible run to run on the same reads
+      # and binary. Seen 2026-09-28 on one attempt of an unchanged fixture, where every kvmer row's
+      # consensus_count / total_count came out 5-15% low (TTCGACCCCTT 45/7/52 -> 38/6/44) while its per-op error
+      # counts were identical or one lower; the rerun was byte-identical to the committed fixture. So a red diff
+      # here is a rerun before it is a bug. Determinism is the same concern as lesson 3.10 in the plan.
       - name: Diff deterministic outputs against committed fixtures
         if: matrix.skiver == 'v0.3.2'
         run: |
