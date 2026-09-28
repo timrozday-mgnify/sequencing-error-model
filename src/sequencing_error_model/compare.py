@@ -12,13 +12,18 @@ errors and strain variation. So comparisons are restricted to what both observe.
   estimates PCR/library substitutions, plus any residual variation or reference error.
 - `models(a, b, table)`: both specs' head E on one table, conditioned on no indel: op TV, rates, rate by Q, and
   each spec's log-likelihood per row.
+- `components(a, b, table)`: two specs' head E compared per component on one table - predicted error rate by Q,
+  position, GC, strand and mate, the slope of one's context log-odds on the other's, and op composition. The modes
+  fit different component sets, so what is compared is what the heads predict on shared rows, not parameters.
+- `generated(a, b, reference, ...)`: phase 3 metrics of reads generated from both specs, via `recovery.compare`.
 - `skiver_evidence(analyze, table)`: the marginals `skiver analyze` reports - P(error | Q), the read-position
   curves, GC and the trinucleotide spectrum - recomputed from a truth-bearing table, so skiver's own evidence is
   checked against `pe-overlap` and `reference` truth independently of the `kmer` fitters (plan phase 6).
 
 CLI (`python -m sequencing_error_model.compare`): one run's R1/R2 and its BAM, with the specs the two source CLIs
 fitted from them, give a JSON report of both levels (models on each mode's rows), plus the skiver comparison
-with `--skiver <analyze prefix>`.
+with `--skiver <analyze prefix>` and, with `--kmer-spec`, the `kmer` default spec against both of them per
+component, on each mode's rows, and (with `--generated-reads`) on generated reads.
 """
 
 import argparse
@@ -32,7 +37,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
+import pysam
 
+from sequencing_error_model import recovery
 from sequencing_error_model import spec as spec_io
 from sequencing_error_model.fit import error, indel
 from sequencing_error_model.generate import _flank, observations
@@ -254,10 +261,7 @@ def models(a: ErrorModelSpec, b: ErrorModelSpec, table: CountTable, by: str = "q
     oi, ci, f0 = t.fields.index("op"), t.fields.index("context"), t.meta.get("flank", (0, 0))[0]
     n = np.array(list(t.counts.values()), float)
     cat = np.array([error._category(k[oi], str(k[ci])[f0]) for k in t.counts])
-    p = []
-    for spec in (a, b):
-        q = error.probabilities(indel.split(spec.error_head)[0], spec.quality_alphabet, t)[:, :5]
-        p.append(q / q.sum(axis=1, keepdims=True))
+    p = _heads(a, b, t, indels=False)
     rates = [float(n @ (1 - x[:, 0]) / n.sum()) for x in p]
     key = np.array([str(k[t.fields.index(by)]) for k in t.counts])
     values = sorted(set(key), key=lambda v: (len(v), v))
@@ -273,6 +277,129 @@ def models(a: ErrorModelSpec, b: ErrorModelSpec, table: CountTable, by: str = "q
         "values": values,
         "rates_by": [[float(n[key == v] @ (1 - x[key == v, 0]) / n[key == v].sum()) for v in values] for x in p],
     }
+
+
+def _values(key: "np.ndarray[Any, Any]") -> list[str]:
+    return sorted(set(key.tolist()), key=lambda v: (len(v), v))
+
+
+def _rates(p: "list[np.ndarray[Any, Any]]", n: "np.ndarray[Any, Any]", sel: "np.ndarray[Any, Any]") -> list[float]:
+    """Exposure-weighted P(error) under each spec over the selected rows."""
+    return [float(n[sel] @ (1 - x[sel, 0]) / n[sel].sum()) for x in p]
+
+
+def _heads(a: ErrorModelSpec, b: ErrorModelSpec, t: CountTable, indels: bool) -> "list[np.ndarray[Any, Any]]":
+    """Each spec's head E on `t`'s rows, renormalised over the categories the comparison keeps."""
+    out = []
+    for s in (a, b):
+        q = error.probabilities(indel.split(s.error_head)[0], s.quality_alphabet, t)
+        q = q if indels else q[:, :5]
+        out.append(q / q.sum(axis=1, keepdims=True))
+    return out
+
+
+def components(
+    a: ErrorModelSpec,
+    b: ErrorModelSpec,
+    table: CountTable,
+    by: Sequence[str] = ("q", "pos_start", "pos_end", "gc", "strand", "mate"),
+    min_exposure: float = 100,
+    indels: bool = False,
+) -> dict[str, Any]:
+    """Two specs' head E compared per component on one table's rows (plan phase 6, model check).
+
+    Not a parameter comparison: the modes fit different component sets (the `kmer` default head has no mate
+    term, a `pe-overlap` head no indels), and a shared covariate can be reached by different tokens. What is
+    compared is what the heads *predict* on the same rows, exposure-weighted by the table and marginalised onto
+    each covariate, so a ratio away from 1 is that covariate's effect moved, as in `recovery.indel_components`.
+
+    - each field of `by` present on the table: predicted error rate per value, and b over a;
+    - `context`: the least-squares slope and correlation of b's error log-odds on a's over contexts with at
+      least `min_exposure` rows, centred, as `recovery._slope` does for `Context` parameters (1 is unbiased,
+      below 1 a shrunk effect), plus the mean absolute log ratio;
+    - `op`: expected shares of the error mass over `error.CATEGORIES`, and their total variation.
+    """
+    t = _substitution_support(table, indels)
+    if not t.counts:
+        raise ValueError(f"{table.source}: no rows on the comparison's support")
+    n = np.array(list(t.counts.values()), float)
+    p = _heads(a, b, t, indels)
+    out: dict[str, Any] = {
+        "sources": [str(s.provenance.get("mode", "?")) for s in (a, b)],
+        "rows": float(n.sum()),
+        "support": "all ops" if indels else "substitutions",
+    }
+    for f in by:
+        if f not in t.fields:
+            continue
+        key = np.array([str(k[t.fields.index(f)]) for k in t.counts])
+        values = [v for v in _values(key) if n[key == v].sum() >= min_exposure]
+        if not values:
+            continue
+        pairs = [_rates(p, n, key == v) for v in values]
+        ra, rb = [r[0] for r in pairs], [r[1] for r in pairs]
+        out[f] = {
+            "values": values,
+            "rate_a": ra,
+            "rate_b": rb,
+            "ratio": [y / x if x else float("nan") for x, y in zip(ra, rb, strict=True)],
+        }
+    out["context"] = _context_shape(p, n, t, min_exposure)
+    mass = [n @ y[:, 1:] for y in p]
+    shares = [m / m.sum() for m in mass]
+    out["op"] = {
+        "categories": list(error.CATEGORIES[1 : 1 + p[0].shape[1] - 1]),
+        "shares_a": shares[0].tolist(),
+        "shares_b": shares[1].tolist(),
+        "tv": float(0.5 * np.abs(shares[0] - shares[1]).sum()),
+    }
+    return out
+
+
+def _context_shape(
+    p: "list[np.ndarray[Any, Any]]", n: "np.ndarray[Any, Any]", t: CountTable, min_exposure: float
+) -> dict[str, Any]:
+    """Slope, correlation and mean absolute log ratio of b's context error log-odds on a's, both centred."""
+    key = np.array([str(k[t.fields.index("context")]) for k in t.counts])
+    values = [v for v in _values(key) if n[key == v].sum() >= min_exposure]
+    if len(values) < 2:
+        return {"skipped": f"{t.source}: fewer than 2 contexts with {min_exposure} rows"}
+    rates = np.array([_rates(p, n, key == v) for v in values])  # [contexts, 2]
+    lo = np.log(np.clip(rates, 1e-12, 1 - 1e-12) / np.clip(1 - rates, 1e-12, 1))
+    x, y = (lo[:, i] - lo[:, i].mean() for i in (0, 1))
+    return {
+        "contexts": len(values),
+        "log_odds_slope": float(x @ y / (x @ x)) if x @ x else float("nan"),
+        "r": float(np.corrcoef(x, y)[0, 1]),
+        "mean_abs_log_ratio": float(np.abs(np.log(rates[:, 1] / rates[:, 0])).mean()),
+    }
+
+
+def generated(
+    a: ErrorModelSpec,
+    b: ErrorModelSpec,
+    reference: Path,
+    n_reads: int,
+    read_length: int,
+    seed: int = 0,
+    q_reads: int = 20_000,
+) -> dict[str, Any]:
+    """Phase 3 metrics of reads generated from both specs, on templates sliced from the real reference.
+
+    `recovery.compare` treats `a` as the truth, so `rate_ratio` and the curve pairs read as b over a. Both
+    heads Q come from the same FASTQ, so the Q-track metrics are a check that the generator applies each head,
+    not a difference between the modes; the error metrics are the comparison.
+    """
+    with pysam.FastaFile(str(reference)) as fasta:
+        genome = max((fasta.fetch(c) for c in fasta.references), key=len).upper()
+    if len(genome) < read_length + 1:
+        raise ValueError(f"{reference}: longest contig is shorter than one {read_length} bp read")
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, len(genome) - read_length, n_reads)
+    templates = [genome[s : s + read_length] for s in starts]
+    mates = [1, 2] * (n_reads // 2) + [1] * (n_reads % 2)
+    report = recovery.compare(a, b, templates, mates, rng, q_reads=q_reads, substitutions_only=True)
+    return {"reads": n_reads, "read_length": read_length, **vars(report)}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -294,6 +421,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--max-reads", type=int)
     p.add_argument("--mask-alt-freq", type=float, help="mask sites with a non-reference allele at this frequency")
     p.add_argument("--skiver", type=Path, metavar="PREFIX", help="`skiver analyze -o` prefix on the same reads")
+    p.add_argument("--kmer-spec", type=Path, help="spec from fit.kmer on the same run's skiver outputs")
+    p.add_argument("--generated-reads", type=int, default=0, help="with --kmer-spec: phase 3 metrics on this many")
+    p.add_argument("--read-length", type=int, default=150, help="with --generated-reads")
     args = p.parse_args(argv)
     a, b = spec_io.load(args.overlap_spec), spec_io.load(args.reference_spec)
     # One window for both tables, wide enough for both specs' head E.
@@ -321,6 +451,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "evidence": evidence(overlap, reference, args.by, args.min_exposure),
         "models": {"reference_rows": models(a, b, reference), "overlap_rows": models(a, b, overlap)},
     }
+    if args.kmer_spec is not None:
+        k = spec_io.load(args.kmer_spec)
+        report["kmer"] = {
+            name: {
+                "components": components(k, other, t, min_exposure=args.min_exposure),
+                "models": models(k, other, t),
+            }
+            for name, other, t in (("overlap", a, overlap), ("reference", b, reference))
+        }
+        if args.generated_reads:
+            report["kmer"]["generated"] = {
+                name: generated(k, other, args.reference, args.generated_reads, args.read_length)
+                for name, other in (("overlap", a), ("reference", b))
+            }
     if args.skiver is not None:
         analyze = skiver_analyze.read_analyze(args.skiver)
         report["skiver"] = {

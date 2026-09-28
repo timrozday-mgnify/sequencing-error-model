@@ -1026,7 +1026,34 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     0.8x/1.2x the rate) come back with every rate ratio at 1 within 1e-4 and the spectrum at TV < 1e-9, so a
     misaligned key, bin or insertion context fails sharply; the CLI carries the section through on the v0.3.2
     fixture.
-- **Model check.** Compare the `kmer` default spec with the `pe-overlap` and `reference` specs per component (context log-odds, centre-Q curve, position, op composition), on held-out likelihood of their tuples, and on phase 3 metrics of generated reads.
+- ✓ **Model check** (`compare.components`, `compare.generated`, `--kmer-spec` on the `compare` CLI). The `kmer`
+  default spec against the `pe-overlap` and `reference` specs, per component on each mode's own rows, plus
+  `compare.models` for the held-out likelihood of those tuples and `compare.generated` for phase 3 metrics of
+  reads generated from both.
+  - **Predictions, not parameters.** The modes fit different component sets (the `kmer` default head has no
+    `Mate` term, a `pe-overlap` head no indels) and reach a shared covariate through different tokens, so
+    `components` compares what the two heads *predict* on the same rows, exposure-weighted by the table and
+    marginalised onto each covariate, the way `recovery.indel_components` does for indels. A ratio away from 1
+    is that covariate's effect moved.
+  - Per covariate (`q`, `pos_start`, `pos_end`, `gc`, `strand`, `mate`, those the table carries): predicted
+    error rate per value and b over a, at values with at least `min_exposure` rows. `context`: the least-squares
+    slope and correlation of b's error log-odds on a's, both centred, as `recovery._slope` does for `Context`
+    parameters, plus the mean absolute log ratio. `op`: expected shares of the error mass over
+    `error.CATEGORIES` and their total variation. Indels are kept only with `indels=True`, since `pe-overlap`
+    identifies none.
+  - **The context slope reads the whole context shape**, not one component: the per-context marginal carries
+    every context-varying component (`Homopolymer` as well as `Context`). Halving `Context` alone in the test
+    moves it to 0.80, not 0.50.
+  - `generated` slices templates from the real reference and hands both specs to `recovery.compare`. Both heads
+    Q come from the same FASTQ, so its Q-track metrics check that the generator applies each head rather than
+    separating the modes; the error metrics are the comparison.
+  - **Fixed at the root:** `recovery._tuples` now sizes the table for *both* specs' heads. Comparing two specs
+    with different component sets built a table too narrow for one of them, which every caller of
+    `recovery.compare` would hit; `cigar_mode` never did, because it refits with the truth's own tokens.
+  - Test (`tests/test_compare.py`): identical specs agree to 1e-9 on every covariate ratio, the context slope
+    and op TV; halving head E's `Context` term leaves a shrunk but still highly correlated context slope
+    (0.5 < slope < 0.95, r > 0.9); `generated` reproduces a spec against itself; the CLI carries all three
+    sections through.
 - **Synthetic recovery.** Generate, run skiver (released binary), profile the FASTQ, fit, compare with the spec. On clonal reads, run with skiver's outlier filter on (default) and off (`--use-all`), and report the keys, contexts and error mass the filter removes when there is no variation to remove.
 - **Exit:**
   - the synthetic loop passes at v=13 within the phase 2 tolerances, and the documented failure at small v is reproduced as a guarded error or warning;
