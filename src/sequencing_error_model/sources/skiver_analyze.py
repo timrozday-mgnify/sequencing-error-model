@@ -175,6 +175,11 @@ def _op(name: str) -> str:
     return name
 
 
+def context(op: str, prev: str, nxt: str) -> str:
+    """The trinucleotide a spectrum row sits in: its centre is the true base, or "-" for an insertion."""
+    return prev + ("-" if op.startswith("-") else op[0]) + nxt
+
+
 def read_error_rate(path: Path) -> ErrorRate:
     header = (
         "per_base_error_rate,per_base_error_rate_5-95th_percentile,mean_hazard_rate,mean_hazard_rate_5-95th_percentile,"
@@ -305,9 +310,6 @@ def tables(a: SkiverAnalyze) -> list[CountTable]:
         name: str, fields: tuple[str, ...], unit: str, items: Iterable[tuple[Key, int]], **meta: Any
     ) -> CountTable:
         return CountTable(f"skiver_analyze:{name}", fields, unit, True, count(items), {"k": k, "v": v, **meta})
-
-    def context(op: str, prev: str, nxt: str) -> str:
-        return prev + ("-" if op.startswith("-") else op[0]) + nxt
 
     passing = [r for r in a.kvmer if r.passes_filter]
     return [

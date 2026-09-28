@@ -12,20 +12,24 @@ errors and strain variation. So comparisons are restricted to what both observe.
   estimates PCR/library substitutions, plus any residual variation or reference error.
 - `models(a, b, table)`: both specs' head E on one table, conditioned on no indel: op TV, rates, rate by Q, and
   each spec's log-likelihood per row.
+- `skiver_evidence(analyze, table)`: the marginals `skiver analyze` reports - P(error | Q), the read-position
+  curves, GC and the trinucleotide spectrum - recomputed from a truth-bearing table, so skiver's own evidence is
+  checked against `pe-overlap` and `reference` truth independently of the `kmer` fitters (plan phase 6).
 
 CLI (`python -m sequencing_error_model.compare`): one run's R1/R2 and its BAM, with the specs the two source CLIs
-fitted from them, give a JSON report of both levels (models on each mode's rows).
+fitted from them, give a JSON report of both levels (models on each mode's rows), plus the skiver comparison
+with `--skiver <analyze prefix>`.
 """
 
 import argparse
 import json
 import sys
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import asdict, replace
 from itertools import islice
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -33,23 +37,27 @@ from sequencing_error_model import spec as spec_io
 from sequencing_error_model.fit import error, indel
 from sequencing_error_model.generate import _flank, observations
 from sequencing_error_model.observations import CountTable, Key
-from sequencing_error_model.sources import bam, pe_overlap
+from sequencing_error_model.sources import bam, pe_overlap, skiver_analyze
+from sequencing_error_model.sources.skiver_analyze import SkiverAnalyze
 from sequencing_error_model.spec import ErrorModelSpec
 
 
-def _substitution_support(table: CountTable) -> CountTable:
+def _substitution_support(table: CountTable, indels: bool = False) -> CountTable:
+    """Matches and substitutions, or every op with `indels` (for a source that labels them, e.g. skiver)."""
     if "op" not in table.fields:
         raise ValueError(f"{table.source}: comparison needs op labels")
     oi = table.fields.index("op")
-    kept: Counter[Key] = Counter({k: n for k, n in table.counts.items() if k[oi] == "=" or "-" not in str(k[oi])})
+    kept: Counter[Key] = Counter(
+        {k: n for k, n in table.counts.items() if indels or k[oi] == "=" or "-" not in str(k[oi])}
+    )
     return replace(table, counts=kept)
 
 
-def _exposure(table: CountTable, by: Sequence[str]) -> dict[Key, tuple[float, float]]:
-    """(rows, substitutions) per value of `by`, on substitution support."""
+def _exposure(table: CountTable, by: Sequence[str], indels: bool = False) -> dict[Key, tuple[float, float]]:
+    """(rows, errors) per value of `by`, on the support `indels` selects."""
     if missing := sorted(set(by) - set(table.fields)):
         raise ValueError(f"{table.source}: no fields {missing}")
-    t = _substitution_support(table)
+    t = _substitution_support(table, indels)
     oi, idx = t.fields.index("op"), [t.fields.index(f) for f in by]
     out: dict[Key, tuple[float, float]] = {}
     for k, n in t.counts.items():
@@ -58,9 +66,15 @@ def _exposure(table: CountTable, by: Sequence[str]) -> dict[Key, tuple[float, fl
     return out
 
 
-def evidence(a: CountTable, b: CountTable, by: Sequence[str] = ("q",), min_exposure: float = 100) -> dict[str, Any]:
+def evidence(
+    a: CountTable,
+    b: CountTable,
+    by: Sequence[str] = ("q",),
+    min_exposure: float = 100,
+    indels: bool = False,
+) -> dict[str, Any]:
     """Substitution rates of two tables on the covariate values both observe, standardised to pooled exposure."""
-    ea, eb = _exposure(a, by), _exposure(b, by)
+    ea, eb = _exposure(a, by, indels), _exposure(b, by, indels)
     shared = sorted((k for k in ea.keys() & eb.keys() if min(ea[k][0], eb[k][0]) >= min_exposure), key=str)
     if not shared:
         raise ValueError(f"{a.source} and {b.source} share no values of {list(by)} with {min_exposure} rows each")
@@ -70,6 +84,7 @@ def evidence(a: CountTable, b: CountTable, by: Sequence[str] = ("q",), min_expos
     return {
         "sources": [a.source, b.source],
         "by": list(by),
+        "support": "all ops" if indels else "substitutions",
         "values": [str(k if len(k) != 1 else k[0]) for k in shared],
         "coverage": [sum(e[k][0] for k in shared) / sum(v[0] for v in e.values()) for e in (ea, eb)],
         "rate_a": rate_a,
@@ -79,6 +94,158 @@ def evidence(a: CountTable, b: CountTable, by: Sequence[str] = ("q",), min_expos
         "rates_a": ra.tolist(),
         "rates_b": rb.tolist(),
     }
+
+
+def _counts(items: Iterable[tuple[Key, float]]) -> Counter[Key]:
+    """Sum possibly fractional counts per key, dropping non-positive ones."""
+    out: dict[Key, float] = {}
+    for key, n in items:
+        out[key] = out.get(key, 0.0) + n
+    return cast("Counter[Key]", Counter({k: v for k, v in out.items() if v > 0}))
+
+
+def _gc10(lo: int, hi: int) -> tuple[int, int]:
+    """skiver's GC bin as the 10 % bin `generate.gc_bin` labels reads with."""
+    if lo // 10 != (hi - 1) // 10:
+        raise ValueError(f"GC bin [{lo}, {hi}) crosses a 10 % boundary, so it cannot be pooled into a 10 % bin")
+    return (lo // 10 * 10, lo // 10 * 10 + 10)
+
+
+def skiver_marginals(a: SkiverAnalyze) -> dict[str, CountTable]:
+    """skiver's rate marginals as head-E-shaped tables, at the rate skiver *reports* (plan §5.6, phase 6).
+
+    `summary_phred.csv` and `summary_gc_content.csv` carry a per-Q/per-bin Weibull rate beside scan counts whose
+    ratio is a hazard, so their counts are rebuilt as (matches, errors) at the reported rate over the same
+    exposure; the GC bins are pooled into the 10 % bins `generate.gc_bin` uses. `summary_read_position.csv` has
+    no fitted rate, so its own counts stand: the exposure at position p is the values that survived to p, and
+    the ratio is the error rate there *given survival*, which is the per-base rate when errors do not cluster.
+
+    First-error stopping itself cannot be emulated from a per-base table, which has no value grouping, so the
+    comparison is of rates (this is the "otherwise compare rates" case of the phase 6 evidence check).
+    """
+
+    def table(name: str, field: str, rows: Iterable[tuple[Hashable, float, float]]) -> CountTable:
+        items = (((k, op), n) for k, rate, e in rows for op, n in (("=", e * (1 - rate)), ("!", e * rate)))
+        return CountTable(f"skiver_analyze:{name}", (field, "op"), "base", True, _counts(items), {"k": a.k, "v": a.v})
+
+    out = {
+        "phred": table("phred", "q", ((b.lo, b.per_base_error_rate, b.num_correct + b.num_error) for b in a.phred)),
+        "gc_content": table(
+            "gc_content",
+            "gc",
+            ((_gc10(b.lo, b.hi), b.per_base_error_rate, b.num_correct + b.num_error) for b in a.gc_content),
+        ),
+    }
+    for name, field, start in (("read_position_start", "pos_start", True), ("read_position_end", "pos_end", False)):
+        rows = [r for r in a.read_position if r.from_start is start]
+        out[name] = table(
+            name,
+            field,
+            ((r.index, r.num_error / n, float(n)) for r in rows if (n := r.num_correct + r.num_error)),
+        )
+    return out
+
+
+def _trinucleotide(t: CountTable) -> Counter[Key]:
+    """(trinucleotide context, op) error counts, the table's context trimmed to skiver's one base each side.
+
+    An insertion row is keyed at its insertion point, as skiver keys it: the table centres the row on the
+    template base *after* the insertion, so its trinucleotide is (previous base, "-", that base).
+    """
+    left, right = t.meta.get("flank", (0, 0))
+    if left < 1 or right < 1:
+        raise ValueError(f"{t.source}: needs one flanking base each side to compare with skiver's spectrum")
+    ci, oi = t.fields.index("context"), t.fields.index("op")
+    return _counts(
+        (
+            ((s[left - 1] + "-" + s[left] if str(k[oi]).startswith("-") else s[left - 1 : left + 2], k[oi]), n)
+            for k, n in t.counts.items()
+            if k[oi] != "=" and (s := str(k[ci]))
+        )
+    )
+
+
+def spectrum(a: SkiverAnalyze, t: CountTable, min_count: float = 0.0) -> dict[str, Any]:
+    """`summary_error_spectrum.csv` against a truth-bearing table: shares of the error mass, no exposure.
+
+    Restricted to the ops both label (`pe-overlap` identifies substitutions only) and to trinucleotide context,
+    which is all skiver reports; a wider table's context is trimmed to it.
+    """
+    sk = _counts(((skiver_analyze.context(r.op, r.prev_base, r.next_base), r.op), float(r.total)) for r in a.spectrum)
+    ours = _trinucleotide(t)
+    ops = {str(k[1]) for k in sk} & {str(k[1]) for k in ours}
+    keys = sorted(
+        (k for k in sk.keys() | ours.keys() if str(k[1]) in ops and sk.get(k, 0.0) + ours.get(k, 0.0) >= min_count),
+        key=str,
+    )
+    if not keys:
+        raise ValueError(f"{t.source} and summary_error_spectrum.csv share no error operations")
+    na, nb = (np.array([c.get(k, 0.0) for k in keys]) for c in (sk, ours))
+    pa, pb = na / na.sum(), nb / nb.sum()
+    return {
+        "sources": ["skiver_analyze:spectrum", t.source],
+        "ops": sorted(ops),
+        "keys": [f"{c}:{op}" for c, op in keys],
+        "coverage": [float(n.sum() / sum(c.values())) for n, c in ((na, sk), (nb, ours))],
+        "tv": float(0.5 * np.abs(pa - pb).sum()),
+        "r": float(np.corrcoef(pa, pb)[0, 1]) if len(keys) > 1 else 1.0,
+        "shares_a": pa.tolist(),
+        "shares_b": pb.tolist(),
+    }
+
+
+def _hazard(a: SkiverAnalyze, t: CountTable) -> dict[str, Any]:
+    """skiver's fitted rate, Weibull and op proportions beside the table's own, as `fit.kmer.hazard` carries them.
+
+    skiver's hazard is over positions inside a k-mer value, an exposure a read table cannot reproduce, and
+    beta < 1 is clustering default mode does not identify (§6.2), so the two are reported side by side rather
+    than compared.
+    """
+    oi = t.fields.index("op")
+    n = sum(t.counts.values())
+    kinds = {"substitution": 0.0, "insertion": 0.0, "deletion": 0.0}
+    for k, c in t.counts.items():
+        op = str(k[oi])
+        if op != "=":
+            kinds["insertion" if op.startswith("-") else "deletion" if op.endswith("-") else "substitution"] += c
+    errors = sum(kinds.values())
+    r = a.error_rate
+    return {
+        "skiver_per_base_error_rate": r.per_base_error_rate,
+        "skiver_mean_hazard_rate": r.mean_hazard_rate,
+        "skiver_weibull": [r.lambda_, r.beta],
+        "skiver_op_proportions": {
+            "substitution": r.substitution_error_proportion,
+            "insertion": r.insertion_error_proportion,
+            "deletion": r.deletion_error_proportion,
+        },
+        "table_rate": errors / n if n else 0.0,
+        "table_op_proportions": {k: (v / errors if errors else 0.0) for k, v in kinds.items()},
+        "clustering": "not comparable: skiver's hazard is per value position, and beta is clustering no mode here fits",
+    }
+
+
+def skiver_evidence(a: SkiverAnalyze, t: CountTable, min_exposure: float = 100) -> dict[str, Any]:
+    """Every marginal skiver reports, recomputed from a truth-bearing table (plan phase 6, evidence check).
+
+    Tests skiver's evidence independently of the `kmer` fitters: the same reads seen through `pe-overlap` or
+    `reference` truth should reproduce skiver's P(error | Q), position curves, GC curve and error spectrum.
+    Indels are kept on both sides, so against a substitutions-only table (`pe-overlap`) skiver's rates carry
+    indel errors the table cannot see; `support` and `coverage` record what each comparison stood on. A
+    marginal with no shared values is reported as `skipped` rather than failing the whole report.
+    """
+    out: dict[str, Any] = {}
+    for name, m in skiver_marginals(a).items():
+        try:
+            out[name] = evidence(m, t, (m.fields[0],), min_exposure, indels=True)
+        except ValueError as e:
+            out[name] = {"skipped": str(e)}
+    try:
+        out["spectrum"] = spectrum(a, t)
+    except ValueError as e:
+        out["spectrum"] = {"skipped": str(e)}
+    out["hazard"] = _hazard(a, t)
+    return out
 
 
 def models(a: ErrorModelSpec, b: ErrorModelSpec, table: CountTable, by: str = "q") -> dict[str, Any]:
@@ -126,6 +293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--max-pairs", type=int)
     p.add_argument("--max-reads", type=int)
     p.add_argument("--mask-alt-freq", type=float, help="mask sites with a non-reference allele at this frequency")
+    p.add_argument("--skiver", type=Path, metavar="PREFIX", help="`skiver analyze -o` prefix on the same reads")
     args = p.parse_args(argv)
     a, b = spec_io.load(args.overlap_spec), spec_io.load(args.reference_spec)
     # One window for both tables, wide enough for both specs' head E.
@@ -153,6 +321,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "evidence": evidence(overlap, reference, args.by, args.min_exposure),
         "models": {"reference_rows": models(a, b, reference), "overlap_rows": models(a, b, overlap)},
     }
+    if args.skiver is not None:
+        analyze = skiver_analyze.read_analyze(args.skiver)
+        report["skiver"] = {
+            name: skiver_evidence(analyze, t, args.min_exposure)
+            for name, t in (("overlap", overlap), ("reference", reference))
+        }
     args.output.write_text(json.dumps(report, indent=2))
     e = report["evidence"]
     print(json.dumps({k: e[k] for k in ("rate_a", "rate_b", "excess", "coverage")}))

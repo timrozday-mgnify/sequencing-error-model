@@ -1002,7 +1002,30 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
       in the code with the upgrade path (a curvature penalty as in `error._walk`).
 
   Head Q uses the phase 2 FASTQ fitters.
-- **Evidence check.** On the same reads, tabulate from `pe-overlap` and `reference` tuples the marginals skiver reports: spectrum in trinucleotide context, P(error | Q), read-position curve, GC, and hazard/clustering. Use skiver's counting conventions where they can be emulated (§5.6; e.g. first-error stopping for P(error | Q)), otherwise compare rates. Compare with skiver's CSVs through `compare.py`. This tests skiver's evidence independently of the `kmer` fitters.
+- ✓ **Evidence check** (`compare.skiver_evidence`, `--skiver` on the `compare` CLI). The marginals skiver reports,
+  recomputed from `pe-overlap` and `reference` tuples of the same reads: P(error | Q), both read-position curves,
+  GC, the trinucleotide spectrum, and skiver's hazard beside the table's own rate.
+  - **Conventions.** First-error stopping cannot be emulated from a per-base table, which has no value grouping,
+    so this is the "otherwise compare rates" case. `summary_phred.csv` and `summary_gc_content.csv` are read at
+    their reported Weibull rate, not their scan counts, whose ratio is a hazard (§5.6); their counts are rebuilt
+    as (matches, errors) at that rate over the same exposure. `summary_read_position.csv` has no fitted rate, so
+    its own counts stand: at position p the exposure is the values that survived to p, so the ratio is the error
+    rate there given survival, which is the per-base rate when errors do not cluster. skiver's 5 % GC bins are
+    pooled into the 10 % bins `generate.gc_bin` labels reads with. Indels are kept on both sides, so against
+    `pe-overlap` skiver's rates carry indel errors the overlap cannot see; every comparison records its `support`
+    and the exposure share it stood on. A marginal with no shared values is reported, not raised.
+  - **The spectrum** is compared as shares of the error mass (skiver reports no exposure for it), on the ops both
+    sources label and in trinucleotide context, which is all skiver reports; a wider table's context is trimmed.
+    An insertion row is rekeyed at its insertion point, (previous base, "-", the base it precedes), because the
+    table centres it on the base *after* the insertion and skiver keys it on the gap.
+  - **The hazard is not comparable** and is reported side by side: skiver's hazard is per value position, an
+    exposure a read table cannot reproduce, and beta < 1 is clustering no mode here fits (§6.2), as in
+    `fit.kmer.hazard`.
+  - Test (`tests/test_compare.py`): skiver marginals synthesised from a 800-read `reference` table's own truth
+    (the spectrum walked independently off the alignments, the GC curve written as skiver's two 5 % bins at
+    0.8x/1.2x the rate) come back with every rate ratio at 1 within 1e-4 and the spectrum at TV < 1e-9, so a
+    misaligned key, bin or insertion context fails sharply; the CLI carries the section through on the v0.3.2
+    fixture.
 - **Model check.** Compare the `kmer` default spec with the `pe-overlap` and `reference` specs per component (context log-odds, centre-Q curve, position, op composition), on held-out likelihood of their tuples, and on phase 3 metrics of generated reads.
 - **Synthetic recovery.** Generate, run skiver (released binary), profile the FASTQ, fit, compare with the spec. On clonal reads, run with skiver's outlier filter on (default) and off (`--use-all`), and report the keys, contexts and error mass the filter removes when there is no variation to remove.
 - **Exit:**
