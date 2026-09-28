@@ -95,13 +95,27 @@ def example_spec() -> ErrorModelSpec:
     )
 
 
-def _tuples(model: ErrorModelSpec, templates: Sequence[str], reads: Sequence[Read], mates: Sequence[int]) -> CountTable:
-    """Head E tuples wide enough for both heads' context and Q windows."""
-    e, q = _flank(model.error_head), _flank(model.quality_head)
-    m = max(model.error_head[0].args[0], model.quality_head[0].args[0])
+def _tuples(
+    model: ErrorModelSpec,
+    templates: Sequence[str],
+    reads: Sequence[Read],
+    mates: Sequence[int],
+    also: ErrorModelSpec | None = None,
+) -> CountTable:
+    """Head E tuples wide enough for both heads' context and Q windows, and for `also`'s heads as well.
+
+    `also` matters when the two specs being compared were fitted with different component sets - a `kmer`
+    default head has no `Homopolymer`, a `pe-overlap` head no indels - so a table sized for one of them would
+    not carry the covariates the other needs.
+    """
+    heads = [h for s in ([model] if also is None else [model, also]) for h in (s.error_head, s.quality_head)]
+    flanks = [_flank(h) for h in heads]
+    flank = (max(f[0] for f in flanks), max(f[1] for f in flanks))
+    m = max(h[0].args[0] for h in heads)
     per_event = indel.split(model.error_head)[1] is not None
-    flank, read_ids = (max(e[0], q[0]), max(e[1], q[1])), model.latent is not None
-    return observations(zip(templates, reads, mates, strict=True), flank, m, per_event=per_event, read_ids=read_ids)
+    return observations(
+        zip(templates, reads, mates, strict=True), flank, m, per_event=per_event, read_ids=model.latent is not None
+    )
 
 
 def cigar_mode(templates: list[str], reads: list[Read], mates: list[int], truth: ErrorModelSpec) -> ErrorModelSpec:
@@ -166,7 +180,7 @@ def compare(
     support of `pe-overlap`."""
     alphabet = np.asarray(truth.quality_alphabet)
     true_reads = generate(truth, templates, mates, rng)
-    table = _tuples(truth, templates, true_reads, mates)
+    table = _tuples(truth, templates, true_reads, mates, fitted)
     n = np.array(list(table.counts.values()), float)
     p_true, p_fit = (
         error.probabilities(indel.split(s.error_head)[0], truth.quality_alphabet, table) for s in (truth, fitted)

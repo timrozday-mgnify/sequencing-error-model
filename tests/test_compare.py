@@ -103,8 +103,13 @@ def test_cli_reports_both_levels(tmp_path: Path) -> None:
     assert bam.main([str(path), str(ref), "--output", str(spec_b), *quality]) == 0
     args = [*fastqs, str(path), str(ref), "--overlap-spec", str(spec_a), "--reference-spec", str(spec_b)]
     skiver = Path(__file__).parent / "fixtures" / "skiver-v0.3.2" / "analyze"
-    assert compare.main([*args, "--output", str(report), "--min-exposure", "10", "--skiver", str(skiver)]) == 0
+    # No `kmer` spec on these reads (no skiver run), so the overlap spec stands in: this checks the plumbing.
+    extra = ["--skiver", str(skiver), "--kmer-spec", str(spec_a), "--generated-reads", "100", "--read-length", "40"]
+    assert compare.main([*args, "--output", str(report), "--min-exposure", "10", *extra]) == 0
     doc = json.loads(report.read_text())
+    assert set(doc["kmer"]) == {"overlap", "reference", "generated"}
+    assert doc["kmer"]["overlap"]["components"]["op"]["tv"] < 1e-12  # the stand-in spec against itself
+    assert doc["kmer"]["generated"]["reference"]["reads"] == 100
     # Different reads, so only the shape of the skiver section is checked here, not agreement.
     for mode in ("overlap", "reference"):
         assert set(doc["skiver"][mode]) == {
@@ -213,3 +218,38 @@ def test_skiver_marginals_recomputed_from_reference_truth() -> None:
     assert {"->A", "A>-"} <= set(s["ops"]), s["ops"]  # the insertion and deletion context conventions are exercised
     assert s["tv"] < 1e-9 and s["r"] > 0.9999, s
     assert found["hazard"]["table_op_proportions"]["substitution"] > 0.5, found["hazard"]
+
+
+def test_components_localise_a_moved_context_effect(tmp_path: Path) -> None:
+    """Identical specs agree everywhere; halving head E's Context term shrinks the context log-odds slope."""
+    truth, rng = recovery.example_spec(), np.random.default_rng(3)
+    genome = "".join(rng.choice(list("ACGT"), size=3000))
+    templates = [genome[s : s + 40] for s in rng.integers(0, len(genome) - 40, 600)]
+    mates = [1, 2] * (len(templates) // 2)
+    reads = gen.generate(truth, templates, mates, rng)
+    table = gen.observations(zip(templates, reads, mates, strict=True), (2, 2), 1, "reference")
+
+    same = compare.components(truth, truth, table, min_exposure=20)
+    assert same["op"]["tv"] < 1e-12 and same["context"]["r"] > 0.9999
+    assert abs(same["context"]["log_odds_slope"] - 1) < 1e-9, same["context"]
+    for field in ("q", "pos_start", "mate"):
+        assert max(abs(r - 1) for r in same[field]["ratio"]) < 1e-9, (field, same[field])
+
+    ctx = next(c for c in truth.error_head if c.name == "Context")
+    half = replace(
+        truth,
+        error_head=tuple(
+            replace(c, params={**c.params, "weights": c.params["weights"] * 0.5}) if c is ctx else c
+            for c in truth.error_head
+        ),
+    )
+    moved = compare.components(truth, half, table, min_exposure=20)
+    # A shrunk effect, but not halved: the per-context marginal carries every context-varying component (here
+    # `Homopolymer` too, unchanged), so the slope reads the whole context shape, not one component's parameters.
+    assert 0.5 < moved["context"]["log_odds_slope"] < 0.95, moved["context"]
+    assert moved["context"]["r"] > 0.9 and moved["context"]["mean_abs_log_ratio"] > 0.02, moved["context"]
+
+    ref = tmp_path / "ref.fa"
+    ref.write_text(f">g\n{genome}\n")
+    doc = compare.generated(truth, truth, ref, 200, 40, q_reads=400)
+    assert abs(doc["scalars"]["rate_ratio"] - 1) < 1e-9 and doc["scalars"]["op_tv"] < 1e-12, doc["scalars"]
