@@ -296,11 +296,12 @@ def read_analyze(prefix: str | Path) -> SkiverAnalyze:
     )
 
 
-def tables(a: SkiverAnalyze) -> list[CountTable]:
+def tables(a: SkiverAnalyze, use_all: bool = False) -> list[CountTable]:
     """The analyze counts as observation tables, with `t` rebased to the value position.
 
     `summary_error_rate.csv` and `survival_rate.csv` are fitted parameters, not counts;
-    they stay on `SkiverAnalyze`. `kvmer.csv` keys failing skiver's outlier filter are dropped.
+    they stay on `SkiverAnalyze`. `kvmer.csv` keys failing skiver's outlier filter are dropped
+    unless `use_all`, which keeps every key, as skiver's own `--use-all` does.
     """
     k, v = a.k, a.v
     scan = "value bases up to and including the first mismatch"
@@ -311,7 +312,7 @@ def tables(a: SkiverAnalyze) -> list[CountTable]:
     ) -> CountTable:
         return CountTable(f"skiver_analyze:{name}", fields, unit, True, count(items), {"k": k, "v": v, **meta})
 
-    passing = [r for r in a.kvmer if r.passes_filter]
+    passing = [r for r in a.kvmer if use_all or r.passes_filter]
     return [
         table("phred", ("q", "op"), "base", (((b.lo, op), n) for b in a.phred for op, n in (("=", b.num_correct), ("!", b.num_error))), exposure=trimmed),
         table("gc_content", ("gc", "op"), "base", ((((b.lo, b.hi), op), n) for b in a.gc_content for op, n in (("=", b.num_correct), ("!", b.num_error))), exposure=trimmed),

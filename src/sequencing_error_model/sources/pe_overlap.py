@@ -43,6 +43,7 @@ from sequencing_error_model.fit import error, quality
 from sequencing_error_model.fit.quality import _BASE, Array
 from sequencing_error_model.generate import Read, _flank, _revcomp, gc_bin
 from sequencing_error_model.observations import CountTable, Key
+from sequencing_error_model.sources import fastq_quality
 from sequencing_error_model.sources.fastq_quality import read_fastq
 from sequencing_error_model.spec import Component, ErrorModelSpec
 
@@ -145,17 +146,14 @@ def collect(
 
     The mismatch cap is loose on purpose: a tight one drops exactly the error-rich pairs and biases rates down.
     """
-    ev, (left, right) = Evidence(m, flank), flank
+    ev = Evidence(m, flank)
     # ponytail: Python loop per base; move row building to numpy if real runs are too slow.
     for r1, q1, r2, q2 in pairs:
         ev.stats.pairs += 1
         reads, qs = (r1.upper(), r2.upper()), (list(q1), list(q2))
         ev.alphabet.update(qs[0], qs[1])
         for mate, (seq, q) in enumerate(zip(reads, qs, strict=True), 1):
-            padded = "." * left + seq + "." * right
-            for p in range(len(seq)):
-                lags = tuple(q[p - k] if p >= k else None for k in range(1, m + 1))
-                ev.quality[(*lags, p + 1, len(seq) - p, mate, padded[p : p + left + right + 1], q[p])] += 1
+            ev.quality.update(fastq_quality.quality_rows(seq, q, mate, m, flank))
         s, indel = place(reads[0], reads[1], min_overlap, max_mismatch, max_shift, min_gain, max_rival)
         if s is None or indel:
             ev.stats.no_overlap += s is None
@@ -275,9 +273,7 @@ def fit(
     assert error_head is not None
 
     lags = [f"q-{i}" for i in range(1, ev.m + 1)]
-    q_table = CountTable(
-        "pe-overlap:quality", (*lags, "pos_start", "pos_end", "mate", "context", "q"), "base", False, ev.quality
-    )
+    q_table = CountTable("pe-overlap:quality", fastq_quality.quality_fields(ev.m), "base", False, ev.quality)
     q_lags = lags[: Component(quality_tokens[0]).args[0]]
     quality_head = quality.fit(
         replace(q_table.marginal(*q_lags, "pos_start", "pos_end", "mate", "context", "q"), meta={"flank": ev.flank}),

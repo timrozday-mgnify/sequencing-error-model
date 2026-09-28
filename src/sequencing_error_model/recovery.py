@@ -44,7 +44,8 @@ from sequencing_error_model.generate import (
     realign,
 )
 from sequencing_error_model.observations import CountTable, Key
-from sequencing_error_model.sources import bam
+from sequencing_error_model.sources import bam, fastq_quality, skiver_analyze
+from sequencing_error_model.sources import kmer as kmer_source
 from sequencing_error_model.spec import Component, ErrorModelSpec
 
 Mode = Callable[[list[str], list[Read], list[int], ErrorModelSpec], ErrorModelSpec]
@@ -647,6 +648,150 @@ def aligner_bias(
     }
 
 
+_ERROR_TOKENS = ("QualityWindow(0)", "Context(1,1)", "Position(4)", "Strand", "GC(3)")
+_QUALITY_TOKENS = ("QualityMarkov(1)", "Position(48)", "Context(1,1)")
+
+
+def run_skiver(skiver: str, reads: Path, prefix: Path, k: int, v: int, c: int, extra: Sequence[str] = ()) -> None:
+    """`skiver analyze` from a released binary, writing `<prefix>.*.csv`."""
+    cmd = [skiver, "analyze", str(reads), "-k", str(k), "-v", str(v), "-c", str(c), "-o", str(prefix), *extra]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"no skiver binary at {skiver!r}: --skiver takes a path to a released binary") from e
+
+
+def skiver_recovery(
+    truth: ErrorModelSpec,
+    skiver: str,
+    workdir: Path,
+    n_reads: int = 20_000,
+    read_length: int = 150,
+    genome_length: int = 20_000,
+    k: int = 11,
+    v: int = kmer_source.GOOD_V,
+    c: int = 8,
+    seed: int = 0,
+    use_all: bool = False,
+    extra: Sequence[str] = (),
+    q_reads: int = 20_000,
+    error_tokens: Sequence[str] = _ERROR_TOKENS,
+    quality_tokens: Sequence[str] = _QUALITY_TOKENS,
+) -> tuple[ErrorModelSpec, dict[str, Any]]:
+    """The `kmer` default-mode loop end to end (plan phase 6): generate clonal reads from `truth`, run a released
+    `skiver analyze` on them, profile the same FASTQ, fit, and compare with `truth` on held-out reads.
+
+    Reads are single-end slices of one random genome, so coverage is clonal and there is no variation for
+    skiver's outlier filter to remove; `outlier_filter_cost` is what quantifies what it removes anyway. Mates
+    are all 1: default mode identifies no mate effect (§6.2).
+
+    `extra` goes to `skiver analyze` verbatim. Lesson §3.7 is that synthetic recovery wants `--use-all` (the
+    filter hides generated errors) and the fork's `-l 0`; `use_all` covers the first, and the second is a flag
+    of the caller's binary, so pass it through `extra` rather than having this guess at it.
+
+    The fitted quality alphabet must equal the truth's: `compare` indexes both heads with the truth's alphabet,
+    so a Q the generated reads never produced would silently misindex. That is raised, not worked around.
+    """
+    rng = np.random.default_rng(seed)
+    genome = "".join(rng.choice(list("ACGT"), size=genome_length))
+    starts = rng.integers(0, genome_length - read_length, n_reads)
+    templates = [genome[s : s + read_length] for s in starts]
+    mates = [1] * n_reads
+    reads = generate(truth, templates, mates, rng)
+    workdir.mkdir(parents=True, exist_ok=True)
+    fastq, prefix = workdir / "reads.fastq", workdir / "analyze"
+    fastq.write_text("".join(f"@r{i}\n{r.sequence}\n+\n{r.quality}\n" for i, r in enumerate(reads)))
+    run_skiver(skiver, fastq, prefix, k, v, c, ["--use-all", *extra] if use_all else extra)
+    a = skiver_analyze.read_analyze(prefix)
+    flank, m = bam.window(error_tokens, quality_tokens)
+    profile = fastq_quality.profile_fastq(fastq, order=m, flank=flank)
+    q_table = fastq_quality.quality_table(fastq, m=m, flank=flank)
+    fitted = kmer_source.fit(
+        a,
+        profile,
+        q_table,
+        error_tokens,
+        quality_tokens,
+        {"mode": "kmer", "skiver_build": "default", "sources": ["synthetic-recovery"]},
+        use_all=use_all,
+        flank=flank,
+    )
+    if tuple(fitted.quality_alphabet) != tuple(truth.quality_alphabet):
+        raise ValueError(
+            f"the generated reads carry qualities {list(fitted.quality_alphabet)} but the truth has "
+            f"{list(truth.quality_alphabet)}; generate more reads so every Q appears"
+        )
+    held = [genome[s : s + read_length] for s in rng.integers(0, genome_length - read_length, max(n_reads // 2, 2))]
+    report = compare(truth, fitted, held, [1] * len(held), rng, q_reads=q_reads)
+    doc = {
+        "reads": n_reads,
+        "read_length": read_length,
+        "k": k,
+        "v": v,
+        "c": c,
+        "use_all": use_all,
+        "skiver_args": list(extra),
+        "outlier_filter": kmer_source.filter_stats(a),
+        "skiver_error_rate": a.error_rate.per_base_error_rate,
+        "skiver_beta": a.error_rate.beta,
+        "failures": report.failures(),
+        **vars(report),
+    }
+    return fitted, doc
+
+
+def outlier_filter_cost(
+    truth: ErrorModelSpec,
+    skiver: str,
+    workdir: Path,
+    n_reads: int = 20_000,
+    read_length: int = 150,
+    genome_length: int = 20_000,
+    k: int = 11,
+    v: int = kmer_source.GOOD_V,
+    c: int = 8,
+    seed: int = 0,
+    extra: Sequence[str] = (),
+    q_reads: int = 20_000,
+) -> dict[str, Any]:
+    """The clonal cost of skiver's outlier filter (plan phase 6 exit): the same reads analyzed with the filter on
+    (skiver's default) and off (`--use-all`), fitted both ways, and compared per head E component.
+
+    Clonal reads carry no variation for the filter to remove, so whatever it removes is cost. `filter_stats`
+    counts the keys, consensus values, observations and error mass it drops; `compare.components` says where in
+    head E that lands. skiver is run twice on the same FASTQ, not once: `--use-all` changes its summary CSVs too,
+    and those are what set the fitted level (§5.6).
+    """
+    from sequencing_error_model import compare as comparison  # local: `compare` imports this module
+
+    fit_args = dict(
+        n_reads=n_reads,
+        read_length=read_length,
+        genome_length=genome_length,
+        k=k,
+        v=v,
+        c=c,
+        seed=seed,
+        extra=extra,
+        q_reads=q_reads,
+    )
+    specs, runs = {}, {}
+    for name, use_all in (("filtered", False), ("use_all", True)):
+        specs[name], runs[name] = skiver_recovery(truth, skiver, workdir / name, use_all=use_all, **fit_args)  # type: ignore[arg-type]
+    rng = np.random.default_rng(seed + 1)
+    genome = "".join(rng.choice(list("ACGT"), size=genome_length))
+    n = max(n_reads // 2, 2)
+    templates = [genome[s : s + read_length] for s in rng.integers(0, genome_length - read_length, n)]
+    mates = [1] * n
+    table = _tuples(specs["filtered"], templates, generate(truth, templates, mates, rng), mates, specs["use_all"])
+    return {
+        "runs": runs,
+        "removed": runs["filtered"]["outlier_filter"],
+        "components": comparison.components(specs["filtered"], specs["use_all"], table, indels=True),
+        "rate_ratio": {name: runs[name]["scalars"]["rate_ratio"] for name in runs},
+    }
+
+
 def paired_draw(read_length: int, insert_mean: float, insert_sd: float, genome_length: int = 100_000) -> Draw:
     """A `draw` of interleaved mate 1, mate 2 templates from `generate.fragments` on a random genome."""
 
@@ -673,7 +818,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--error-rate-scale", type=float, default=1.0, help="with --aligner")
     p.add_argument("--preset", default="map-ont", help="minimap2 preset, with --aligner minimap2")
     p.add_argument("--unclip", action="store_true", help="with --aligner: realign soft-clipped reads end to end")
+    p.add_argument("--skiver", help="path to a released skiver binary: run the `kmer` default-mode loop instead")
+    p.add_argument("--filter-cost", action="store_true", help="with --skiver: the outlier filter's clonal cost")
+    p.add_argument("--use-all", action="store_true", help="with --skiver: run skiver with --use-all")
+    p.add_argument("-k", type=int, default=11, help="with --skiver")
+    p.add_argument("-v", type=int, default=kmer_source.GOOD_V, help="with --skiver")
+    p.add_argument("-c", type=int, default=8, help="with --skiver: FracMinHash denominator")
+    p.add_argument("--read-length", type=int, default=150, help="with --skiver")
+    p.add_argument("--skiver-arg", action="append", default=[], metavar="ARG", help="extra `skiver analyze` argument")
     args = p.parse_args(argv)
+    if args.skiver:
+        truth = spec_io.load(args.spec) if args.spec else example_spec()
+        shared: dict[str, Any] = dict(
+            n_reads=args.reads,
+            read_length=args.read_length,
+            genome_length=args.genome_length,
+            k=args.k,
+            v=args.v,
+            c=args.c,
+            seed=args.seed,
+            extra=args.skiver_arg,
+        )
+        loop: dict[str, Any]
+        with tempfile.TemporaryDirectory() as tmp:
+            if args.filter_cost:
+                loop = outlier_filter_cost(truth, args.skiver, Path(tmp), **shared)
+                summary = {"removed": loop["removed"], "rate_ratio": loop["rate_ratio"]}
+            else:
+                _, loop = skiver_recovery(truth, args.skiver, Path(tmp), use_all=args.use_all, **shared)
+                summary = {"failures": loop["failures"], **loop["scalars"]}
+        if args.output:
+            args.output.write_text(json.dumps(loop, indent=2) + "\n")
+        print(json.dumps(summary, indent=2))
+        return 1 if loop.get("failures") else 0
     if args.mask_cost or args.aligner:
         truth = spec_io.load(args.spec) if args.spec else example_spec()
         doc: dict[str, Any]
