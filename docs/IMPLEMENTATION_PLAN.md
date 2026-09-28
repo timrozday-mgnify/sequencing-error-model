@@ -1083,9 +1083,43 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     draws 150 bp reads from it; the v guard raises and warns; unidentifiable tokens are refused; and the whole
     loop, including the filter-cost double run, runs against a stub binary that hands back that fixture, which
     checks the plumbing while the real numbers come from the `kmer-recovery` workflow against a released binary.
+  - ✓ **First real run** (2026-09-28), 40,000 training reads (held-out 20,000), v = 13, k = 11, c = 8, seed 0,
+    150 bp single-end clonal reads from the built-in example spec. The GitHub release ships a linux-amd64 binary
+    only, so this ran against an **arm64 build of unmodified upstream `v0.3.2` from source at the tag**; the
+    committed fixtures still come from CI's x86 binary, which counts slightly differently, and skiver's exposure
+    counts vary run to run (§6.3), so these are one run's numbers. 17 min for the loop, 32 min for the filter
+    cost, against 38 min for the loop alone on a 4-vCPU runner.
+
+    | | truth | fitted | |
+    |---|---|---|---|
+    | per-base error rate | 7.029 % | 6.928 % | ratio **0.986** |
+    | op composition | | | TV 0.027, KL 0.013 |
+    | rate by reported Q (2 / 12 / 23 / 37) | 49.1 / 25.0 / 9.13 / 2.70 % | 44.6 / 24.6 / 9.48 / 2.81 % | Q2 9 % low, the rest within 4 % |
+    | Q lag-1 autocorrelation | 0.590 | 0.597 | |
+    | Q by position | | | TV at most 0.016 |
+
+    `failures` is empty: the phase 2 tolerances hold. `skiver`'s own reported rate is 0.0539 against the truth's
+    0.0703, 23 % low, which is the hazard convention (§5.6) and not a fit error - marginal matching takes the
+    level from `summary_phred.csv`'s Weibull rate, and lands at 0.986. Marginal matching clipped 11 cells
+    (0.05 % of the exposure) where it wanted more errors than bases; the warning names the share.
+  - ✓ **The outlier filter's clonal cost is negative here** (`--filter-cost`, same reads, two skiver runs). The
+    filter removes 514 of 5,094 keys, 477 of 4,907 consensus values, 44,676 of 535,047 observations and 11,210
+    of 141,859 error mass (7.9 %) - on clonal reads, so every one of those is a false positive, and the fork's
+    lesson 7 (the filter hides generated errors) is reproduced in the kvmer table. It does not carry into the
+    fitted spec: **the filtered fit passes (rate ratio 0.986) and `--use-all` fails** (1.073, and by reported Q
+    [0.98, 1.07, 1.14, 1.14]).
+    - Per head E component (`compare.components` on 3.0 M rows, `use_all` over `filtered`), the difference is a
+      level shift, not a shape change: q 1.078-1.096, `pos_start` / `pos_end` median 1.093 (1.014-1.098), GC
+      1.082-1.093, strand and mate 1.088, the context log-odds slope 1.025 at r = 0.998 with mean |log ratio|
+      0.062, and op shares TV 0.0045 over 96 contexts.
+    - **Why the level moves at all**: `--use-all` changes skiver's summary CSVs too (its per-base rate 0.0593
+      against 0.0539, beta 0.973 against 0.993), and those are what set the fitted level. That is exactly why the
+      cost needs two skiver runs rather than one run read twice (§5.6).
+    - So at this depth and error rate, keeping the filter on is nearer the truth, and its cost is precision (the
+      dropped observations), not accuracy. A higher-depth or lower-error run is what would change that.
 - **Exit:**
-  - the synthetic loop passes at v=13 within the phase 2 tolerances, and the documented failure at small v is reproduced as a guarded error or warning;
-  - the outlier filter's clonal cost is quantified per head E component;
+  - ✓ the synthetic loop passes at v=13 within the phase 2 tolerances (rate ratio 0.986, op TV 0.027, `failures` empty; run above), and the documented failure at small v is reproduced as a guarded error or warning (`sources/kmer._check_v`);
+  - ✓ the outlier filter's clonal cost is quantified per head E component (run above: a 1.08-1.10 level shift with the filter off, no shape change, and the filtered fit is the one that passes);
   - on the phase 5 near-clonal real datasets, skiver's marginals and the `kmer` spec are compared with both other modes on shared support, and the report states agreement per component, with expected gaps (PCR errors vs `pe-overlap`) given as estimates;
   - reported, not blocking: the default-mode model's held-out likelihood and marginals vs ReSeq (Illumina) and Badread (long reads) profiles trained on the aligned reads (§4.4, risk 2).
 
