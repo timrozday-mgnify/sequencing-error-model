@@ -470,6 +470,15 @@ def run_aligner(aligner: str, reference: Path, reads: Path, sam: Path, preset: s
         subprocess.run(cmd, check=True, stdout=out, stderr=subprocess.PIPE)
 
 
+def scale_error_rate(truth: ErrorModelSpec, scale: float) -> ErrorModelSpec:
+    """`truth` with every non-match logit of head E's first component shifted by `log(scale)`, which is exactly
+    what `generate(error_rate_scale=)` does - so the scaled spec is the truth throughout, not a scaled fit."""
+    head0 = truth.error_head[0]
+    shift = np.r_[0.0, np.full(_K - 1, np.log(scale))]
+    scaled = (replace(head0, params={**head0.params, "bias": head0.params["bias"] + shift}), *truth.error_head[1:])
+    return replace(truth, error_head=scaled)
+
+
 def aligner_bias(
     truth: ErrorModelSpec,
     aligner: str,
@@ -503,10 +512,7 @@ def aligner_bias(
     (seeding, bands, clipping); `edits_hidden` and `observable_rate_ratio` size what even the optimal alignment
     doesn't show."""
     lengths = lengths or ALIGNER_READS[aligner]
-    head0 = truth.error_head[0]
-    shift = np.r_[0.0, np.full(_K - 1, np.log(error_rate_scale))]
-    scaled = (replace(head0, params={**head0.params, "bias": head0.params["bias"] + shift}), *truth.error_head[1:])
-    truth = replace(truth, error_head=scaled)
+    truth = scale_error_rate(truth, error_rate_scale)
 
     rng = np.random.default_rng(seed)
     genome = "".join(rng.choice(list("ACGT"), size=genome_length))

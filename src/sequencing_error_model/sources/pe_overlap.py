@@ -251,6 +251,11 @@ def fit(
     trade the global L2 on `QualityWindow` for a curvature prior across Q. On a 20,000-pair HiSeq-like simulation
     they cut mean |log2(fitted / true rate)| over Q >= 30 from 1.54 to 0.97 (plan, phase 4).
     """
+    if not ev.certain and not ev.disputed:
+        raise ValueError(
+            f"no pair overlapped ({ev.stats.no_overlap} of {ev.stats.pairs} placed nowhere), so there is no "
+            "overlap evidence to fit: `pe-overlap` needs an insert shorter than twice the read length"
+        )
     alphabet, groups = tuple(sorted(ev.alphabet)), list(ev.disputed.items())
     first = np.full(len(groups), 0.5)
     error_head: tuple[Component, ...] | None = None
