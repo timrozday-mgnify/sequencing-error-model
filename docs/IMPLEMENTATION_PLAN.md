@@ -958,7 +958,22 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
       a 1.6 % per-base rate, so the fitted intercept is low by that factor; the test asserts the shortfall equals
       the truth's dropped mass, so context shape stays checked. Marginal matching against `summary_phred.csv`
       sets the level, so this is not corrected in the kvmer fit itself.
-  - centre-Q term by marginal matching against `summary_phred.csv` under the FASTQ exposure;
+  - ✓ centre-Q term by marginal matching against `summary_phred.csv` under the FASTQ exposure (`fit/kmer.py`:
+    `rake`, `fit_centre_q`). IPF over the (observed context, centre Q) cells of `fastq_quality:context`: cell
+    error counts start at the product of the two marginals and are raked until they sum to `summary_phred.csv`'s
+    rate per Q and to the kvmer context head's rate per context, then each cell's error mass is split over the
+    ops by that context's composition and the whole head is refitted over the real alphabet. The level comes
+    from `summary_phred.csv` alone (the context margin is rescaled to its total), which is what corrects the
+    kvmer truncation bias above. Q bins skiver reports no rate for, and N centre bases, are dropped with a
+    warning naming the exposure share; `error.fit`'s `smooth` is what carries a dropped bin. The Q rate used is
+    skiver's per-Q Weibull rate, not its `num_error / (num_correct + num_error)`, which is a hazard (§5.6).
+    - `l2` defaults to 1e-3 here: the raked counts are expected values, not draws, so the usual shrinkage pulled
+      the fit off the margins it exists to reproduce (a few percent at the extreme Q, where error mass is thinnest).
+    - Test: with a log-additive truth whose low qualities and hard contexts co-occur, and a context head handed in
+      18 % low, the fit reproduces the Q margin to 1 %, restores the overall level to 1 %, matches the context
+      margin at r > 0.9999, and lands every cell's rate within 0.6 % on average; multiplying the two marginals
+      into each cell instead is 51 % off overall and 131 % off on the correlated cells. Log-additivity is the
+      assumption this rests on, and no test of it is possible in default mode (§6.1).
   - position curve, strand, GC, Weibull passthrough.
 
   Head Q uses the phase 2 FASTQ fitters.

@@ -126,6 +126,120 @@ def test_recovers_context_through_the_latent_position() -> None:
     assert abs(share[1] / share[0] - 1) < 0.15, share
 
 
+REAL_ALPHABET = (2, 12, 23, 37)
+
+
+def truth_with_q() -> tuple[Component, ...]:
+    """The same context effects, plus a centre-Q effect on every error category."""
+    intercept, context = truth()
+    window = np.zeros((1, len(REAL_ALPHABET) + 1, K))
+    window[0, :4] = np.outer([2.0, 1.0, 0.0, -1.0], np.r_[0, np.ones(K - 1)])
+    return Component("QualityWindow(0)", {"bias": intercept.params["bias"], "window": window}), context
+
+
+def exposure_table(n_reads: int, seed: int, length: int = 60) -> CountTable:
+    """A FASTQ-like (observed context, centre Q) exposure where low Q and the hard context co-occur.
+
+    Qualities are drawn low after a G, which is where `truth` puts its extra substitutions, so a model that
+    multiplies the two marginals into every cell over-counts those cells.
+    """
+    rng = np.random.default_rng(seed)
+    counts: Counter[Key] = Counter()
+    for _ in range(n_reads):
+        padded = ".." + "".join(rng.choice(list("ACGT"), size=length)) + ".."
+        for t in range(length):
+            hard = padded[t + 1] == "G"
+            q = rng.choice(REAL_ALPHABET, p=[0.30, 0.30, 0.25, 0.15] if hard else [0.05, 0.15, 0.30, 0.50])
+            counts[(padded[t : t + 5], int(q))] += 1
+    return CountTable("fastq_quality:context", ("context", "q"), "base", False, counts, {"flank": list(FLANK)})
+
+
+def cells(exposure: CountTable) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """(count, context index, Q index, contexts) in `exposure.counts` order."""
+    contexts: dict[str, int] = {}
+    keys = [(str(c), int(str(q))) for c, q in exposure.counts]
+    ctx = np.array([contexts.setdefault(c, len(contexts)) for c, _ in keys])
+    q = np.array([REAL_ALPHABET.index(v) for _, v in keys])
+    return np.array(list(exposure.counts.values()), float), ctx, q, list(contexts)
+
+
+def pooled_context_head(
+    true: Sequence[Component], exposure: CountTable, n: np.ndarray, ctx: np.ndarray, contexts: list[str], level: float
+) -> tuple[Component, ...]:
+    """What `kvmer.csv` gives: P(op | context) with Q pooled over the exposure, at `level` times the true rate.
+
+    Pooling is what makes marginal matching necessary: the context margin has no Q in it, and the exposure's
+    Q tilt per context is exactly the overlap the two margins would otherwise double-count. `level` stands in
+    for the truncation bias of a kvmer-only fit (§6.2).
+    """
+    per_context = np.zeros((len(contexts), K))
+    np.add.at(per_context, ctx, n[:, None] * error.probabilities(true, REAL_ALPHABET, exposure))
+    counts: Counter[Key] = Counter()
+    for c, row in enumerate(per_context):
+        counts[(contexts[c], kmer.DUMMY_Q, "=")] = row[0] + (1 - level) * row[1:].sum()
+        for cat, errors in enumerate(row[1:], start=1):
+            if errors > 0:
+                counts[(contexts[c], kmer.DUMMY_Q, kmer._op(cat, contexts[c][FLANK[0]]))] = level * errors
+    table = CountTable("kvmer-like", ("context", "q", "op"), "base", True, counts, {"flank": list(FLANK)})
+    return error.fit(table, ["QualityWindow(0)", "Context(2,2)"], (kmer.DUMMY_Q,), l2=1e-3)
+
+
+def rate_per_cell(components: Sequence[Component], exposure: CountTable) -> np.ndarray:
+    rate: np.ndarray = 1 - error.probabilities(components, REAL_ALPHABET, exposure)[:, 0]
+    return rate
+
+
+def group_rate(n: np.ndarray, rate: np.ndarray, key: np.ndarray) -> np.ndarray:
+    return np.bincount(key, n * rate) / np.bincount(key, n)
+
+
+def phred_bins(rates: np.ndarray) -> list[skiver_analyze.RateBin]:
+    """`summary_phred.csv` rows for `REAL_ALPHABET`; only the rate and a non-zero exposure are read."""
+    return [
+        skiver_analyze.RateBin(q, q, float(r), (0.0, 0.0), 1000, 1) for q, r in zip(REAL_ALPHABET, rates, strict=True)
+    ]
+
+
+def test_marginal_matching_reproduces_both_skiver_marginals() -> None:
+    true = truth_with_q()
+    exposure = exposure_table(400, seed=7)
+    n, ctx, q, contexts = cells(exposure)
+    truth_rate = rate_per_cell(true, exposure)
+
+    # skiver's two marginals under this exposure: P(error | Q) from summary_phred.csv, and a context margin
+    # with Q pooled out, 18 % low as a kvmer-only fit leaves it (§6.2).
+    phred = phred_bins(group_rate(n, truth_rate, q))
+    head = pooled_context_head(true, exposure, n, ctx, contexts, level=0.82)
+    fitted = kmer.fit_centre_q(head, phred, exposure, ["QualityWindow(0)", "Context(2,2)"], REAL_ALPHABET)
+
+    got = rate_per_cell(fitted, exposure)
+    # The Q margin is skiver's, and the level with it, despite the context head coming in 18 % low.
+    np.testing.assert_allclose(group_rate(n, got, q), group_rate(n, truth_rate, q), rtol=0.01)
+    assert abs((n @ got) / (n @ truth_rate) - 1) < 0.01
+    # The context margin too, and with both margins right, the joint rate of every cell.
+    by_context = [group_rate(n, r, ctx) for r in (truth_rate, got)]
+    assert np.corrcoef(by_context[0], by_context[1])[0, 1] > 0.99, by_context
+
+    # Raking, not multiplying the two rates into every cell: that double-counts low Q after a G. The truth here
+    # is log-additive, which is the assumption marginal matching rests on and cannot itself test (§6.1).
+    naive = by_context[1][ctx] * group_rate(n, got, q)[q] / ((n @ got) / n.sum())
+    hard = np.array([c[1] == "G" for c in contexts])[ctx] & (q == 0)
+    for label, where in (("all cells", np.ones(len(n), bool)), ("hard context at the lowest Q", hard)):
+        off = [float(np.average(np.abs(r[where] / truth_rate[where] - 1), weights=n[where])) for r in (got, naive)]
+        assert off[0] < 0.02 and off[1] > 0.2, (label, off)
+
+
+def test_warns_about_exposure_it_cannot_match() -> None:
+    """An N centre base or a Q skiver reports no rate for is dropped loudly, not silently."""
+    counts: Counter[Key] = Counter({("ACGTA", 12): 100, ("ACNTA", 12): 5, ("ACGTA", 37): 3})
+    exposure = CountTable("fastq_quality:context", ("context", "q"), "base", False, counts, {"flank": list(FLANK)})
+    phred = [skiver_analyze.RateBin(12, 12, 0.01, (0.0, 0.0), 1000, 1)]  # nothing for Q 37
+    with pytest.warns(RuntimeWarning, match="no centre-Q evidence"):
+        raked = kmer.rake(truth(), phred, exposure, REAL_ALPHABET)
+    assert {k[1] for k in raked.counts} == {12}
+    assert sum(n for k, n in raked.counts.items() if k[2] != "=") == pytest.approx(1.0)  # 1 % of the 100 kept bases
+
+
 def test_fits_a_real_analyze_run() -> None:
     kvmer = next(
         t
