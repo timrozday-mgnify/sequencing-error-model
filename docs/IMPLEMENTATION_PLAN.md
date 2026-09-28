@@ -359,7 +359,7 @@ These are computed from the fitted heads, not fitted separately:
 - **Neighbouring-quality effects and quality × context interactions** in head E. Unmodified skiver never pairs errors with quality windows or with context-specific qualities. The effects are fixed at zero and flagged; closing this needs enhanced skiver or a truth-bearing source such as PE overlap.
 - **Joint effects of position, strand and mate with context or Q.** Each CSV is a separate marginal. They are combined log-additively, an assumption that is untestable without per-observation data.
 - **Quality head conditioned on true context and on errors.** FASTQ conditions on observed bases. That is acceptable for Illumina (error ≈ 10⁻³), but biased for ONT, where erroneous bases are frequent and correlated with low Q.
-- **Indels longer than 1 bp and multi-error windows.** 2+-edit values are dropped, so the indel length distribution is unobserved. Assume 1 bp (fine for Illumina, wrong for ONT homopolymers).
+- **Indels longer than 1 bp and multi-error windows.** 2+-edit values are dropped, so the indel length distribution is unobserved. Assume 1 bp (fine for Illumina, wrong for ONT homopolymers). Dropping them also truncates the error mass `kvmer.csv` shows at all: ~16 % of it at v = 13 and a 1.6 % per-base rate (measured in phase 6), which biases a kvmer-only intercept down. The level comes from marginal matching instead (§5.6).
 - **Homopolymer effects.** `kvmer.csv` has only the longest run in the value, and the position of an indel inside a run isn't identifiable. Only a coarse run-length covariate is possible.
 - **Read-level heterogeneity** jointly affecting Q and errors. Only the aggregate β is available.
 - **R1 vs R2** differences in errors are unobservable; R1 vs R2 qualities come from the FASTQ.
@@ -942,9 +942,22 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - ✓ `QualityWindow` beats the centre-Q-only head E on held-out likelihood, or the report shows it doesn't (SRR24523812: it does in both modes, and m=2 beats m=1);
   - ✓ the baseline harness runs on at least one Illumina and one long-read dataset, and the report states where the native generator beats, matches or trails each baseline (SRR24523812 vs ReSeq; SRR30993108 vs Badread, PBSIM3 and CycSim, above). The native generator beats every baseline on rate by reported Q; it trails on per-read heterogeneity on both platforms, and on the ONT error rate through it.
 
-### Phase 6: `kmer` mode (default build), checked against `pe-overlap` and `reference`
+### Phase 6: `kmer` mode (default build), checked against `pe-overlap` and `reference` (in progress)
 - Head E fitters for unmodified skiver:
-  - latent-position `Context(L,R)` from `kvmer.csv` with the true-base mask;
+  - ✓ latent-position `Context(L,R)` from `kvmer.csv` with the true-base mask (`fit/kmer.py`). EM over the value
+    position an op could have sat at: the E-step weighs a locus's candidate positions by the model's odds of that
+    op there (an insertion by its own probability, since it leaves the position matching), and the M-step refits
+    head E through `fit.error.fit` on those positions' contexts with those weights, plus the match exposure every
+    observation leaves elsewhere. Contexts running past the value's end are "." as beyond a read end; a left flank
+    wider than k is refused. `kvmer.csv` has no quality, so the fit runs on a one-value dummy alphabet and its
+    `QualityWindow(0)` is only an intercept, replaced by the centre-Q term below.
+    - Test (`tests/test_fit_kmer.py`): loci simulated from a known head E, keeping only skiver's matching and
+      one-edit values, recover the context log-odds at r = 0.98 (0.79 before EM moves off uniform positions), and
+      the fit runs on the v0.3.2 fixture's real `kvmer.csv`.
+    - **Known bias, measured:** dropping 2+-edit values (§6.2) takes ~16 % of the error mass with it at v = 13 and
+      a 1.6 % per-base rate, so the fitted intercept is low by that factor; the test asserts the shortfall equals
+      the truth's dropped mass, so context shape stays checked. Marginal matching against `summary_phred.csv`
+      sets the level, so this is not corrected in the kvmer fit itself.
   - centre-Q term by marginal matching against `summary_phred.csv` under the FASTQ exposure;
   - position curve, strand, GC, Weibull passthrough.
 
