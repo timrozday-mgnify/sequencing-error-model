@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina run (native vs ReSeq) have landed; the long-read baseline run remains. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
+Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
 
 ## 1. Goal
 
@@ -674,7 +674,11 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - `bam.fit` fits it when an `IndelLength` token is given (the CLI then makes a second pass for events), and `recovery.cigar_mode` passes events through.
   - Tests: generated length distributions per kind and run group are within TV 0.05 of the truth; `recover` on a 4× indel-rate truth with longer indels in runs of 3+ passes the phase 2 tolerances, and refitted lengths are within weighted TV 0.05.
   - Known approximations: the post-insertion row is fitted as a full draw; adjacent deletions read back as one event; for deletions Q is the next read base's (the open deletion-Q convention).
-- Deferred: per-read error *and quality* trajectories for `Latent(S)`. No phase fits `Latent(S)` yet, so they wait for the phase that adds its fitter.
+- ✓ **`Latent(S)`** (`fit/latent.py`, `bam.fit(n_latent=)`, CLI `--latent S`). A read-level class s ∈ 0..S−1, drawn once per read from the spec's `latent` prior. Both heads carry a `Latent(S)` component, weights [S, K] on a `latent` field, so a class shifts error and quality logits together. The spec requires the same token in both heads and in the latent layer.
+  - EM over reads. `observations(read_ids=True)` adds a `read` field. The E-step scores each read's head E and head Q rows under each class (`error.read_log_likelihood`, `quality.read_log_likelihood`). The M-step refits both heads, warm-started (`quality.fit` gained `init`), on rows expanded by class with the posterior weights, and sets the prior to their mean. Classes start from quantiles of each read's observed error rate (op labels, never Q), with ties broken at random.
+  - The generator draws each read's class, then samples its Q track and head E outcomes with it.
+  - Test (`tests/test_latent.py`): the example spec plus a 30 % class (error logits +1.5, lower Q), 1,500 reads. The refit recovers the prior within 0.03, the class shifts within 0.35 (E) and 0.2 (Q), and on generated reads the variance/mean of edits per read within 10 % and the sd of per-read mean Q within 5 %. A refit without the class gives under 0.6× that dispersion.
+  - ponytail: a mixture, not the HMM over positions of §5.4. Add transitions if long reads show regimes changing within a read. Rows are expanded per class in Python, so a fit costs S× the rows per EM iteration: 42 min for 10,000 Illumina records (8 iterations).
 - One code path for three kinds of reference: an external genome, a spike-in or mock community, and a self-assembly. Ship documented recipes (assemble with metaSPAdes / metaFlye / myloasm / hifiasm-meta, polish, align with minimap2 or bwa-mem2) rather than wrapping assemblers.
 - ✓ **Aligner bias check** (`recovery.aligner_bias`, `python -m sequencing_error_model.recovery --aligner minibwa|minimap2`). It uses minibwa for short reads and minimap2 (`-x map-ont` by default) for long reads. The `Testing` workflow installs the pinned x64-linux release binaries (minibwa v0.7, minimap2 v2.31) and sets `REQUIRE_ALIGNERS=1`, so a missing aligner fails there; locally, `tests/test_aligners.py` skips without them (Homebrew has both at the same versions).
   - Single-end reads from one random genome, on both strands, with known CIGARs. The truth's error rate is scaled by shifting head E's non-match bias (what `generate(error_rate_scale=)` does).
@@ -788,39 +792,155 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     Each spec wins on its own mode's rows, and the 100,000-pair overlap spec also wins on the short-insert reference rows, which the reference spec (fitted on all inserts) doesn't specialise to: the selection effect again. Rate ratios at model level (1.35–1.66) exceed the evidence-level 1.31, and the two overlap specs differ (0.55% vs 0.61% on overlap rows). Likely cause, not yet checked: on reference rows the overlap spec's `Position(4)` extrapolates to early cycles it rarely saw, where Q21 is 7× more error-prone.
 - **Baseline harness.** The phase 3 metrics computed on real reads vs reads from (a) the native generator, (b) ReSeq for Illumina, (c) Badread, PBSIM3 and CycSim for long reads, each simulator trained by its own profiler on the same alignment. Add k-mer spectrum concordance and context-dependent substitution rates, the metrics of the 2026 ONT benchmark.
   - ✓ `baseline.py` (`python -m sequencing_error_model.baseline REF REAL_BAM NAME=BAM … --output report.json`). Every read set is aligned the same way and profiled by the same code.
-    - Error rows come from `bam.records` → `generate.observations` (by reported Q, 10-cycle bin and trinucleotide, split into match, substitution, deletion and insertion), with edits per aligned read counted alongside.
-    - Q comes from every base of every primary record (Q histogram per cycle, lag-1 pairs), and canonical 21-mers from the same records (multiplicity spectrum, and occurrences absent from the reference).
+    - Error rows come from `bam.records` → `generate.observations` (by reported Q, cycle bin and trinucleotide, split into match, substitution, deletion and insertion), in batches of 200 records, with each aligned read's error rate (0.2% bins, capped at 10%) counted alongside. `--cycle-bin` sets the bin (10 for short reads, 500 for long reads).
+    - Q comes from every base of every primary record (Q histogram per cycle bin, lag-1 pairs), and canonical 21-mers from the same records (multiplicity spectrum, and occurrences absent from the reference).
     - `distances` gives one number per metric, 0 when identical. Rate metrics are the real-exposure-weighted mean \|log rate ratio\|; the others are TVs, except `q_lag1` (absolute difference) and `kmer_absent` (\|log ratio\|).
     - `verdict` gives the native generator's result against each baseline: beats, matches (within 10% or 0.01), or trails.
-    - Test: reads from the example spec rank a same-spec read set above a 3× error-scaled one on every rate, edits-per-read and k-mer-absent metric, and canonical k-mers ignore strand and skip N windows.
+    - Test: reads from the example spec rank a same-spec read set above a 3× error-scaled one on every rate, per-read error rate and k-mer-absent metric, and canonical k-mers ignore strand and skip N windows.
   - ✓ **Illumina run** (2026-09-16), SRR24523812 (as above).
     - Training: pairs 1–20,000 aligned with minibwa. The native spec is the `reference` spec above (`QualityWindow(1) Context(1,1) Homopolymer Mate`, fitted with `--unclip`). ReSeq 1.1 (bioconda container, amd64 under emulation, 1 min) got `--adapterFile` with the TruSeq pair, because its adapter auto-detection fails on adapter-trimmed reads. Its coverage bias fit didn't converge at 1.2× depth, so it simulated uniform coverage.
     - Evaluation: held-out pairs 20,001–100,000 against 80,000 simulated pairs each (native `--insert-mean 369 --insert-sd 66`, the training alignment's), all aligned with minibwa and profiled with `--unclip 2 8 12 2`, 2 min per run.
 
-    | metric | real | native | ReSeq | native distance | ReSeq distance | native vs ReSeq |
-    |---|---|---|---|---|---|---|
-    | error rate | 0.776% | 0.832% | 0.849% | 0.070 | 0.089 | beats |
-    | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 3.0 / 3.2 | 3.2 / 2.3 | 0.137 / 0.006 | 0.206 / 0.308 | beats |
-    | rate by reported Q | | | | 0.140 | 0.243 | beats |
-    | rate by cycle | | | | 0.122 | 0.094 | trails |
-    | substitution rate by trinucleotide | | | | 0.180 | 0.245 | beats |
-    | Q by cycle (TV) | mean Q 32.36 | 32.30 | 32.13 | 0.013 | 0.021 | matches |
-    | Q lag-1 autocorrelation | 0.200 | 0.175 | 0.188 | 0.026 | 0.012 | trails |
-    | edits per read (TV) | dispersion 4.62 | 1.06 | 3.77 | 0.350 | 0.067 | trails |
-    | k-mer spectrum (TV) | | | | 0.057 | 0.045 | trails |
-    | reference-absent k-mers | 11.5% | 15.4% | 13.1% | 0.288 | 0.132 | trails |
+    | metric | real | native | `Position(4)` | `Position(8)` | ReSeq | distance: native / `Position(4)` / `Position(8)` / ReSeq | `Position(8)` vs ReSeq |
+    |---|---|---|---|---|---|---|---|
+    | error rate | 0.776% | 0.832% | 0.819% | 0.798% | 0.849% | 0.070 / 0.054 / **0.028** / 0.089 | beats |
+    | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 3.0 / 3.2 | 3.0 / 3.3 | 2.9 / 3.6 | 3.2 / 2.3 | D 0.137 / 0.146 / 0.093 / 0.206; I 0.006 / 0.060 / 0.143 / 0.308 | beats |
+    | rate by reported Q | | | | | | 0.140 / 0.141 / **0.108** / 0.243 | beats |
+    | rate by 10-cycle bin | | | | | | 0.122 / 0.074 / **0.056** / 0.094 | beats |
+    | substitution rate by trinucleotide | | | | | | 0.180 / 0.176 / 0.168 / 0.245 | beats |
+    | Q by 10-cycle bin (TV) | mean Q 32.36 | 32.30 | 32.30 | 32.30 | 32.13 | 0.010 / 0.010 / 0.010 / 0.018 | matches |
+    | Q lag-1 autocorrelation | 0.200 | 0.175 | 0.175 | 0.175 | 0.188 | 0.026 / 0.026 / 0.026 / 0.012 | trails |
+    | per-read error rate (TV) | median < 0.2%, p90 2.7% | 0.7%, 1.9% | 0.7%, 1.9% | 0.7%, 1.9% | < 0.2%, 2.7% | 0.373 / 0.368 / 0.360 / 0.076 | trails |
+    | k-mer spectrum (TV) | | | | | | 0.057 / 0.054 / 0.051 / 0.045 | matches (within the 0.01 floor) |
+    | reference-absent k-mers | 11.5% | 15.4% | 15.0% | 14.6% | 13.1% | 0.288 / 0.263 / 0.241 / 0.132 | trails |
 
     - **Beats** on per-base error structure: rates by Q and trinucleotide context, and indel rates.
-    - **Trails** on rate by cycle, because the spec has no `Position` in head E (the Q21 cycle effect above). This is a spec choice, not a generator limit.
-    - **Trails** on per-read error heterogeneity, the largest gap. Real edits per read are overdispersed (variance/mean 4.6; 59% of reads have none, against 33% under Poisson). ReSeq reaches 3.8 through its errors-so-far conditioning. The native generator draws errors independently given Q, so it gives 1.06, and its lag-1 Q (0.175 vs 0.200) doesn't carry enough read-level clustering. The spread-out errors break more k-mers, which drives the k-mer spectrum and reference-absent k-mer gaps. That is the deferred per-read trajectory model (`Latent(S)`).
+    - **Rate by cycle** trailed because the first spec had no `Position` in head E (the Q21 cycle effect above). Refitting head E as `QualityWindow(1) Context(1,1) Position(4) Homopolymer Mate` on the same training records (14 min; +0.00022 nats per row, +1,290 on 5.98 M training rows), with head Q unchanged and generation repeated with the same seed, cuts that distance from 0.122 to 0.074. It now beats ReSeq (0.094).
+    - `Position(8)` (19 min; +0.00035 nats per training row) goes further: rate by cycle 0.056, error rate 0.028, and rate by reported Q 0.108 (from 0.140), so part of the Q curve's miss was cycle confounded with Q.
+      - Held-out head E log-likelihood on pairs 20,001–50,000 (9.0 M rows, same `--unclip` and window) agrees: +1,568 nats for `Position(4)` and +2,538 for `Position(8)` over no `Position`. The extra knots generalise.
+      - The insertion distance grows (0.006 → 0.060 → 0.143), but it rests on about 750 insertion bases per read set, so without a noise floor it reads as noise; deletions improve (0.137 → 0.093).
+      - Per-read heterogeneity doesn't move (0.373 → 0.360).
+      - Default for Illumina `reference` specs: `Position(8)` over `Position(4)`. The `pe-overlap` default stays `Position(4)`: fixed-length amplicon reads leave its position axes collinear (phase 4).
+    - **Trails** on per-read error heterogeneity, the largest gap. Real mismatches per read (NM) are overdispersed (variance/mean 4.0; 59% of reads have none, against 33% under Poisson). ReSeq reaches 3.4 through its errors-so-far conditioning. The native generator draws errors independently given Q, so it gives 1.05, and its lag-1 Q (0.175 vs 0.200) doesn't carry enough read-level clustering. The spread-out errors break more k-mers, which drives the k-mer spectrum and reference-absent k-mer gaps. That is the deferred per-read trajectory model (`Latent(S)`).
     - Not yet measured: a sampling-noise floor (real vs real halves), which matters for the rare indels (600–750 indel bases per read set).
-  - **Open:** a long-read dataset with Badread, PBSIM3 and CycSim; re-run the Illumina row with `Position` in head E, and again once `Latent(S)` lands.
+    - ✓ **`Latent(2)`** (2026-09-16). The `Position(8)` tokens plus `Latent(2)`, both heads fitted by EM on training records 1–10,000 (pairs 1–5,000, `--unclip`; 42 min, 8 iterations). Everything else is as above: 80,000 pairs, same insert sizes, same seed, same alignment and profiling. Classes: 63 % / 37 %. The second has more errors (match logit −1.16 relative to errors) and lower Q (Q2 and the lowest bins up, the top bin −0.79).
+
+      | metric | real | `Position(8)` | `Latent(2)` | ReSeq | distance: `Position(8)` / `Latent(2)` / ReSeq | `Latent(2)` vs ReSeq |
+      |---|---|---|---|---|---|---|
+      | error rate | 0.776% | 0.798% | 0.723% | 0.849% | 0.028 / 0.071 / 0.089 | beats |
+      | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 2.9 / 2.7 | 4.9 / 2.9 | 3.2 / 2.3 | D 0.093 / 0.626 / 0.206; I 0.143 / 0.094 / 0.308 | D trails, I beats |
+      | rate by reported Q | | | | | 0.108 / **0.083** / 0.243 | beats |
+      | rate by 10-cycle bin | | | | | **0.056** / 0.113 / 0.094 | trails |
+      | substitution rate by trinucleotide | | | | | **0.168** / 0.192 / 0.245 | beats |
+      | Q by 10-cycle bin (TV) | mean Q 32.36 | 32.30 | 32.39 | 32.13 | 0.010 / 0.010 / 0.018 | matches |
+      | Q lag-1 autocorrelation | 0.200 | 0.175 | 0.178 | 0.188 | 0.026 / 0.023 / 0.012 | trails |
+      | per-read error rate (TV) | median < 0.2%, p90 2.7% | 0.7%, 1.9% | < 0.2%, 1.9% | < 0.2%, 2.7% | 0.360 / **0.134** / 0.076 | trails |
+      | k-mer spectrum (TV) | | | | | 0.051 / 0.047 / 0.045 | matches |
+      | reference-absent k-mers | 11.5% | 14.6% | 12.3% | 13.1% | 0.241 / **0.070** / 0.132 | beats |
+
+      - Per-read heterogeneity: the TV falls from 0.360 to 0.134, and the median read is error-free, as in the real reads. The errors now cluster in fewer reads, so fewer k-mers break: reference-absent k-mers fall from 14.6 % to 12.3 % (real 11.5 %) and now beat ReSeq. ReSeq still has the heavier p90 tail (2.7 %, against 1.9 %); two classes don't reach it.
+      - Worse: the error rate (−7 %), rate by cycle and deletions (1.9× real). The deletion distance rests on about 750 deletion bases per read set, and the second class's deletion weight (+1.63) is fitted from roughly a quarter of the training deletions. Training on 5,000 pairs instead of 20,000 confounds all three; a 20,000-pair EM fit (about 3 h at this speed) would separate data size from the class.
+    - ✓ **`Latent(2)` on the full training set** (2026-09-24). The same tokens, both heads fitted by EM on all 40,000 training records (pairs 1–20,000, `--unclip`; 3 h 10 min, peak under 18 GB after the fitter memory fix below). Everything else is as above. Classes: 61.9 % / 38.1 % (from 63 / 37), the second again the high-error one (match logit −0.73 relative to errors, from −1.16). It answers the open item: **the deficits were data size, not the class model.**
+
+      | metric | real | `Position(8)` | `Latent(2)` 5 k pairs | `Latent(2)` 20 k pairs | ReSeq |
+      |---|---|---|---|---|---|
+      | error rate | 0.776 % | 0.798 % (0.028) | 0.723 % (0.071) | **0.791 % (0.019)** | 0.849 % (0.089) |
+      | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 2.9 / 3.6 | 4.9 / 2.9 | 3.1 / 3.1 (D 0.162, I **0.018**) | 3.2 / 2.3 |
+      | rate by reported Q | | 0.108 | **0.083** | 0.115 | 0.243 |
+      | rate by 10-cycle bin | | **0.056** | 0.113 | 0.078 | 0.094 |
+      | substitution rate by trinucleotide | | **0.168** | 0.192 | 0.179 | 0.245 |
+      | Q by 10-cycle bin (TV) | mean Q 32.36 | 0.010 | 0.010 | 0.011 (32.29) | 0.018 |
+      | Q lag-1 autocorrelation | 0.200 | 0.175 (0.026) | 0.178 (0.023) | 0.178 (0.023) | 0.188 (**0.012**) |
+      | per-read error rate (TV) | p50 0.1 %, p90 2.7 % | 0.360 | **0.134** | 0.154 (p50 0.7 %, p90 2.7 %) | 0.076 |
+      | k-mer spectrum (TV) | | 0.051 | 0.047 | 0.047 | **0.045** |
+      | reference-absent k-mers | 11.5 % | 14.6 % (0.241) | **12.3 %** (0.070) | 13.3 % (0.146) | 13.1 % (0.132) |
+
+      - **The error rate is now the best of every spec and every baseline** (0.019, against `Position(8)` 0.028 and ReSeq 0.089): the −7 % at 5,000 pairs was the training size.
+      - **The deletion excess was too**: 4.9 → 3.1 ×10⁻⁵ (0.626 → 0.162), fitted from four times the deletions. Insertions reach 0.018, the best in the table.
+      - Rate by cycle improves (0.113 → 0.078) but still trails plain `Position(8)` (0.056), and rate by Q slips (0.083 → 0.115).
+      - Per-read heterogeneity keeps most of its gain (0.360 → 0.154) and the p90 tail now matches real exactly (2.7 %), but the median read is 0.7 % against real <0.2 %, and reference-absent k-mers give back ground (12.3 → 13.3 %). ReSeq (0.076) still leads on per-read spread.
+    - ✓ **`Latent(3)` on the full training set** (2026-09-24). The same tokens with three classes, EM on all 40,000 records (5 h 01 min). Classes 39 % / 41 % / 20 %, match logits 0.90 / 1.29 / −0.16, so the third is a distinctly worse class than either of the two `Latent(2)` finds. It buys per-read structure and costs rate:
+
+      | metric | real | `Latent(2)` 20 k | `Latent(3)` 20 k |
+      |---|---|---|---|
+      | error rate | 0.776 % | **0.791 % (0.019)** | 0.804 % (0.035) |
+      | deletion / insertion bases per row (×10⁻⁵) | 2.6 / 3.2 | 3.1 / 3.1 (D **0.162**, I 0.018) | 3.3 / 3.2 (D 0.213, I **0.013**) |
+      | rate by reported Q | | 0.115 | **0.099** |
+      | rate by 10-cycle bin | | **0.078** | 0.085 |
+      | per-read error rate (TV) | p50 0.1 %, p90 2.7 % | 0.154 (p50 0.7 %, p90 2.7 %) | **0.114** (p50 0.1 %, p90 2.7 %) |
+      | reference-absent k-mers | 11.5 % | 13.3 % (0.146) | **13.0 % (0.119)** |
+
+      - **The p90 tail item is met**: with three classes both the median read (0.1 %) and the p90 (2.7 %) match the real reads exactly, and the per-read TV falls to 0.114, the best of any native spec (ReSeq 0.076 still leads).
+      - It costs the error rate (0.019 → 0.035) and deletions (0.162 → 0.213), and gains rate by Q (0.115 → 0.099) and insertions (0.013, the best in either table). **Default stays `Latent(2)`** for Illumina: the rate is the headline metric and two classes hold it best; `Latent(3)` is the choice when per-read spread matters more.
+      - **Fitter memory** (2026-09-24). The first attempt at this fit peaked at 49 GB on a 24 GB machine and thrashed swap. The cost is per fit, not per L-BFGS evaluation: `_matrix` built the design matrix as COO triplets, so scipy sorted and de-duplicated three `rows × slots` arrays. Every row has the same slots, so `fit.quality._csr` now builds the CSR directly (`indptr` a stride, int32 column indices): on 20,000 records (3.5 M expanded rows) head E's peak falls from 7.52 GB to 5.51 GB with the log-likelihood unchanged (−123,329.57 vs −123,328.79). Both objectives also accumulate over 200,000-row chunks, which measured neutral at 4,000 records but bounds the `[rows, K]` temporaries at scale.
+  - ✓ **Long-read run** (2026-09-16): SRR30993108, *E. coli* K-12, PromethION R10.4.1 (kit14, 5 kHz, dorado sup v5), 62,469 reads, mean 7.9 kb. Reference NC_000913.3 (MG1655). Reads 1–5,000 train and reads 30,001–35,000 (39.7 Mb) are held out, all aligned with minimap2 `-ax map-ont`, profiled without `--unclip` (its DP is unbanded) and with `--cycle-bin 500`, 5.5 min for five read sets.
+    - **Badread 0.4.2:** `error_model` and `qscore_model` on the training PAF; `simulate` with the training reads' length (8,356 ± 10,166) and primary-alignment identity (97.8, max 99.9, sd 4.2), and default adapters, junk, random reads, chimeras and glitches.
+    - **PBSIM3 3.0.5:** `--method sample --sample train.fq` (lengths and Q strings from the training reads), `--difference-ratio 39:24:36` (its recommendation for ONT).
+    - **CycSim 1.0.4:** built from source (not on bioconda; needs `CMAKE_POLICY_VERSION_MINIMUM=3.5` with current CMake). `train -r nanopore` on the training alignment, `sim -D` to the held-out base count. Its unaligned BAM output was converted to FASTQ and aligned like the others.
+    - **Native:** head E `QualityWindow(1) Context(1,1) Homopolymer IndelLength(8)` fitted on training reads 1–300 (2.4 M rows, 3 min); head Q `QualityMarkov(1) Position(48) Context(1,1)` fitted on reads 1–100 (27 min). Head Q is the limit: long-read rows never share `pos_start`/`pos_end`, so nothing collapses, and a 49-value Q alphabet costs about 6 s per 1,000 rows. Templates have lengths resampled from the training reads, placed uniformly on both strands; generation took 6.5 min.
+
+    | metric | real | native | Badread | PBSIM3 | CycSim | native vs Badread / PBSIM3 / CycSim |
+    |---|---|---|---|---|---|---|
+    | error rate | 1.97% | 1.44% (0.317) | 2.43% (0.210) | 1.58% (0.219) | 2.36% (0.179) | trails / trails / trails |
+    | substitution / deletion / insertion | 0.83 / 0.57 / 0.57% | 0.72 / 0.44 / 0.27% | 0.97 / 0.83 / 0.63% | 0.74 / 0.53 / 0.31% | 0.89 / 0.88 / 0.59% | insertions trail all three (0.732 vs 0.107 / 0.604 / 0.044) |
+    | rate by reported Q | | 0.454 | 2.126 | 0.532 | 0.856 | beats / beats / beats |
+    | rate by 500-cycle bin | | 0.330 | 0.229 | 0.308 | 0.195 | trails / matches / trails |
+    | substitution rate by trinucleotide | | 0.331 | 0.172 | 0.613 | 0.471 | trails / beats / beats |
+    | Q by cycle bin (TV) | mean Q 34.2 | 34.7 (0.066) | 34.3 (0.036) | 34.7 (0.034) | 20.7 (0.895) | trails / trails / beats |
+    | Q lag-1 autocorrelation | 0.947 | 0.932 (0.015) | 0.337 (0.610) | 0.947 (0.000) | 0.391 (0.556) | beats / trails / beats |
+    | per-read error rate (TV) | median 0.5%, p90 5.3% | 1.5%, 2.1% (0.739) | 0.9%, 6.5% (0.221) | 0.5%, 3.9% (0.091) | 1.9%, 4.9% (0.742) | trails / trails / matches |
+    | k-mer spectrum (TV) | | 0.441 | 0.329 | 0.428 | 0.248 | trails / matches / trails |
+    | reference-absent k-mers | 14.2% | 13.2% (0.075) | 21.9% (0.431) | 13.9% (0.024) | 30.1% (0.751) | beats / trails / beats |
+
+    Distances in brackets. From NM, held-out real reads have 1.98% errors, all training reads 2.20%, and training reads 1–300 2.45%.
+    - **Beats** every baseline on rate by reported Q. Badread's Q barely tracks its errors, and CycSim's Q is off altogether (mean 20.7). PBSIM3 copies real Q strings, so it matches Q almost exactly and reaches its errors through Q, but with its fixed error ratio.
+    - **Trails** on the error rate (1.44%, against 2.45% in its own training reads), insertions most of all. This is not the error head: on the training reads head E's expected rates equal the observed ones exactly (substitution 1.125%, deletion 0.481%, insertion 0.337% of per-event rows). On the same templates, generated reads give substitution 0.745%, deletion 0.317% and insertion 0.227%, and head E is again self-consistent on those rows. So the generated Q tracks carry the loss. Real reads have a heavier low-Q tail (Q ≤ 10 on 7.0% of bases, against 4.9% generated) and much wider per-read quality: per-read mean Q spans 26.7–40.8 (p10–p90), native only 33.3–36.0. Head Q's `QualityMarkov(1)` gets lag-1 right (0.932 vs 0.947) but has no per-read level, so whole low-quality reads, where errors concentrate, are never generated. It is the Illumina per-read heterogeneity gap again, this time on the Q side, and `Latent(S)` should close both.
+    - The per-read error rate shows it directly: native 1.5–2.1% (p50–p90) against real 0.5–5.3%. PBSIM3 inherits per-read quality from the real Q strings and gets closest (TV 0.09).
+    - ✓ **`Latent(2)`** (2026-09-16). Head E `QualityWindow(1) Context(1,1) Homopolymer Latent(2)` and head Q `QualityMarkov(1) Position(48) Context(1,1) Latent(2)`, both fitted by EM on training reads 1–100 (1.08 M rows, 55 min). `IndelLength(8)` comes from reads 1–300 as before. Same templates, alignment and profiling as the native row. Classes: 77 % / 23 %. The second is a low-quality class: Q2–Q20 weights up by 0.4–1.1, Q25 and above down by 0.2–0.7. Its error shift is small (match −0.27), so errors follow its Q through `QualityWindow`.
+
+      | metric | real | native | `Latent(2)` | distance: native / `Latent(2)` | `Latent(2)` vs Badread / PBSIM3 / CycSim |
+      |---|---|---|---|---|---|
+      | error rate | 1.97% | 1.44% | 1.28% | **0.317** / 0.431 | trails / trails / trails |
+      | substitution / deletion / insertion | 0.83 / 0.57 / 0.57% | 0.72 / 0.44 / 0.27% | 0.65 / 0.40 / 0.24% | I **0.732** / 0.873 | trails all three on insertions |
+      | rate by reported Q | | | | 0.454 / **0.434** | beats / beats / beats |
+      | rate by 500-cycle bin | | | | **0.330** / 0.427 | trails / trails / trails |
+      | Q lag-1 autocorrelation | 0.947 | 0.932 | 0.931 | 0.015 / 0.017 | beats / trails / beats |
+      | per-read error rate (TV) | p10 0.1%, p50 0.5%, p90 5.3% | 0.9%, 1.5%, 2.1% | 0.3%, 0.5%, 4.3% | 0.739 / **0.355** | trails / trails / beats |
+      | k-mer spectrum (TV) | | | | **0.441** / 0.470 | trails / trails / trails |
+      | reference-absent k-mers | 14.2% | 13.2% | 11.7% | **0.075** / 0.192 | beats / trails / beats |
+
+      - Per-read heterogeneity: the TV halves (0.739 → 0.355), with the median read right (0.5 %) and a much longer tail (p90 4.3 %, real 5.3 %). PBSIM3 (0.091) and Badread (0.221) are still closer.
+      - The error rate falls further (1.44 % → 1.28 %, real 1.97 %). Errors cluster in fewer reads, so fewer k-mers break: reference-absent k-mers undershoot (11.7 %), where the native row was close by accident. Most of the loss is head E trained on 100 reads instead of 300, and the heavier real low-Q tail (7.0 % of bases at Q ≤ 10) that two classes don't reach. The per-read rate gap is now mostly a rate gap, not a spread gap.
+    - ✓ **`Latent(2)` on the full training set** (2026-09-24). Both heads fitted by EM on training reads 1–300, the same reads `IndelLength(8)` uses (2 h 45 min, after the fitter memory fix). Classes: 79.8 % / 20.2 % (from 77 / 23). The training-size diagnosis holds here too: **the error rate recovers from 1.28 % to 1.62 %** (real 1.97 %), the best of any native ONT row.
+
+      | metric | real | native | `Latent(2)` 100 reads | `Latent(2)` 300 reads | vs Badread / PBSIM3 / CycSim |
+      |---|---|---|---|---|---|
+      | error rate | 1.97 % | 1.44 % (0.317) | 1.28 % (0.431) | **1.62 % (0.197)** | matches / beats / matches |
+      | substitution / deletion / insertion | 0.83 / 0.57 / 0.57 % | 0.72 / 0.44 / 0.27 % | 0.65 / 0.40 / 0.24 % | 0.81 / 0.50 / 0.31 % (S **0.030**, D 0.125, I 0.616) | S beats all three; I trails Badread and CycSim |
+      | rate by reported Q | | 0.454 | 0.434 | **0.389** | beats / beats / beats |
+      | rate by 500-cycle bin | | 0.330 | 0.427 | **0.212** | matches / beats / matches |
+      | Q lag-1 autocorrelation | 0.947 | 0.932 (0.015) | 0.931 (0.017) | 0.939 (**0.009**) | beats / matches / beats |
+      | per-read error rate (TV) | p50 0.5 %, p90 5.3 % | 0.739 | 0.355 | 0.370 (p50 **0.5 %**, p90 6.1 %) | trails / trails / beats |
+      | k-mer spectrum (TV) | | 0.441 | 0.470 | 0.433 | trails / matches / trails |
+      | reference-absent k-mers | 14.2 % | 13.2 % (0.075) | 11.7 % (0.192) | **13.6 % (0.044)** | beats / trails / beats |
+
+      - It beats the 100-read fit on every metric except per-read TV (0.355 → 0.370, where the median is now exactly right and the p90 overshoots, 6.1 % against 5.3 %), and beats the no-class native row on all twelve.
+      - **Insertions remain the gap** (0.31 % against 0.57 %, distance 0.616), unchanged in character by more training data or by the class. They are the one metric where Badread (0.107) and CycSim (0.044) clearly lead.
+      - Per-read spread still trails PBSIM3 (0.091) and Badread (0.221), which inherit it from real reads rather than modelling it.
+  - **Open:**
+    - ✓ `Latent(S)` (per-read quality and error level), re-run on both rows;
+    - ✓ the error rate under `Latent(S)` on both platforms: refit on the full training sets (Illumina 0.791 % against 0.776 %, distance 0.019; ONT 1.62 % against 1.97 %, 0.197). Both deficits were training size, not the class model. `Latent(3)` tried on Illumina;
+    - ✓ the per-read p90 tail (`Latent(3)`) and the deletion excess, on a 20,000-pair fit: `Latent(3)` matches the real median and p90 exactly (TV 0.114), and the deletion excess was training size (4.9 → 3.1 ×10⁻⁵);
+    - `Latent(3)` on ONT (the 300-read fit takes about 4 h), where the remaining gaps are insertions and the p90 tail;
+    - ONT insertions (0.31 % against 0.57 %), which neither more training data nor the class moved;
+    - head Q fitting cost on long reads (bin `pos_start`/`pos_end` geometrically, or fit on a Q-binned alphabet);
+    - a sampling-noise floor.
 - **Exit:**
   - on generated reads aligned back to their genome, the full spec (including indel lengths and homopolymer effects) is recovered within the phase 2 tolerances, after correcting for the measured aligner bias. Redefined 2026-09-15 against the observable truth (aligner bias check above). Rates, indel lengths and indel rates by homopolymer run (within 10%) are met for minimap2, and for minibwa with `--unclip`, and so are `Homopolymer` and `Context` on indels (indel components above);
   - the clonal cost of each mask is reported, and masks that bias a head E component beyond the phase 2 tolerances on clonal reads are off by default;
   - ✓ on one real near-clonal Illumina dataset (isolate, spike-in or amplicon mock), `pe-overlap` and `reference` specs agree per component on shared support within tolerance, or the report explains each disagreement (SRR24523812 above: rates are explained, by insert-size and cycle selection plus a flat library/reference excess; per-component comparison beyond rates is still open);
   - ✓ `QualityWindow` beats the centre-Q-only head E on held-out likelihood, or the report shows it doesn't (SRR24523812: it does in both modes, and m=2 beats m=1);
-  - the baseline harness runs on at least one Illumina and one long-read dataset, and the report states where the native generator beats, matches or trails each baseline.
+  - ✓ the baseline harness runs on at least one Illumina and one long-read dataset, and the report states where the native generator beats, matches or trails each baseline (SRR24523812 vs ReSeq; SRR30993108 vs Badread, PBSIM3 and CycSim, above). The native generator beats every baseline on rate by reported Q; it trails on per-read heterogeneity on both platforms, and on the ONT error rate through it.
 
 ### Phase 6: `kmer` mode (default build), checked against `pe-overlap` and `reference`
 - Head E fitters for unmodified skiver:

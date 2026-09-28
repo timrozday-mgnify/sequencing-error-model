@@ -24,11 +24,11 @@ SCHEMA_VERSION = 1
 MODES = ("pe-overlap", "reference", "kmer")  # evidence modes (§1.1)
 SKIVER_BUILDS = ("default", "enhanced")  # only for `kmer`
 MAX_Q = 93
-# Component name -> heads it may appear in (E: error, Q: quality). The shared `Latent(S)`
-# layer sits outside both heads.
+# Component name -> heads it may appear in (E: error, Q: quality). `Latent(S)` sits in both heads (its
+# per-class weights) and as the spec's `latent` layer (the class prior); all three must agree on S.
 # ponytail: names and heads only; argument arity is checked by each component's fitter.
 COMPONENTS = {
-    **dict.fromkeys(("Context", "ContextTable", "Position", "Mate", "Strand", "Homopolymer"), "EQ"),
+    **dict.fromkeys(("Context", "ContextTable", "Position", "Mate", "Strand", "Homopolymer", "Latent"), "EQ"),
     **dict.fromkeys(
         ("QualityWindow", "QualityxContext", "GC", "Weibull", "IndelLength", "FragmentOverdispersion"), "E"
     ),
@@ -95,6 +95,10 @@ class ErrorModelSpec:
                 raise SpecError(f"head {head} repeats a component: {names}")
         if self.latent is not None and not re.fullmatch(r"Latent\(\d+\)", self.latent.token):
             raise SpecError(f"latent layer must be Latent(S), got {self.latent.token!r}")
+        want = [] if self.latent is None else [self.latent.token]
+        for head, components in (("Q", self.quality_head), ("E", self.error_head)):
+            if [c.token for c in components if c.name == "Latent"] != want:
+                raise SpecError(f"head {head} must carry the latent layer's token {want}, and only it")
         for key, arr in self._arrays().items():
             if not isinstance(arr, np.ndarray) or arr.dtype.hasobject:
                 raise SpecError(f"{key}: parameters must be non-object numpy arrays")

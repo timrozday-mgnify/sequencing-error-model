@@ -39,7 +39,7 @@ from typing import Any
 import numpy as np
 import pysam
 
-from sequencing_error_model.fit import error, indel, quality
+from sequencing_error_model.fit import error, indel, latent, quality
 from sequencing_error_model.fit.quality import Array
 from sequencing_error_model.generate import _CIGAR, Read, _revcomp, align, indel_events, observations, realign
 from sequencing_error_model.observations import CountTable, Key
@@ -275,24 +275,31 @@ def fit(
     quality_tokens: Sequence[str],
     provenance: dict[str, Any],
     indels: CountTable | None = None,
+    n_latent: int = 0,
 ) -> ErrorModelSpec:
     """Both heads from exact-position tuples: head E from every draw, head Q from bases that emit a read base.
-    An `IndelLength` token is fitted from `indels` (`generate.indel_events`); `table` then needs per-event rows."""
+    An `IndelLength` token is fitted from `indels` (`generate.indel_events`); `table` then needs per-event rows.
+    `n_latent` > 0 adds `Latent(n_latent)` to both heads, fitted by EM (`fit.latent`); `table` then needs a `read` field."""
     body = [t for t in error_tokens if Component(t).name != "IndelLength"]
-    error_head = error.fit(table, body, alphabet)
-    if lengths := [t for t in error_tokens if Component(t).name == "IndelLength"]:
-        if indels is None:
-            raise ValueError(f"{lengths[0]} needs an indel event table")
-        error_head += (indel.fit(indels, lengths[0], alphabet),)
     oi = table.fields.index("op")
     # One row per template base with an emitted read base: matches and substitutions.
     final: Counter[Key] = Counter(
         {k: n for k, n in table.counts.items() if (op := str(k[oi])) == "=" or "-" not in (op[0], op[2])}
     )
     lags = [f"q-{i}" for i in range(1, Component(quality_tokens[0]).args[0] + 1)]
-    q_table = replace(table, counts=final).marginal(*lags, "pos_start", "pos_end", "mate", "context", "q")
-    quality_head = quality.fit(q_table, quality_tokens, alphabet)
-    return ErrorModelSpec(tuple(alphabet), provenance, quality_head, error_head)
+    q_fields = (*lags, "pos_start", "pos_end", "mate", "context", *(("read",) if n_latent else ()), "q")
+    q_table = replace(table, counts=final).marginal(*q_fields)
+    layer = None
+    if n_latent:
+        error_head, quality_head, layer = latent.fit(table, q_table, body, quality_tokens, alphabet, n_latent)
+    else:
+        error_head = error.fit(table, body, alphabet)
+        quality_head = quality.fit(q_table, quality_tokens, alphabet)
+    if lengths := [t for t in error_tokens if Component(t).name == "IndelLength"]:
+        if indels is None:
+            raise ValueError(f"{lengths[0]} needs an indel event table")
+        error_head += (indel.fit(indels, lengths[0], alphabet),)
+    return ErrorModelSpec(tuple(alphabet), provenance, quality_head, error_head, layer)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -304,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--output", type=Path, required=True, metavar="SPEC_DIR")
     p.add_argument("--error-tokens", nargs="+", default=["QualityWindow(1)", "Context(1,1)", "Homopolymer", "Mate"])
     p.add_argument("--quality-tokens", nargs="+", default=["QualityMarkov(1)", "Position(48)", "Mate", "Context(1,1)"])
+    p.add_argument("--latent", type=int, default=0, metavar="S", help="fit S read-level classes (Latent(S)) by EM")
     p.add_argument("--min-mapq", type=int, default=20)
     p.add_argument("--max-reads", type=int)
     p.add_argument("--mask-alt-freq", type=float, help="mask sites with a non-reference allele at this frequency")
@@ -343,7 +351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     flank, m = window(args.error_tokens, args.quality_tokens)
     reads = islice(records(args.bam, args.reference, args.min_mapq, masked, unclip), args.max_reads)
     per_event = any(Component(t).name == "IndelLength" for t in args.error_tokens)
-    table = observations(reads, flank, m, "bam", per_event)
+    table = observations(reads, flank, m, "bam", per_event, read_ids=args.latent > 0)
     indels = None
     if per_event:  # a second pass over the same records
         again = records(args.bam, args.reference, args.min_mapq, masked, unclip)
@@ -353,7 +361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Q windows can reach clipped bases, whose Q never appears at a centre.
     qs = {v for k in table.counts for f, v in zip(table.fields, k, strict=True) if f.startswith("q") and v is not None}
     alphabet = sorted(int(v) for v in qs)  # type: ignore[call-overload]
-    spec = fit(table, alphabet, args.error_tokens, args.quality_tokens, provenance, indels)
+    spec = fit(table, alphabet, args.error_tokens, args.quality_tokens, provenance, indels, args.latent)
     spec.save(args.output)
     print(json.dumps({"rows": sum(table.counts.values()), "quality_alphabet": alphabet}))
     return 0

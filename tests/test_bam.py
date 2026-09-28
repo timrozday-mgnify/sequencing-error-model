@@ -127,3 +127,7 @@ def test_cli_fits_spec(tmp_path: Path) -> None:
     # The Q±1 window reaches the clipped base beside each aligned end: Q30 (forward) and Q21 (reverse).
     assert spec.provenance["mode"] == "reference" and spec.quality_alphabet == (2, 12, 21, 23, 30, 37)
     assert spec.provenance["contigs_kept"] == 1 and report.read_text().startswith("contig\tlength\tmean_depth")
+    # Per-read rows reach the EM fit of Latent(S).
+    assert bam.main([*args, "--quality-tokens", "QualityMarkov(1)", "--latent", "2"]) == 0
+    spec = spec_io.load(out)
+    assert spec.latent is not None and spec.latent.token == spec.error_head[-1].token == "Latent(2)"

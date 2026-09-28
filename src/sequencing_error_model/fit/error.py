@@ -21,6 +21,7 @@ Components and params (A = alphabet size, trailing axis K):
 - `GC(n)`: `knots` [n] over GC %, `weights` [n, K]: linear spline of the `gc` bin midpoint.
 - `QualityxContext(r)`: `quality` [A, r] and `context` [3, 5, r, K], a rank-r interaction of the centre Q
   with bases x_{t-1..t+1}.
+- `Latent(S)`: `weights` [S, K] by the read's class, shared with head Q (`fit.latent`). Field `latent`.
 
 Q enters only as a categorical feature, never as 10^(-Q/10): the calibration is learned.
 """
@@ -33,12 +34,16 @@ from typing import Any
 import numpy as np
 from scipy import optimize, sparse, special
 
-from sequencing_error_model.fit.quality import _BASE, Array, _hat
+from sequencing_error_model.fit.quality import _BASE, Array, _csr, _hat
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component
 
 CATEGORIES = ("=", ">A", ">C", ">G", ">T", "->A", "->C", "->G", "->T", "-")
-COMPONENTS = ("QualityWindow", "Context", "Homopolymer", "Position", "Mate", "Strand", "GC", "QualityxContext")
+COMPONENTS = (
+    *("QualityWindow", "Context", "Homopolymer", "Position", "Mate", "Strand", "GC", "QualityxContext", "Latent"),
+)
+# Rows per objective chunk: the softmax temporaries are [CHUNK, K], so peak memory does not grow with rows.
+CHUNK = 200_000
 _ARITY = {"QualityWindow": 1, "Context": 2, "Homopolymer": 0, "Position": 1, "Mate": 0, "Strand": 0, "GC": 1}
 _K = len(CATEGORIES)
 
@@ -49,7 +54,7 @@ def _check(components: Sequence[Component]) -> None:
         raise ValueError(f"head E needs QualityWindow(m) first, then distinct {COMPONENTS[1:]}, got {names}")
     for c in components:
         a = c.args
-        low = {"Position": 2, "GC": 2, "QualityxContext": 1}.get(c.name, 0)
+        low = {"Position": 2, "GC": 2, "QualityxContext": 1, "Latent": 2}.get(c.name, 0)
         if len(a) != _ARITY.get(c.name, 1) or (low and a[0] < low):
             raise ValueError(f"bad arguments in {c.token!r}")
 
@@ -58,6 +63,7 @@ def _fields(c: Component) -> set[str]:
     if c.name == "QualityWindow":
         return {"q"} | {f"q{s}{i}" for i in range(1, c.args[0] + 1) for s in "+-"}
     extra = {"Position": {"pos_start", "pos_end"}, "Mate": {"mate"}, "Strand": {"strand"}, "GC": {"gc"}}
+    extra["Latent"] = {"latent"}
     return {"context"} | extra.get(c.name, set()) | ({"q"} if c.name == "QualityxContext" else set())
 
 
@@ -111,7 +117,7 @@ def _shapes(c: Component, d: dict[str, Any]) -> dict[str, tuple[int, ...]]:
         return {"start": (c.args[0],), "end": (c.args[0],)}
     if c.name in ("Mate", "Strand"):
         return {"weights": (2,)}
-    if c.name == "GC":
+    if c.name in ("GC", "Latent"):
         return {"weights": (c.args[0],)}
     return {}  # QualityxContext is bilinear, handled by _interaction
 
@@ -141,6 +147,8 @@ def _design(c: Component, d: dict[str, Any]) -> tuple[Array, Array]:
         return (d["mate"] - 1)[:, None], np.ones((n, 1))
     if c.name == "Strand":
         return d["strand"][:, None], np.ones((n, 1))
+    if c.name == "Latent":
+        return np.asarray(d["latent"], np.int64)[:, None], np.ones((n, 1))
     if c.name == "GC":
         knots = c.params["knots"]
         vals = np.stack([np.interp(d["gc"], knots, e) for e in np.eye(len(knots))], axis=1)
@@ -149,14 +157,17 @@ def _design(c: Component, d: dict[str, Any]) -> tuple[Array, Array]:
 
 
 def _matrix(components: Sequence[Component], d: dict[str, Any]) -> sparse.csr_matrix:
-    blocks, offset = [], 0
+    """The design matrix, built straight as CSR: every row has the same slots, so `indptr` is a stride.
+
+    Going through COO would sort and de-duplicate 3 arrays of `rows x slots`, which is the fit's memory peak.
+    """
+    idxs, vals_, offset = [], [], 0
     for c in components:
         idx, vals = _design(c, d)
-        r = np.broadcast_to(np.arange(len(idx))[:, None], idx.shape)
-        blocks.append((vals.ravel(), r.ravel(), (offset + idx).ravel()))
+        idxs.append(offset + idx)
+        vals_.append(np.broadcast_to(vals, idx.shape))
         offset += sum(prod(s) for s in _shapes(c, d).values())
-    vals, r, col = (np.concatenate(x) for x in zip(*blocks, strict=True))
-    return sparse.csr_matrix((vals, (r, col)), shape=(len(d["centre"]), offset))
+    return _csr(idxs, vals_, len(d["centre"]), offset)
 
 
 def _centre(v: Array) -> Array:
@@ -260,13 +271,27 @@ def _labelled(
     return counts, d
 
 
-def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> float:
-    """Log-likelihood of a labelled table's counts under fitted head E components."""
+def _row_log_likelihood(
+    components: Sequence[Component], alphabet: Sequence[int], table: CountTable
+) -> tuple[Array, Any]:
     _check(components)
     counts, d = _labelled(table, components, alphabet)
     logits = np.where(_mask(d), -np.inf, _logits(components, d))
-    logp = logits - special.logsumexp(logits, axis=1, keepdims=True)
-    return float(np.sum(counts[counts > 0] * logp[counts > 0]))
+    logp = np.where(_mask(d), 0.0, logits - special.logsumexp(logits, axis=1, keepdims=True))
+    return (counts * logp).sum(axis=1), d
+
+
+def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> float:
+    """Log-likelihood of a labelled table's counts under fitted head E components."""
+    return float(_row_log_likelihood(components, alphabet, table)[0].sum())
+
+
+def read_log_likelihood(
+    components: Sequence[Component], alphabet: Sequence[int], table: CountTable, n_reads: int
+) -> Array:
+    """Log-likelihood [n_reads] of a labelled table's counts per value of its `read` field."""
+    ll, d = _row_log_likelihood(components, alphabet, table)
+    return np.bincount(np.asarray(d["read"], np.int64), weights=ll, minlength=n_reads)
 
 
 def fit(
@@ -326,23 +351,32 @@ def fit(
 
     def objective(flat: Array) -> tuple[float, Array]:
         smoothed = smooth * np.asarray(walk @ flat[:n_lin].reshape(-1, _K))
-        logits = np.asarray(x @ flat[:n_lin].reshape(-1, _K))
+        theta = flat[:n_lin].reshape(-1, _K)
+        u, v = flat[n_lin:split].reshape(k_q, rank), flat[split:].reshape(3, 5, rank, _K)
+        nll = 0.5 * float(flat @ (precision * flat)) + 0.5 * float(np.sum(flat[:n_lin] * smoothed.ravel()))
+        g_lin, g_u, g_v = np.zeros_like(theta), np.zeros((k_q, rank)), np.zeros((3, 5, rank, _K))
+        for lo in range(0, len(counts), CHUNK):  # [rows, K] temporaries, so a whole fit's rows don't fit at once
+            sl = slice(lo, lo + CHUNK)
+            cs, ms, ts = counts[sl], mask[sl], totals[sl]
+            logits = np.asarray(x[sl] @ theta)
+            if rank:
+                inter, uq, per_row = _interaction(u, v, xq[sl], xc[sl])
+                logits += inter
+            logits[ms] = -np.inf
+            top = logits.max(axis=1, keepdims=True)
+            logp = logits - top - np.log(np.exp(logits - top).sum(axis=1, keepdims=True))
+            logp[ms] = 0.0
+            nll -= float(np.sum(cs * logp))
+            g = ts[:, None] * np.where(ms, 0.0, np.exp(logp)) - cs
+            g_lin += np.asarray(x[sl].T @ g)
+            if rank:
+                g_u += np.asarray(xq[sl].T @ np.einsum("njk,nk->nj", per_row, g))
+                dv = np.asarray(xc[sl].T @ (uq[:, :, None] * g[:, None, :]).reshape(len(g), -1))
+                g_v += dv.reshape(3, 5, rank, _K)
+        grads = [g_lin.ravel() + smoothed.ravel()]
         if rank:
-            u, v = flat[n_lin:split].reshape(k_q, rank), flat[split:].reshape(3, 5, rank, _K)
-            inter, uq, per_row = _interaction(u, v, xq, xc)
-            logits += inter
-        logits[mask] = -np.inf
-        top = logits.max(axis=1, keepdims=True)
-        logp = logits - top - np.log(np.exp(logits - top).sum(axis=1, keepdims=True))
-        logp[mask] = 0.0
-        nll = -np.sum(counts * logp) + 0.5 * flat @ (precision * flat) + 0.5 * np.sum(flat[:n_lin] * smoothed.ravel())
-        g = totals[:, None] * np.where(mask, 0.0, np.exp(logp)) - counts
-        grads = [np.asarray(x.T @ g).ravel() + smoothed.ravel()]
-        if rank:
-            grads.append(np.asarray(xq.T @ np.einsum("njk,nk->nj", per_row, g)).ravel())
-            dv = np.asarray(xc.T @ (uq[:, :, None] * g[:, None, :]).reshape(len(g), -1))
-            grads.append(_centre(dv.reshape(3, 5, rank, _K)).ravel())
-        return float(nll), np.concatenate(grads) + precision * flat
+            grads += [g_u.ravel(), _centre(g_v).ravel()]  # _centre is linear, so centring the sum is the same
+        return nll, np.concatenate(grads) + precision * flat
 
     res = optimize.minimize(objective, start, jac=True, method="L-BFGS-B")
     if not res.success:
@@ -375,7 +409,7 @@ def probabilities(components: Sequence[Component], alphabet: Sequence[int], tabl
 def probabilities_at(components: Sequence[Component], columns: dict[str, Any]) -> Array:
     """P(category) [R, K] from feature columns shaped like `_data`'s (the generator builds them as arrays):
     `k_q`, `flank`, `context` [R, L+R+1] base indices, `centre`, `q` and `q±i` alphabet indices (A beyond a
-    read end), `pos_start`, `pos_end`, `mate`, `strand` (1 for "-") and `gc` (bin midpoint)."""
+    read end), `pos_start`, `pos_end`, `mate`, `strand` (1 for "-"), `gc` (bin midpoint) and `latent` (class index)."""
     _check(components)
     logits = np.where(_mask(columns), -np.inf, _logits(components, columns))
     return np.asarray(special.softmax(logits, axis=1))

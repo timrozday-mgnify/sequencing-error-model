@@ -4,16 +4,18 @@ Every read set is aligned to one reference the same way, and each simulator is t
 same training alignment, so a metric's distance from the real reads compares the simulators, not the pipelines.
 A `profile` holds, per read set:
 
-- error rows (`generate.observations` of aligned records) by reported Q, by cycle (10-base bins of `pos_start`)
+- error rows (`generate.observations` of aligned records) by reported Q, by cycle (`cycle_bin`-base bins of `pos_start`)
   and by trinucleotide context, split into match / substitution / deletion / insertion;
-- edits (substitutions and indel bases) per aligned read, whose spread shows per-read error heterogeneity;
-- Q by cycle over every base of every primary read (clips included), and lag-1 Q pairs;
+- each aligned read's error rate (substitutions and indel bases per draw, in `_READ_RATE_BIN` bins), whose spread
+  shows per-read error heterogeneity;
+- Q by cycle bin over every base of every primary read (clips included), and lag-1 Q pairs;
 - canonical k-mer multiplicities, and how many k-mer occurrences are absent from the reference.
 
 `distances(real, sim)` gives one number per metric, 0 when identical. Rate metrics are the real-exposure-weighted
 mean |log rate ratio| per group; `q_cycle_tv` the weighted mean per-cycle Q TV; `q_lag1` the absolute difference
 in lag-1 autocorrelation; `kmer_spectrum_tv` the TV of distinct-k-mer multiplicity histograms (capped at
-`_MAX_MULTIPLICITY`); `edits_per_read_tv` the TV of edits-per-read histograms (capped the same way); `kmer_absent` the |log ratio| of reference-absent k-mer occurrence fractions (error k-mers).
+`_MAX_MULTIPLICITY`); `read_error_rate_tv` the TV of per-read error rate histograms (capped the same way);
+`kmer_absent` the |log ratio| of reference-absent k-mer occurrence fractions (error k-mers).
 `verdict` says whether one simulator beats, matches or trails another per metric.
 
 ponytail: no sampling-noise floor (a real-vs-real split); read sets of similar size keep the comparison fair.
@@ -34,11 +36,12 @@ import pysam
 from numpy.lib.stride_tricks import sliding_window_view
 
 from sequencing_error_model.fit.quality import Array
-from sequencing_error_model.generate import Read, _edits, observations
+from sequencing_error_model.generate import Read, align, observations
 from sequencing_error_model.sources import bam
 
 CLASSES = ("match", "substitution", "deletion", "insertion")
 _MAX_MULTIPLICITY = 50
+_READ_RATE_BIN = 0.002  # per-read error rate histogram bin: 1 edit in 150 bases is bin 3, up to 10%
 _CODE = np.full(256, 4, np.uint8)
 for _i, _b in enumerate(b"ACGT"):
     _CODE[_b] = _CODE[ord(chr(_b).lower())] = _i
@@ -67,8 +70,8 @@ def kmers(sequences: Iterable[str], k: int = 21, chunk: int = 100_000) -> Array:
 @dataclass
 class Profile:
     rows: Counter[tuple[str, Any, str]] = field(default_factory=Counter)  # (axis, value, class)
-    edits: Counter[int] = field(default_factory=Counter)  # reads by edit count
-    q_cycle: Counter[tuple[int, int]] = field(default_factory=Counter)  # (cycle, Q)
+    read_rates: Counter[int] = field(default_factory=Counter)  # reads by error rate bin
+    q_cycle: Counter[tuple[int, int]] = field(default_factory=Counter)  # (cycle bin start, Q)
     lag: Array = field(default_factory=lambda: np.zeros(6))  # n, Σx, Σy, Σx², Σy², Σxy
     multiplicity: Array = field(default_factory=lambda: np.zeros(0, np.int64))  # per distinct k-mer
     kmers_absent: int = 0
@@ -83,18 +86,23 @@ class Profile:
             "rows": n,
             "error_rate": 1 - rates.pop("match"),
             **{f"{c}_rate": r for c, r in rates.items()},
-            "edits_per_read_dispersion": _dispersion(self.edits),
+            **_quantiles(self.read_rates),
             "mean_q": sum(q * v for (_, q), v in self.q_cycle.items()) / max(bases, 1),
             "q_lag1": _corr(self.lag),
             "kmer_absent_fraction": self.kmers_absent / max(int(self.multiplicity.sum()), 1),
         }
 
 
-def _dispersion(c: Counter[int]) -> float:
-    n = np.array(list(c.values()), float)
-    x = np.array(list(c), float)
-    mean = x @ n / n.sum()
-    return float(((x - mean) ** 2 @ n / n.sum()) / mean)
+def _quantiles(c: Counter[int]) -> dict[str, float]:
+    """10th, 50th and 90th percentile per-read error rate (bin midpoints)."""
+    bins = sorted(c)
+    cum = np.cumsum([c[b] for b in bins]) / max(sum(c.values()), 1)
+    return {
+        f"read_error_rate_p{p}": (bins[int(np.searchsorted(cum, p / 100))] + 0.5) * _READ_RATE_BIN
+        if bins
+        else float("nan")
+        for p in (10, 50, 90)
+    }
 
 
 def _corr(s: Array) -> float:
@@ -107,30 +115,41 @@ def profile(
     reads: Iterable[tuple[str, Sequence[int]]],
     reference_kmers: Array,
     k: int = 21,
+    cycle_bin: int = 10,
     batch: int = 10_000,
 ) -> Profile:
     """Profile aligned (template, read, mate) triples, and every read's (sequence, Q in read orientation).
-    `reference_kmers` is `np.unique(kmers(contigs, k))`."""
+    `reference_kmers` is `np.unique(kmers(contigs, k))`. Cycles are binned by `cycle_bin` bases (10 for short
+    reads; hundreds for long reads)."""
     out = Profile()
 
     def counted() -> Iterator[tuple[str, Read, int]]:
         for record in records:
-            out.edits[_edits(record[0], record[1])] += 1
+            ops = [op for _, op in align(record[0], record[1])[0]]
+            rate = sum(op != "=" for op in ops) / max(len(ops), 1)
+            out.read_rates[min(int(rate / _READ_RATE_BIN), _MAX_MULTIPLICITY)] += 1
             yield record
 
-    table = observations(counted(), (1, 1), 0, "baseline")
-    iq, ic, ip, io = (table.fields.index(f) for f in ("q", "context", "pos_start", "op"))
-    for key, n in table.counts.items():
-        c = _op_class(str(key[io]))
-        for axis, value in (("q", key[iq]), ("cycle", (int(key[ip]) - 1) // 10 * 10 + 1), ("context", key[ic])):  # type: ignore[call-overload]
-            out.rows[axis, value, c] += n
+    stream = counted()
+    # Batched: long reads' rows never share a position, so one table over a whole read set would not fit in memory.
+    while batch_records := list(islice(stream, 200)):
+        table = observations(batch_records, (1, 1), 0, "baseline")
+        iq, ic, ip, io = (table.fields.index(f) for f in ("q", "context", "pos_start", "op"))
+        for key, n in table.counts.items():
+            c, cycle = _op_class(str(key[io])), (int(str(key[ip])) - 1) // cycle_bin * cycle_bin + 1
+            for axis, value in (("q", key[iq]), ("cycle", cycle), ("context", key[ic])):
+                out.rows[axis, value, c] += n
     codes = []
     it = iter(reads)
     while chunk := list(islice(it, batch)):
         out.reads += len(chunk)
         for _, q in chunk:
-            out.q_cycle.update(enumerate(q, 1))
-            x, y = np.asarray(q[:-1], float), np.asarray(q[1:], float)
+            qs = np.asarray(q, np.int64)
+            cells, n = np.unique(np.arange(len(qs)) // cycle_bin * 256 + qs, return_counts=True)
+            out.q_cycle.update(
+                {(int(c) // 256 * cycle_bin + 1, int(c) % 256): int(m) for c, m in zip(cells, n, strict=True)}
+            )
+            x, y = qs[:-1].astype(float), qs[1:].astype(float)
             out.lag += (len(x), x.sum(), y.sum(), x @ x, y @ y, x @ y)
         codes.append(kmers((s for s, _ in chunk), k))
     distinct, out.multiplicity = np.unique(
@@ -175,17 +194,22 @@ def distances(real: Profile, sim: Profile) -> dict[str, float]:
         "rate_by_cycle": _rate_distance(real, sim, "cycle", errors),
         "substitution_by_context": _rate_distance(real, sim, "context", ("substitution",)),
     }
-    cycles = sorted({c for c, _ in real.q_cycle} & {c for c, _ in sim.q_cycle})
+    by_cycle: list[dict[int, dict[int, int]]] = [{}, {}]
+    for cells, p in zip(by_cycle, (real, sim), strict=True):
+        for (c, q), v in p.q_cycle.items():
+            cells.setdefault(c, {})[q] = v
     tv, weight = [], []
-    for c in cycles:
-        h = [{q: v for (cc, q), v in p.q_cycle.items() if cc == c} for p in (real, sim)]
+    for c in by_cycle[0].keys() & by_cycle[1].keys():
+        h = [by_cycle[0][c], by_cycle[1][c]]
         tot = [sum(x.values()) for x in h]
         tv.append(0.5 * sum(abs(h[0].get(q, 0) / tot[0] - h[1].get(q, 0) / tot[1]) for q in h[0].keys() | h[1].keys()))
         weight.append(tot[0])
     out["q_cycle_tv"] = float(np.average(tv, weights=weight)) if tv else float("nan")
     out["q_lag1"] = abs(_corr(real.lag) - _corr(sim.lag))
     out["kmer_spectrum_tv"] = _histogram_tv(*((p.multiplicity, None) for p in (real, sim)))
-    out["edits_per_read_tv"] = _histogram_tv(*((np.array(list(p.edits)), list(p.edits.values())) for p in (real, sim)))
+    out["read_error_rate_tv"] = _histogram_tv(
+        *((np.array(list(p.read_rates)), list(p.read_rates.values())) for p in (real, sim))
+    )
     a, b = (p.summary()["kmer_absent_fraction"] for p in (real, sim))
     out["kmer_absent"] = float(abs(np.log(b / a)))
     return out
@@ -219,6 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--native", default="native", help="the NAME of the native generator's read set")
     p.add_argument("--output", type=Path, required=True, metavar="JSON")
     p.add_argument("-k", type=int, default=21)
+    p.add_argument("--cycle-bin", type=int, default=10, help="bases per cycle bin (hundreds for long reads)")
     p.add_argument("--min-mapq", type=int, default=20)
     p.add_argument("--max-reads", type=int)
     p.add_argument("--unclip", nargs=4, type=int, metavar=("MATCH", "MISMATCH", "OPEN", "EXTEND"))
@@ -230,7 +255,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def run(path: Path) -> Profile:
         records = islice(bam.records(path, args.reference, args.min_mapq, unclip=unclip), args.max_reads)
-        return profile(records, islice(bam_reads(path, args.reference), args.max_reads), ref_kmers, args.k)
+        return profile(
+            records, islice(bam_reads(path, args.reference), args.max_reads), ref_kmers, args.k, args.cycle_bin
+        )
 
     real = run(args.real)
     profiles = {name: run(Path(path)) for name, path in sims.items()}
