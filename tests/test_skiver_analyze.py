@@ -109,3 +109,13 @@ def test_pre_0_3_outputs_rejected(tmp_path: Path) -> None:
             shutil.copy(f, tmp_path / f.name)
     with pytest.raises(sa.SkiverFormatError, match="older than skiver 0.3"):
         sa.read_analyze(tmp_path / "analyze")
+
+
+def test_half_integer_median_coverage(tmp_path: Path) -> None:
+    """`key_median_coverage` is a median over keys, so a real run reports 14.5 where the fixture has an int."""
+    src = (FIXTURES / "analyze.summary_error_rate.csv").read_text().splitlines()
+    fields = src[1].split(",")
+    fields[8] = "14.5"
+    path = tmp_path / "analyze.summary_error_rate.csv"
+    path.write_text(f"{src[0]}\n{','.join(fields)}\n")
+    assert sa.read_error_rate(path).key_median_coverage == 14.5

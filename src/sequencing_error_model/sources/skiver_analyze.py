@@ -56,7 +56,7 @@ class ErrorRate:
     lambda_ci: CI
     beta: float
     beta_ci: CI
-    key_median_coverage: int
+    key_median_coverage: float  # a median over keys, so it can be a half-integer (real runs)
     key_coverage_ci: CI
     true_median_coverage: float
     true_coverage_ci: CI
@@ -193,7 +193,7 @@ def read_error_rate(path: Path) -> ErrorRate:
     r = rows[0]
     return ErrorRate(
         float(r[0]), _ci(r[1]), float(r[2]), _ci(r[3]), float(r[4]), _ci(r[5]), float(r[6]), _ci(r[7]),
-        int(r[8]), _ci(r[9]), float(r[10]), _ci(r[11]), float(r[12]), float(r[13]), float(r[14]),
+        float(r[8]), _ci(r[9]), float(r[10]), _ci(r[11]), float(r[12]), float(r[13]), float(r[14]),
     )  # fmt: skip
 
 
