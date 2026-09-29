@@ -10,6 +10,9 @@ with the truth on held-out **clonal** templates - so every deviation is the vari
   majority strain, or an external relative at `relative_ani` - then a head E refit from the alignments;
 - `kmer`: a released `skiver analyze` with its own outlier filter, profiled from the same FASTQ.
 
+`--site-mask` turns on phase 8's conservative mask (`sites.conservative`) inside the `reference` mode, so the
+same grid measures what separation buys over the unmodified run.
+
 The grid's clonal point (`--ani 1 --haplotypes 1 --minor-density 0`) is the phase 4-6 recovery run, which is
 what makes this a bias table rather than a pile of numbers. `labels` sizes the problem independently of any fit:
 the share of read bases that really differ from the consensus, beside the share the generator got wrong.
@@ -32,7 +35,7 @@ from typing import Any
 import numpy as np
 
 from sequencing_error_model import compare as comparison
-from sequencing_error_model import recovery, variation
+from sequencing_error_model import recovery, sites, variation
 from sequencing_error_model import spec as spec_io
 from sequencing_error_model.generate import Read, generate, insert_sizes
 from sequencing_error_model.sources import bam, fastq_quality, pe_overlap, skiver_analyze
@@ -175,6 +178,7 @@ def scenario(
     preset: str = "sr",
     min_mapq: int = 20,
     unclip: bool = True,
+    site_mask: bool = False,
     skiver: str | None = None,
     k: int = 11,
     v: int = kmer_source.GOOD_V,
@@ -255,6 +259,7 @@ def scenario(
                 preset=preset,
                 min_mapq=min_mapq,
                 unclip=unclip,
+                site_mask=site_mask,
                 skiver=skiver,
                 k=k,
                 v=v,
@@ -297,23 +302,35 @@ def _fit(
         return fitted, {"stats": fitted.provenance["stats"]}
     if name == "reference":
         fasta, fastq, sam = workdir / "ref.fa", workdir / "reads.fastq", workdir / "aligned.sam"
+        contigs = _reference(pop, kw["reference"], kw["relative_ani"], rng)
         with fasta.open("w") as out:
-            for contig, seq in _reference(pop, kw["reference"], kw["relative_ani"], rng):
+            for contig, seq in contigs:
                 out.write(f">{contig}\n{seq}\n")
         _fastq(fastq, frags, reads, mate_suffix=True)
         recovery.run_aligner(kw["aligner"], fasta, fastq, sam, kw["preset"])
         _pair_flags(sam)
         scores = recovery.ALIGNER_SCORES[kw["aligner"]] if kw["unclip"] else None
-        aligned = list(bam.records(sam, fasta, kw["min_mapq"], unclip=scores))
+        alignments = list(bam._aligned(sam, fasta, kw["min_mapq"], scores))
+        masked, site_report = None, None
+        if kw.get("site_mask"):
+            # One extra pass over the same alignments: the phase 8 conservative mask (§6.6), which the mode
+            # otherwise runs without, counting every strain allele as an error.
+            seqs = dict(contigs)
+            counts = bam.count_alleles(alignments, {c: len(s) for c, s in contigs})
+            masked, site_report = sites.conservative(counts, sites.linked(alignments), seqs.__getitem__)
+        aligned = list(bam.apply_masks(alignments, masked))
         if not aligned:
             return None, {"skipped": "no read aligned"}
         a_templates, a_reads, a_mates = (list(x) for x in zip(*aligned, strict=True))
         table = recovery._tuples(truth, a_templates, a_reads, a_mates)
+        if not table.counts:
+            return None, {"skipped": "the site mask left no row"}
         fitted = recovery._refit_error(truth, table, aligned)
         return fitted, {
             "reference": kw["reference"],
             "unclip": kw["unclip"],
             "mapped_fraction": len(aligned) / len(reads),
+            "site_mask": site_report,
         }
     if name == "kmer":
         if not kw.get("skiver"):
@@ -410,6 +427,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--aligner", choices=("minibwa", "minimap2"), default="minibwa")
     p.add_argument("--preset", default="sr", help="aligner preset (minibwa -x, minimap2 -x)")
     p.add_argument("--clip", action="store_true", help="leave soft clips as they are (default: realign end to end)")
+    p.add_argument(
+        "--site-mask", action="store_true", help="mask sites the phase 8 conservative mask drops (`reference` mode)"
+    )
     p.add_argument("--skiver", help="path to a released skiver binary, for the `kmer` mode")
     p.add_argument("--use-all", action="store_true", help="run skiver with --use-all")
     p.add_argument("-k", type=int, default=11)
@@ -436,6 +456,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         aligner=args.aligner,
         preset=args.preset,
         unclip=not args.clip,
+        site_mask=args.site_mask,
         skiver=args.skiver,
         use_all=args.use_all,
         k=args.k,
@@ -463,6 +484,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _masked_fraction(report: Sequence[dict[str, Any]] | None) -> float | None:
+    """The share of reference sites the conservative mask dropped, or None when it did not run."""
+    if not report:
+        return None
+    dropped = sum(r["dropped"] for r in report)
+    return round(float(dropped) / max(1, sum(int(r["length"]) for r in report)), 4)
+
+
 def table(points: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """The bias table: one row per grid point and mode, the scalars only."""
     rows = []
@@ -477,6 +506,7 @@ def table(points: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                     "repeat": point["repeat"],
                     "variant_fraction": point.get("labels", {}).get("variant"),
                     "mode": name,
+                    "masked_site_fraction": _masked_fraction(m.get("site_mask")),
                     **{
                         k: m.get(k)
                         for k in (
