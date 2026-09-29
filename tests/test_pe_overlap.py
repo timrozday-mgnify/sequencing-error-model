@@ -2,6 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from sequencing_error_model import generate as gen
 from sequencing_error_model import recovery
@@ -67,3 +68,13 @@ def test_pe_overlap_recovers_substitution_head() -> None:
     assert stats["disagree"] and stats["indel"] and stats["no_overlap"] < stats["pairs"] / 10, stats
     assert fitted.provenance["mode"] == "pe-overlap"
     assert report.failures() == [], (report.scalars, report.curves["rate_by_q_true"], report.curves["rate_by_q_fit"])
+
+
+def test_long_inserts_give_no_overlap_evidence_and_say_so() -> None:
+    """Inserts longer than twice the read length place nowhere, so head E is not identified (phase 7 grid)."""
+    truth = recovery.scale_error_rate(recovery.example_spec(), 0.2)
+    rng = np.random.default_rng(0)
+    templates, mates = recovery.paired_draw(40, 200, 10, genome_length=5000)(rng, 80)
+    reads = gen.generate(truth, templates, mates, rng)
+    with pytest.raises(ValueError, match="no pair overlapped"):
+        pe_overlap.mode(templates, reads, mates, truth)

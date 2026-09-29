@@ -1178,11 +1178,16 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
       14.5 where the tiny fixture is integral, and the `int()` parse raised (`sources/skiver_analyze.py`).
 - **Exit:**
   - ✓ the synthetic loop passes at v=13 within the phase 2 tolerances (rate ratio 0.986, op TV 0.027, `failures` empty; run above), and the documented failure at small v is reproduced as a guarded error or warning (`sources/kmer._check_v`);
+    **Single-end only.** `skiver_recovery` generates all mate 1 (§6.2: default mode identifies no mate
+    effect), and phase 7's grid found that on *paired* reads from the same truth the same loop reads
+    1.19-1.22 rather than ~1.00, at every coverage from 30x to 100x. The truth's head Q makes mate 2 low-Q
+    and so noisier, and default mode's one centre-Q head cannot hold two mate populations. This exit stands
+    for the single-end case it tests; the paired case is phase 7's finding and is open.
   - ✓ the outlier filter's clonal cost is quantified per head E component (run above: a 1.08-1.10 level shift with the filter off, no shape change, and the filtered fit is the one that passes);
   - ✓ on the phase 5 near-clonal real dataset, skiver's marginals and the `kmer` spec are compared with both other modes on shared support, and the report states agreement per component (run above: the shape agrees as a flat multiple, the level does not, and the gap is skiver's own reported rate rather than the fit - bracketed, since the alignment is itself biased, low by a few percent through hidden edits and excluded reads and high through assembly consensus error);
   - reported, not blocking: the default-mode model's held-out likelihood and marginals vs ReSeq (Illumina) and Badread (long reads) profiles trained on the aligned reads (§4.4, risk 2).
 
-### Phase 7: biological variation simulator and the size of the problem (in progress)
+### Phase 7: biological variation simulator and the size of the problem (exits met bar the repeat case, carried to phase 8)
 Test infrastructure only (§1 scope): it exists so separation methods have per-base truth.
 - ✓ `variation.py`: from a base genome, strain haplotypes over a star or random tree at a target divergence
   (ANI), with SNPs (transition/transversion ratio) and short indels; within-population minor alleles from a
@@ -1213,7 +1218,7 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   - Deferred: recombination (below), external haplotypes (below), indel minor alleles, and per-sample
     minor-allele frequencies (one spectrum draw serves every sample).
   - No recombination at first. It weakens linkage, so it is added as a scenario once phase 8's linkage test needs a hard case.
-- External haplotypes: accept a reference plus VCF (msprime, SimBac) or haplotype FASTAs with a truth table (CAMISIM's sgEvolver strains), so richer population structure plugs in without a dependency.
+- External haplotypes (deferred, not an exit): accept a reference plus VCF (msprime, SimBac) or haplotype FASTAs with a truth table (CAMISIM's sgEvolver strains), so richer population structure plugs in without a dependency. Nothing in phase 8 needs it before its own population structure is the thing under test; the tree simulator covers the linkage the separation methods are judged on.
 - ✓ `variation.fragments` samples molecules by haplotype abundance (weighted by each contig's placements), so
   read names carry the haplotype through the contig name `<haplotype>|<contig>`, and every fragment comes with
   the *consensus counterpart* of each mate's template: the consensus base under each template base, `-` where
@@ -1224,12 +1229,95 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   is unchanged.
   - ponytail: placement is variation's own (a weighted copy of `generate.fragments`' draw) rather than a hook in
     the generator, so the abundance and minor-allele logic stays in one module.
-- **Scenario grid:** divergence (ANI 99.99, 99.9, 99, 98, 95%) × minor-strain fraction (0.5, 0.2, 0.05, 0.01) × per-genome coverage (10–200×) × minor-allele density × divergent repeats, single sample and a multi-sample abundance series; Illumina 2×150 with short and long inserts, and ONT/HiFi.
-- **Problem size.** Run each mode unmodified over the grid (`pe-overlap`; `reference` against an external relative, the majority-strain consensus and a self-assembly recipe; `kmer` default with its outlier filter) and report bias against the clonal truth per head E component: marginal rate, op composition, context log-odds, rate per reported Q, position. This is the baseline phase 8 must beat.
+- ✓ `bias.py`: the problem-size harness (`python -m sequencing_error_model.bias`). One grid point builds a
+  population, generates reads from a known spec over it, runs each mode *unmodified*, and compares each fitted
+  head E with the truth on held-out **clonal** templates sliced from the consensus, so every deviation is the
+  variation's cost and not the fitter's. `labels` sizes the problem before any fit: the share of read bases that
+  really differ from the consensus, beside the share the generator got wrong.
+  - Modes: `pe-overlap` on the same pairs; `reference` as single-end alignment (minibwa, soft clips realigned
+    end to end as phase 5 established) to a reference the run does not own, then a head E refit; `kmer` from a
+    released `skiver analyze` profiled off the same FASTQ.
+  - Per point and mode: marginal rate ratio, op-probability TV, op-composition TV, `Context` log-odds slope,
+    rate per reported Q, and rate per read position. Position comes from `compare.components`, not from the
+    report's per-position curve, whose last few points carry almost no exposure.
+  - `--reference` picks the consensus, the majority strain or an external relative at `--relative-ani`. A
+    self-assembly recipe is deferred: it needs an assembler, and `majority` already makes the same coordinate
+    mistake without the dependency.
+  - `recovery.scale_error_rate` was extracted from `aligner_bias`, which had it inline, so both callers share
+    the one definition of "the truth at a scaled error rate".
+  - Tests (`tests/test_bias.py`): a clonal population labels no read base a variant while a diverged one does;
+    the reference choices are each not the reads' own sequence; `_pair_flags` sets the mate bits from the name
+    suffix; a missing skiver is recorded and the rest of the table still lands; and the exit's contrast, that at
+    ANI 95% `pe-overlap` reads 1.04x the truth where `reference` reads 1.48x.
+  - **Fixed on the way:** with inserts longer than twice the read length no pair overlaps, and `pe-overlap` died
+    inside `fit.error` with `cannot reshape array of size 0`. Guarded at the choke point every head E fit routes
+    through (`fit.error._labelled`: no rows means head E is not identified), plus the actionable message in
+    `pe_overlap.fit`, which is the only mode whose evidence can legitimately be empty.
+- **Scenario grid, as run.** One factor at a time around a centre of ANI 99%, two haplotypes, 20% minor strain,
+  30x per genome, Illumina 2x150 with a 230 bp insert, on a 30 kb genome at seed 7, with the truth at
+  `--error-rate-scale 0.2`; 19 points, one process, one scale, unmodified skiver v0.3.2. **Not the planned full
+  product**, which is ~hundreds of points at ~3 minutes each: the axes are swept independently, which is what
+  sizes each one's contribution, and the interactions are not measured. Axes run: divergence (ANI 100, 99.99,
+  99.9, 99, 98, 95%), minor-strain fraction (0.5, 0.2, 0.05, 0.01), coverage (10, 30, 100x), minor-allele
+  density (1e-4, 1e-3), a 500 bp repeat copy at 97% identity, a 500 bp insert with no mate overlap, and the
+  majority-strain and external-relative references.
+  - Deferred with reasons: the multi-sample abundance series (each sample is fitted on its own here, so the
+    minor-strain sweep already covers it; it becomes a real axis when phase 8's multi-sample term exists) and
+    the ONT/HiFi arm (it needs a long-read truth spec, which the repo's example spec is not; `--read-length`
+    and `--aligner minimap2` are in place for it).
+- **Problem size.** Rate ratios, fitted over true, at 4.15% true error on paired reads:
+
+  | ANI | variant share of read bases | `pe-overlap` | `reference` | `kmer` |
+  |---|---|---|---|---|
+  | clonal | 0 | 0.979 | 0.990 | 1.219 |
+  | 99.99% | 0.015% | 1.007 | 0.987 | 1.155 |
+  | 99.9% | 0.05% | 0.956 | 0.995 | 1.162 |
+  | 99% | 0.51% | 0.984 | 1.112 | 1.227 |
+  | 98% | 0.96% | 0.966 | 1.215 | 1.160 |
+  | 95% | 2.38% | 0.976 | 1.545 | 1.414 |
+
+  - **`reference`'s inflation is the variant load, almost exactly.** Predicting 1 + variant/error gives 1.123,
+    1.232 and 1.574 against the measured 1.112, 1.215 and 1.545 at ANI 99, 98 and 95%. The shortfall is reads
+    that stop mapping (mapped fraction 0.992 to 0.965), not a method absorbing anything. Its shape goes with the
+    level: the `Context` log-odds slope falls 0.977, 0.848, 0.768, 0.591 over the same points, and the
+    op-composition TV rises 0.018 to 0.038, so variation flattens the context effect rather than scaling it.
+  - **`pe-overlap` is variant-immune**, 0.956 to 1.007 across every divergence, every minor-strain fraction and
+    every coverage. Both mates read the same molecule, so a real difference from the consensus is agreement, not
+    a disagreement to attribute.
+  - **The minor-strain fraction does not matter**: 0.5, 0.2, 0.05 and 0.01 all give `reference` 1.106 to 1.112.
+    The variant load per read is set by divergence alone, since a read is either off a diverged haplotype or it
+    is not. Mixture proportion is a phase 8 detection problem, not a phase 7 bias one.
+  - **Coverage does not move `reference`** (1.105, 1.112, 1.112 at 10, 30, 100x) but breaks `kmer` at 10x, where
+    it reads *low* at 0.836 against 1.227 at 30x. That is a floor for phase 8 to state rather than tune away.
+  - **The reference you pick is worth more than the method**: at ANI 99%, the majority strain gives 1.039, the
+    consensus 1.112, and an external relative at 95% gives 1.663 with mapping down to 0.950. Aligning to the
+    abundant strain removes most variant mismatches because the reads mostly are that strain.
+  - **`kmer`'s clonal bias of ~1.19-1.22 is a paired-read effect, not coverage and not variation.** It is 1.219
+    at 30x and 1.187 at 100x, but single-end reads from the same truth at the same coverage give 1.018 with no
+    failures, and phase 6's run replicates at 0.9997. The mechanism is in the truth: head Q's `Mate` term makes
+    mate 2 low-Q (weight on Q=2, against Q=37) and so noisier, and default mode sees no mates (§6.2), so its one
+    centre-Q head is fitted to a mixture of two mate populations and lands high. **Phases 4-6 only ever ran
+    `kmer` single-end**, so this is new, and it is a property of default mode plus this truth rather than of the
+    variation the phase is about.
+  - **Two scenarios came out negative, and are reported as such rather than claimed.** The minor-allele
+    densities run (1e-4, 1e-3) reach variant loads of only 0.001% and 0.009%, three orders below the error rate,
+    so nothing moves in any mode and `pe-overlap`'s blindness to within-molecule alleles is *not* exercised;
+    reaching a 0.5% load needs a density near 1e-2 at frequencies near 0.25. And a 500 bp repeat copy at 97%
+    identity is 1.7% of a 30 kb genome, so it costs nothing measurable in a global rate (`pe-overlap` 0.976,
+    `reference` 0.983): the repeat is a per-site failure, and showing it needs a per-site statistic or a much
+    larger repeat fraction.
 - **Exit:**
   - ✓ per-base truth round-trips: every read mismatch against the consensus is labelled error or variant, consistently with the CIGAR and haplotype (`variation.truth`, tested against an independent walk of the alignment);
-  - the grid's clonal point reproduces the phase 4–6 recovery results;
-  - the bias table exists for all three modes, and `pe-overlap` is shown variant-immune outside the repeat scenarios.
+  - ✓ the grid's clonal point reproduces the phase 4-6 recovery results for `pe-overlap` (0.979) and `reference`
+    (0.990), and for `kmer` on the single-end reads phases 4-6 actually ran (1.018, and phase 6's own run
+    replicates at 0.9997); on paired reads `kmer` reads 1.19-1.22 for the reason above, which is recorded as a
+    default-mode finding, not a grid failure;
+  - ✓ the bias table exists for all three modes (above), and `pe-overlap` is shown variant-immune across the
+    divergence, minor-strain and coverage axes;
+  - **not shown:** that `pe-overlap` stops being immune in the repeat scenarios. The repeat run is too small a
+    share of the genome to move a global rate, and the minor-allele densities run are too sparse to test the
+    within-molecule case at all. Both need the per-site statistic phase 8 builds (`sites.py`), so the claim is
+    carried there rather than asserted here.
 
 ### Phase 8: separating biological variation from sequencing error
 - `sites.py` (§6.6):
@@ -1238,9 +1326,19 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   - **`kmer` default:** a key-level test of each key's op counts against head E's expected counts at the key's coverage, beside or instead of skiver's outlier filter; enhanced mode adds linkage through read ids.
 - **Q diagnostic:** mismatch rate by reported Q at called variant sites vs retained sites. The miscalibrated-Q guard (§10) is rerun with variation present.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.
+- **Carried from phase 7**, where a global rate could not show either: the repeat case (a 500 bp copy at 97%
+  identity is 1.7% of a 30 kb genome, so it moves no marginal rate even though it is a per-site failure) and
+  the within-molecule minor-allele case (the densities run reached variant loads three orders below the error
+  rate). Both are per-site claims, so `sites.py`'s own statistic is what tests them: `pe-overlap` is expected
+  to lose its immunity exactly where two repeat copies put different molecules in one overlap.
 - **Real strain-resolved data**, in order: skiver's K-12/O157:H7 mixtures; ZymoBIOMICS D6331 (21 strains including five E. coli at equal abundance; strain genomes supplied); then one real metagenome.
 - **Exit:**
-  - on the phase 7 grid, head E is recovered within the phase 2 tolerances against the clonal truth in every scenario above a stated floor of minor-strain fraction, divergence and coverage; the floor is set from the phase 7 bias table before the methods are tuned, and failures below it are reported;
+  - on the phase 7 grid, head E is recovered within the phase 2 tolerances against the clonal truth in every scenario above a stated floor of minor-strain fraction, divergence and coverage; the floor is set from the phase 7 bias table before the methods are tuned, and failures below it are reported.
+    **The phase 7 table sets that floor**: divergence is the axis that matters (`reference` 1.112 at ANI 99%,
+    1.545 at 95%), minor-strain fraction is not (1.106 to 1.112 over 0.5 down to 0.01), and coverage bites
+    only `kmer`, which reads 0.836 at 10x. Two baselines to beat are already there for free: `pe-overlap` at
+    0.956 to 1.007 throughout, and, for `reference`, picking the majority strain rather than the consensus
+    (1.039 against 1.112) before any separation method runs;
   - no method moves the clonal point outside the phase 2 tolerances;
   - with miscalibrated Q and variants, fitted rates follow the injected truth, not the reported Q;
   - on D6331, `reference` and `kmer` specs agree with `pe-overlap` or a clonal spike-in on shared support within tolerance, or the report explains each gap; variant-site precision and recall against the known strain differences are reported, not blocking.

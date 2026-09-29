@@ -255,6 +255,8 @@ def _labelled(
     """Validate a labelled table for `components`; return counts [R, K] and the feature columns."""
     if "op" not in table.fields:
         raise ValueError(f"{table.source}: head E needs op labels from a truth-bearing source")
+    if not table.counts:
+        raise ValueError(f"{table.source}: no rows, so head E is not identified by this evidence")
     fields = [f for f in table.fields if f != "op"]
     _validate(components, fields, table.meta, table.source)
     oi, ci, f0 = table.fields.index("op"), fields.index("context"), tuple(table.meta.get("flank", (0, 0)))[0]
