@@ -10,8 +10,9 @@ with the truth on held-out **clonal** templates - so every deviation is the vari
   majority strain, or an external relative at `relative_ani` - then a head E refit from the alignments;
 - `kmer`: a released `skiver analyze` with its own outlier filter, profiled from the same FASTQ.
 
-`--site-mask` turns on phase 8's conservative mask (`sites.conservative`) inside the `reference` mode, so the
-same grid measures what separation buys over the unmodified run.
+`--site-mask conservative` or `--site-mask joint` turns on one of phase 8's two site models (`sites.conservative`,
+`sites.joint`) inside the `reference` mode, so the same grid measures what separation buys over the unmodified
+run.
 
 The grid's clonal point (`--ani 1 --haplotypes 1 --minor-density 0`) is the phase 4-6 recovery run, which is
 what makes this a bias table rather than a pile of numbers. `labels` sizes the problem independently of any fit:
@@ -37,6 +38,7 @@ import numpy as np
 from sequencing_error_model import compare as comparison
 from sequencing_error_model import recovery, sites, variation
 from sequencing_error_model import spec as spec_io
+from sequencing_error_model.fit import indel
 from sequencing_error_model.generate import Read, generate, insert_sizes
 from sequencing_error_model.sources import bam, fastq_quality, pe_overlap, skiver_analyze
 from sequencing_error_model.sources import kmer as kmer_source
@@ -178,7 +180,7 @@ def scenario(
     preset: str = "sr",
     min_mapq: int = 20,
     unclip: bool = True,
-    site_mask: bool = False,
+    site_mask: str | None = None,
     skiver: str | None = None,
     k: int = 11,
     v: int = kmer_source.GOOD_V,
@@ -312,12 +314,17 @@ def _fit(
         scores = recovery.ALIGNER_SCORES[kw["aligner"]] if kw["unclip"] else None
         alignments = list(bam._aligned(sam, fasta, kw["min_mapq"], scores))
         masked, site_report = None, None
-        if kw.get("site_mask"):
-            # One extra pass over the same alignments: the phase 8 conservative mask (§6.6), which the mode
-            # otherwise runs without, counting every strain allele as an error.
+        if model := kw.get("site_mask"):
+            # One extra pass over the same alignments: a phase 8 site model (§6.6), which the mode otherwise
+            # runs without, counting every strain allele as an error.
             seqs = dict(contigs)
             counts = bam.count_alleles(alignments, {c: len(s) for c, s in contigs})
-            masked, site_report = sites.conservative(counts, sites.linked(alignments), seqs.__getitem__)
+            if model == "joint":
+                body = [c.token for c in indel.split(truth.error_head)[0]]
+                flank, m = bam.window(body, [c.token for c in truth.quality_head])
+                masked, site_report = sites.joint(alignments, counts, seqs.__getitem__, body, flank=flank, m=m)
+            else:
+                masked, site_report = sites.conservative(counts, sites.linked(alignments), seqs.__getitem__)
         aligned = list(bam.apply_masks(alignments, masked))
         if not aligned:
             return None, {"skipped": "no read aligned"}
@@ -330,6 +337,7 @@ def _fit(
             "reference": kw["reference"],
             "unclip": kw["unclip"],
             "mapped_fraction": len(aligned) / len(reads),
+            "site_model": kw.get("site_mask"),
             "site_mask": site_report,
         }
     if name == "kmer":
@@ -428,7 +436,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--preset", default="sr", help="aligner preset (minibwa -x, minimap2 -x)")
     p.add_argument("--clip", action="store_true", help="leave soft clips as they are (default: realign end to end)")
     p.add_argument(
-        "--site-mask", action="store_true", help="mask sites the phase 8 conservative mask drops (`reference` mode)"
+        "--site-mask",
+        choices=("conservative", "joint"),
+        help="run a phase 8 site model inside the `reference` mode: the conservative mask, or the joint "
+        "latent-site model on top of its coverage criteria",
     )
     p.add_argument("--skiver", help="path to a released skiver binary, for the `kmer` mode")
     p.add_argument("--use-all", action="store_true", help="run skiver with --use-all")

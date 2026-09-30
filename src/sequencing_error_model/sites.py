@@ -1,10 +1,10 @@
-"""Variation vs error at the site level (plan §6.6, phase 8): the conservative mask.
+"""Variation vs error at the site level (plan §6.6, phase 8): the conservative mask and the joint
+latent-site model.
 
 `reference` mode counts every mismatch as an error, so a co-existing strain's alleles inflate head E (phase 7:
 1.11x at ANI 99%, 1.55x at 95%). The conservative mask keeps only sites whose reads can be believed clonal,
 using **Q-free covariates that are not the outcome** - coverage, coverage consistent with a single copy, and
-allele linkage - so head E stays unbiased on what is left. It is the first of §6.6's two layers; the joint
-latent-site model is the second and is still to come.
+allele linkage - so head E stays unbiased on what is left. It is the first of §6.6's two layers.
 
 - **Coverage.** A site below `min_depth` has no power to bound anything, so it goes.
 - **Single copy.** Two collapsed repeat copies pile up at roughly twice the contig's median depth and disagree
@@ -14,6 +14,11 @@ latent-site model is the second and is still to come.
   alleles* recurring on `min_pairs` reads is a variant pair, and both its sites go. This is the one criterion
   that looks at mismatches, and it looks at their co-occurrence rather than their frequency: an error hotspot
   (which frequency-based masking drops, §6.6) has no partner allele to recur with.
+
+`joint` is the second layer. It keeps the two coverage criteria, drops linkage as a hard criterion, and asks
+of every site whether its own alleles are more counts than head E predicts *for the reads that cover it* -
+head E fitted, in the same loop, on the rows the site posteriors leave clonal. Linkage becomes a term in that
+posterior rather than a verdict.
 
 Every mask reports what it dropped and what it kept, by observed op and by reference base, so a mask that eats
 one op class or one context shows up before head E is fitted from what survives.
@@ -25,14 +30,18 @@ than the read links nothing across its gap; mate linkage is the upgrade path whe
 """
 
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
+from scipy import special
 
+from sequencing_error_model.fit import error
 from sequencing_error_model.fit.quality import Array
-from sequencing_error_model.generate import Read, align
-from sequencing_error_model.sources.bam import _BASE, _COMPLEMENT, Alignment
+from sequencing_error_model.generate import Read, align, observations
+from sequencing_error_model.sources.bam import _BASE, _COMPLEMENT, Alignment, apply_masks
+from sequencing_error_model.spec import Component
 
 _OP_NAMES = ("alt_A", "alt_C", "alt_G", "alt_T", "deletion", "insertion")
 
@@ -77,6 +86,24 @@ def _composition(alt: Array, ref: Array, which: Array) -> dict[str, Any]:
     }
 
 
+def _coverage(
+    table: Array, contig_sequence: str, min_depth: float, copy_ratio: float
+) -> tuple[Array, Array, Array, float, Array, Array]:
+    """The two Q-free coverage criteria: reference base indices, non-reference allele counts, depth, the
+    contig's median depth, and the low-depth and off-median (collapsed copy or coverage hole) site masks."""
+    ref = np.array([_BASE.get(b, -1) for b in contig_sequence.upper()] + [-1])
+    depth = table[: len(ref), :5].sum(axis=1)
+    alt = table[: len(ref)].copy()
+    has_ref = ref >= 0
+    alt[np.flatnonzero(has_ref), ref[has_ref]] = 0
+    median = float(np.median(depth[:-1])) if len(ref) > 1 else 0.0
+    low = depth < min_depth
+    copies = np.zeros(len(ref), bool)
+    if median > 0:
+        copies = (depth > copy_ratio * median) | (depth * copy_ratio < median)
+    return ref, alt, depth, median, low, copies
+
+
 def conservative(
     counts: dict[str, Array],
     linked_sites: dict[str, set[int]],
@@ -95,16 +122,7 @@ def conservative(
     masks: dict[str, Array] = {}
     report = []
     for contig, table in counts.items():
-        ref = np.array([_BASE.get(b, -1) for b in sequence(contig).upper()] + [-1])
-        depth = table[: len(ref), :5].sum(axis=1)
-        alt = table[: len(ref)].copy()
-        has_ref = ref >= 0
-        alt[np.flatnonzero(has_ref), ref[has_ref]] = 0
-        median = float(np.median(depth[:-1])) if len(ref) > 1 else 0.0
-        low = depth < min_depth
-        copies = np.zeros(len(ref), bool)
-        if median > 0:
-            copies = (depth > copy_ratio * median) | (depth * copy_ratio < median)
+        ref, alt, _, median, low, copies = _coverage(table, sequence(contig), min_depth, copy_ratio)
         link = np.zeros(len(ref), bool)
         sites = [s for s in linked_sites.get(contig, ()) if 0 <= s < len(ref)]
         link[sites] = True
@@ -121,6 +139,125 @@ def conservative(
                 "dropped_linked": int((link & ~low & ~copies).sum()),
                 "dropped_composition": _composition(alt, ref, mask),
                 "kept_composition": _composition(alt, ref, ~mask),
+            }
+        )
+    return masks, report
+
+
+def joint(
+    alignments: Sequence[Alignment],
+    counts: dict[str, Array],
+    sequence: Callable[[str], str],
+    error_tokens: Sequence[str],
+    *,
+    flank: tuple[int, int],
+    m: int,
+    min_depth: float = 5.0,
+    copy_ratio: float = 2.0,
+    min_pairs: int = 3,
+    prior: float = 1e-3,
+    linkage_log_odds: float = 5.0,
+    iterations: int = 3,
+    threshold: float = 0.5,
+    tol: float = 1e-3,
+) -> tuple[dict[str, Array], list[dict[str, Any]]]:
+    """The joint latent-site model (§6.6, layer two): site posteriors scored against head E's own expected
+    counts, alternating with head E fitted on the rows those posteriors leave clonal. Returns the same
+    `(masks, report)` as `conservative`, so it drops into the same `sources.bam.apply_masks` path.
+
+    The two coverage criteria are kept as hard drops (a site below `min_depth` has no power, one off the
+    contig's median depth is a collapsed copy), and linkage stops being a hard drop and becomes a term in the
+    posterior. Per site and per error category, the count test is inStrain's with head E's expected count in
+    place of an assumed Q: `log BF` between the category's observed count under head E's own predicted rate at
+    *those* reads' contexts, qualities and positions, and under the MLE rate that the observation implies.
+    Q enters only through fitted head E; no rate is ever read off a reported Q.
+
+    `error_tokens` are head E's tokens, `flank` and `m` its context and Q windows (`sources.bam.window`); the
+    quality alphabet is read off the rows, as `sources.bam.main` does. The loop starts from the conservative
+    mask (linked sites at posterior 1) and stops when no posterior moves by `tol`.
+
+    ponytail: hard weights on the way out (a site is dropped or kept), soft weights only inside the loop; the
+    multi-sample term of §6.6 is left out until several samples of one community are on hand; and the
+    posterior is the best single category's, not a sum over alleles, which costs a little power at a site with
+    two real alternative alleles.
+    """
+    alignments = [a for a in alignments if a[0] in counts]
+    ref_of: dict[str, Array] = {}
+    alt_of: dict[str, Array] = {}
+    parts: dict[str, tuple[float, Array, Array]] = {}
+    hard: dict[str, Array] = {}
+    offset: dict[str, int] = {}
+    total = 0
+    for contig, pileup in counts.items():
+        ref, alt, _, median, low, copies = _coverage(pileup, sequence(contig), min_depth, copy_ratio)
+        ref_of[contig], alt_of[contig], parts[contig] = ref, alt, (median, low, copies)
+        hard[contig] = low | copies
+        offset[contig], total = total, total + len(ref)
+
+    table = observations(apply_masks(alignments, hard), flank, m, "bam", read_ids=True, template_index=True)
+    if not table.counts:
+        raise ValueError("the coverage criteria left no row to fit head E on")
+    keys = list(table.counts)
+    n = np.array(list(table.counts.values()), float)
+    ri, ti, oi, ci = (table.fields.index(f) for f in ("read", "t", "op", "context"))
+    rec = np.array([k[ri] for k in keys], np.int64)
+    tpl = np.array([k[ti] for k in keys], np.int64)
+    starts = np.array([a[1] for a in alignments], np.int64)
+    spans = np.array([a[2] - a[1] for a in alignments], np.int64)
+    backwards = np.array([a[3] for a in alignments], bool)
+    bases = np.array([offset[a[0]] for a in alignments], np.int64)
+    site = bases[rec] + np.where(backwards[rec], starts[rec] + spans[rec] - 1 - tpl, starts[rec] + tpl)
+    cat = np.array([error._category(k[oi], str(k[ci])[flank[0]]) for k in keys], np.int64)
+    qs = {v for k in keys for f, v in zip(table.fields, k, strict=True) if f.startswith("q") and v is not None}
+    alphabet = sorted(int(v) for v in qs)  # type: ignore[call-overload]
+
+    link = np.zeros(total, bool)
+    for contig, found in linked(alignments, min_pairs).items():
+        link[[offset[contig] + s for s in found if 0 <= s < len(ref_of[contig])]] = True
+    depth = np.bincount(site, n, minlength=total)
+    k_cat = len(error.CATEGORIES)
+    gamma = link.astype(float)
+    head: tuple[Component, ...] | None = None
+    step = 0
+    while step < iterations:
+        step += 1
+        weighted = replace(table, counts=Counter(dict(zip(keys, n * (1 - gamma[site]), strict=True))))
+        head = error.fit(weighted, error_tokens, alphabet, init=head)
+        predicted = error.probabilities(head, alphabet, table)
+        expected = np.stack([np.bincount(site, n * predicted[:, c], minlength=total) for c in range(1, k_cat)], 1)
+        observed = np.stack([np.bincount(site, n * (cat == c), minlength=total) for c in range(1, k_cat)], 1)
+        d = np.maximum(depth, 1.0)[:, None]
+        p0 = np.clip(expected / d, 1e-9, 0.5)
+        p1 = np.clip(observed / d, p0, 1 - 1e-9)  # the MLE rate under "this site carries the allele"
+        log_bf = observed * np.log(p1 / p0) + (d - observed) * (np.log1p(-p1) - np.log1p(-p0))
+        logit = np.log(prior / (1 - prior)) + log_bf.max(axis=1) + linkage_log_odds * link
+        moved = special.expit(np.where(depth > 0, logit, -np.inf))
+        gap = float(np.abs(moved - gamma).max())
+        gamma = moved
+        if gap < tol:
+            break
+
+    masks: dict[str, Array] = {}
+    report = []
+    for contig, ref in ref_of.items():
+        median, low, copies = parts[contig]
+        g = gamma[offset[contig] : offset[contig] + len(ref)]
+        variant = (g >= threshold) & ~hard[contig]
+        mask = hard[contig] | variant
+        masks[contig] = mask
+        report.append(
+            {
+                "contig": contig,
+                "length": len(ref) - 1,
+                "median_depth": median,
+                "iterations": step,
+                "dropped": int(mask.sum()),
+                "dropped_low_depth": int(low.sum()),
+                "dropped_multi_copy": int((copies & ~low).sum()),
+                "dropped_variant": int(variant.sum()),
+                "dropped_variant_linked": int((variant & link[offset[contig] : offset[contig] + len(ref)]).sum()),
+                "dropped_composition": _composition(alt_of[contig], ref, mask),
+                "kept_composition": _composition(alt_of[contig], ref, ~mask),
             }
         )
     return masks, report

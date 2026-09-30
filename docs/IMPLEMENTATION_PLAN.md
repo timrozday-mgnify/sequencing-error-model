@@ -1324,7 +1324,7 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   - ✓ **conservative mask** (`sites.conservative`, `sites.linked`): coverage, single-copy coverage, no linked
     variants, Q-free; reports what each criterion dropped and the op and reference-base composition of the
     dropped and the kept sites. It returns `sources.bam`-shaped masks, so the mask plugs into the existing
-    `apply_masks` path and `bias.scenario(site_mask=True)` reruns the phase 7 grid with it.
+    `apply_masks` path and `bias.scenario(site_mask="conservative")` reruns the phase 7 grid with it.
     - **Coverage and single copy** are the two Q-free covariates that are not the outcome: a site below
       `min_depth` (5) has no power, and a site outside a factor `copy_ratio` (2) of the contig's median depth
       is two collapsed copies or a coverage hole.
@@ -1349,7 +1349,46 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
     - Deferred: linkage across a pair's two mates (records are linked one at a time, so an insert longer than
       the read links nothing across its gap), per-window median depth, and the `sources.bam` CLI flags - the
       mask is exercised through the bias harness until the grid says which defaults to ship.
-  - **joint latent-site model** over `reference` tuples: site allele counts under head E's expected counts, a linkage term from read and pair co-occurrence, an optional multi-sample term; alternates with head E fitting and warm starts, as `pe-overlap`'s EM does;
+  - ✓ **joint latent-site model** (`sites.joint`, `bias.scenario(site_mask="joint")`): the second layer, the
+    DADA2 loop with head E in place of DADA2's abundance p-value. It keeps the conservative mask's two
+    coverage criteria as hard drops, turns linkage from a verdict into a term, and asks of every remaining
+    site whether its own allele counts are more than head E predicts **for the reads that cover it**.
+    - **The test.** Per site and per error category, `log BF` between head E's predicted rate at those reads'
+      contexts, qualities and positions, and the MLE rate the observation implies; the posterior adds a site
+      prior and, for a site in a linked pair, `linkage_log_odds`. This is inStrain's coverage-dependent count
+      test with head E's expected count where inStrain assumes Q30, so no rate is ever read off a reported Q.
+    - **The loop.** Row counts are scaled by `1 - P(variant)` at their site, head E is refitted warm-started
+      on those fractional counts, the posteriors are rescored, repeat. It starts from the conservative mask
+      (linked sites at posterior 1), never from Q, and converges in 3 passes on every point below.
+    - **Measured** (the conservative mask's grid: 8 kb genome, 2x120 reads, 4.2% true error, `reference` mode
+      on the consensus, ANI 95% with two haplotypes; rate ratio, then the share of sites dropped):
+
+      | coverage | unmasked | conservative | joint | clonal point (joint) |
+      |---|---|---|---|---|
+      | 20x | 1.553 | 1.057 (7.7%) | **0.942** (8.9%) | 0.956 (4.8%, 13 sites called variant) |
+      | 30x | 1.565 | 1.064 (7.3%) | **0.950** (8.4%) | 0.980 (4.2%, 15) |
+      | 100x | 1.551 | **0.979** (15.6%) | 0.911 (11.7%) | 0.969 (3.3%, 68) |
+
+      Against the clonal point at the same coverage - the fitter's own floor, which is the honest comparison -
+      the conservative mask leaves +10.0%, +8.1% and +0.6% of residual inflation and the joint model leaves
+      -1.5%, -3.1% and **-6.4%**. So the joint model is the better of the two at 20x and 30x, where the
+      conservative mask's linkage has no power, and the *worse* of the two at 100x, where it starts to
+      undershoot.
+    - **Why it undershoots at depth, and what that costs.** The count test is outcome-dependent by
+      construction (§6.6): head E supplies the expected count, but the decision is still taken on the observed
+      one, so a site where errors happen to pile up above head E's expectation is dropped with the variants.
+      The test's power grows with coverage, so at 100x it reaches into the error count's own upper tail and
+      shaves the fitted rate. The clonal point bounds that cost directly and it is small (0.956, 0.980, 0.969
+      against 0.960, 0.984, 0.977 unmasked; 13 to 68 sites of 8000 called variant), but it is the mechanism
+      behind the ANI 95% undershoot, where 743 sites are called variant at 100x. `prior` is the knob and it is
+      left at 1e-3 until the exit criteria say which way to tune it - the floor is set before the methods are.
+    - Tests (`tests/test_sites.py`): a hand-built 800 bp pileup at 60x and 2% error where a 40% variant is
+      found and the matching clonal pileup calls nothing; a minor allele at 1 read in 60, the count two errors
+      would make, which is correctly *not* separable (§6.6 signal 2); and the ANI 95% contrast beside the
+      clonal point through `bias.scenario`.
+    - Deferred: §6.6's multi-sample term (no multi-sample scenario exists yet); soft weights on the way out,
+      so the mask the harness consumes is still a hard drop; and the posterior is the best single category's,
+      not a sum over alleles, which costs a little power where two real alternative alleles share a site.
   - **`kmer` default:** a key-level test of each key's op counts against head E's expected counts at the key's coverage, beside or instead of skiver's outlier filter; enhanced mode adds linkage through read ids.
 - **Q diagnostic:** mismatch rate by reported Q at called variant sites vs retained sites. The miscalibrated-Q guard (§10) is rerun with variation present.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.

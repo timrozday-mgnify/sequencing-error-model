@@ -411,6 +411,7 @@ def observations(
     source: str = "generator",
     per_event: bool = False,
     read_ids: bool = False,
+    template_index: bool = False,
 ) -> CountTable:
     """Head E tuples from (template, read, mate) triples, one row per draw, as `fit.error` expects.
 
@@ -420,11 +421,13 @@ def observations(
     aligned part; `strand` overrides the mate-based strand. Rows at template bases other than A, C, G, T, at
     `masked` template indices, or with a read base other than A, C, G, T (an N call), are skipped. With `per_event` (head E with `IndelLength`), an indel event gives
     one row, its first inserted or deleted base, as the generator draws it. `read_ids` adds a `read` field, the
-    record's index, for per-read fits (`Latent(S)`).
+    record's index, for per-read fits (`Latent(S)`); `template_index` adds `t`, the row's template base, which
+    a caller holding each record's placement turns into a reference site (`sites.joint`).
     """
     left, right = flank
     fields = ("q", *(f"q{s}{o}" for o in range(1, m + 1) for s in "-+"))
-    fields += ("context", "pos_start", "pos_end", "mate", "strand", "gc", *(("read",) if read_ids else ()), "op")
+    fields += ("context", "pos_start", "pos_end", "mate", "strand", "gc", *(("read",) if read_ids else ()))
+    fields += (*(("t",) if template_index else ()), "op")
     counts: Counter[Key] = Counter()
     for index, (template, read, mate) in enumerate(records):
         rid = (index,) if read_ids else ()
@@ -444,7 +447,7 @@ def observations(
                 filled[i + o] if 0 <= i + o < len(filled) else None for k in range(1, m + 1) for o in (-k, k)
             )
             key = (filled[i], *window, padded[t : t + left + right + 1], i + 1, len(filled) - i, mate, strand, gc)
-            key += (*rid, op)
+            key += (*rid, *((t,) if template_index else ()), op)
             counts[key] += 1
     return CountTable(source, fields, "base", True, counts, {"flank": flank})
 
