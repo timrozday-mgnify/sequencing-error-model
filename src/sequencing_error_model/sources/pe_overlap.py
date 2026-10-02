@@ -15,7 +15,12 @@ Per pair, streaming:
    matched and the other substituted. Other context bases are the consensus inside the overlap (N where the
    mates disagree) and the mate's own bases outside it.
 4. `fit` attributes each disagreement by EM with head E over both mates' rows, starting from a coin flip and
-   never from Q.
+   never from Q. The two explanations also put a different template base under one mate's reported Q, so each
+   is weighted by head Q's P(Q | context) over the rows whose context covers the site, with the candidate base
+   there. Without it the EM drops a factor of the joint likelihood: head Q makes Q depend on the base read
+   (low Q on G in the example truth), and a truth whose noisy mate is the high-Q one (`recovery.miscalibrate`)
+   was fitted with its Q dependence flattened, Q2 at 6.5x. This uses Q as the modelled output it is (plan §5),
+   not as a rate.
 
 Head Q is fitted from every base of every pair, placed or not, conditioned on observed bases (as
 `fastq_quality`). Fitting it only on kept overlaps would bias it: the pairs dropped for indels or mismatches are
@@ -38,6 +43,7 @@ from pathlib import Path
 from typing import cast
 
 import numpy as np
+from scipy import special
 
 from sequencing_error_model.fit import error, quality
 from sequencing_error_model.fit.quality import _BASE, Array
@@ -49,6 +55,7 @@ from sequencing_error_model.spec import Component, ErrorModelSpec
 
 _COMP = dict(zip("ACGT", "TGCA", strict=True))
 Pair = tuple[str, Sequence[int], str, Sequence[int]]  # R1 bases, R1 Q, R2 bases, R2 Q
+Dispute = tuple[Key, Key, Key, Key, tuple[Key, ...], tuple[Key, ...]]
 
 
 @dataclass
@@ -65,8 +72,9 @@ class Evidence:
     m: int
     flank: tuple[int, int]
     certain: Counter[Key] = field(default_factory=Counter)
-    # (mate 1 row, mate 2 row) if mate 1 read the template base, then the same if mate 2 did
-    disputed: Counter[tuple[Key, Key, Key, Key]] = field(default_factory=Counter)
+    # (mate 1 row, mate 2 row) if mate 1 read the template base, then the same if mate 2 did, then the head Q
+    # rows covering the site under each (both mates' rows in one tuple)
+    disputed: Counter["Dispute"] = field(default_factory=Counter)
     # head Q rows (q-1..q-m, pos_start, pos_end, mate, observed context, q) over every base of every pair
     quality: Counter[Key] = field(default_factory=Counter)
     alphabet: set[int] = field(default_factory=set)
@@ -178,7 +186,12 @@ def collect(
             else:
                 ev.stats.disagree += 1
                 first = (_row(mates[0], i, b1, b1, m, flank), _row(mates[1], j, _COMP[b1], o2, m, flank))
-                ev.disputed[(*first, _row(mates[0], i, b2, b1, m, flank), _row(mates[1], j, o2, o2, m, flank))] += 1
+                second = (_row(mates[0], i, b2, b1, m, flank), _row(mates[1], j, o2, o2, m, flank))
+                q_first = _q_rows(reads[0], qs[0], 1, i, b1, m, flank) + _q_rows(
+                    reads[1], qs[1], 2, j, _COMP[b1], m, flank
+                )
+                q_second = _q_rows(reads[0], qs[0], 1, i, b2, m, flank) + _q_rows(reads[1], qs[1], 2, j, o2, m, flank)
+                ev.disputed[(*first, *second, q_first, q_second)] += 1
     return ev
 
 
@@ -199,34 +212,63 @@ def _row(
     return (q[p], *window, ctx[:left] + centre + ctx[left + 1 :], p + 1, n - p, mate, "+-"[mate - 1], gc, op)
 
 
-Groups = list[tuple[tuple[Key, Key, Key, Key], int]]
+def _q_rows(seq: str, q: list[int], mate: int, p: int, base: str, m: int, flank: tuple[int, int]) -> tuple[Key, ...]:
+    """Head Q rows (as `fastq_quality.quality_rows`) whose context covers read position `p`, with `base` there.
+
+    ponytail: no prior over the template base itself; add one (e.g. base composition) if a genome is skewed.
+    """
+    left, right = flank
+    rows = fastq_quality.quality_rows(seq[:p] + base + seq[p + 1 :], q, mate, m, flank)
+    return tuple(islice(rows, max(0, p - right), p + left + 1))
+
+
+Groups = list[tuple[Dispute, int]]
 
 
 def _expected(ev: Evidence, groups: Groups, first: Array) -> CountTable:
     """Head E rows with each disagreement split by `first`, P(mate 1 read the template base)."""
     counts: dict[Key, float] = dict(ev.certain)
     for (rows, n), w in zip(groups, first, strict=True):
-        for r, c in zip(rows, (n * w, n * w, n * (1 - w), n * (1 - w)), strict=True):
+        for r, c in zip(rows[:4], (n * w, n * w, n * (1 - w), n * (1 - w)), strict=True):
             counts[r] = counts.get(r, 0.0) + float(c)
     expected = cast("Counter[Key]", Counter({k: v for k, v in counts.items() if v > 0}))
     return CountTable("pe-overlap", fields(ev.m), "base", True, expected, {"flank": ev.flank})
 
 
-def _posterior(ev: Evidence, groups: Groups, error_head: Sequence[Component]) -> Array:
-    """P(mate 1 read the template base) per disagreement under `error_head`."""
+def _posterior(
+    ev: Evidence,
+    groups: Groups,
+    error_head: Sequence[Component],
+    quality_head: Sequence[Component] | None = None,
+) -> Array:
+    """P(mate 1 read the template base) per disagreement under `error_head`, and under `quality_head`'s
+    P(Q | context) for the template base each explanation implies."""
     alphabet, meta = tuple(sorted(ev.alphabet)), {"flank": ev.flank}
-    keys = Counter(dict.fromkeys((k for rows, _ in groups for k in rows), 1))
+    keys = Counter(dict.fromkeys((k for rows, _ in groups for k in rows[:4]), 1))
     p = error.probabilities(error_head, alphabet, CountTable("pe-overlap", fields(ev.m), "base", True, keys, meta))
     prob = {k: p[r, error._category(k[-1], str(k[-7])[ev.flank[0]])] for r, k in enumerate(keys)}
-    like = np.array([[prob[a1] * prob[a2], prob[b1] * prob[b2]] for (a1, a2, b1, b2), _ in groups])
-    return np.asarray(like[:, 0] / like.sum(axis=1))
+    like = np.log([[prob[g[0]] * prob[g[1]], prob[g[2]] * prob[g[3]]] for g, _ in groups])
+    if quality_head is not None:
+        q_keys = Counter(dict.fromkeys((k for g, _ in groups for rows in g[4:] for k in rows), 1))
+        q_table = CountTable("pe-overlap:quality", fastq_quality.quality_fields(ev.m), "base", False, q_keys, meta)
+        q_prob = dict(zip(q_keys, quality.log_prob(quality_head, alphabet, q_table), strict=True))
+        like += [[sum(q_prob[k] for k in rows) for rows in g[4:]] for g, _ in groups]
+    return np.asarray(special.expit(like[:, 0] - like[:, 1]))
 
 
-def table(ev: Evidence, error_head: Sequence[Component] | None = None) -> CountTable:
+def table(
+    ev: Evidence,
+    error_head: Sequence[Component] | None = None,
+    quality_head: Sequence[Component] | None = None,
+) -> CountTable:
     """The overlap's head E rows as expected counts, each disagreement split by P(mate 1 read the template base)
-    under `error_head` (e.g. the fitted spec's), or by a coin flip without one. The input `compare` takes."""
+    under `error_head` and `quality_head` (e.g. the fitted spec's), or by a coin flip without a head E. The input
+    `compare` takes."""
     groups = list(ev.disputed.items())
-    first = np.full(len(groups), 0.5) if error_head is None or not groups else _posterior(ev, groups, error_head)
+    if error_head is None or not groups:
+        first = np.full(len(groups), 0.5)
+    else:
+        first = _posterior(ev, groups, error_head, quality_head)
     return _expected(ev, groups, first)
 
 
@@ -242,7 +284,8 @@ def fit(
     seed: int = 0,
     sources: Sequence[str] = ("pe-overlap",),
 ) -> ErrorModelSpec:
-    """Fit both heads from overlap evidence, attributing disagreements by EM with head E.
+    """Fit both heads from overlap evidence, attributing disagreements by EM with head E (and the head Q
+    fitted first, which no attribution changes).
 
     Each iteration refits head E (warm-started) on expected counts, then updates P(mate 1 read the template
     base) per disagreement; it stops when no posterior moves by `tol`, or after `iterations`.
@@ -257,6 +300,14 @@ def fit(
             "overlap evidence to fit: `pe-overlap` needs an insert shorter than twice the read length"
         )
     alphabet, groups = tuple(sorted(ev.alphabet)), list(ev.disputed.items())
+    lags = [f"q-{i}" for i in range(1, ev.m + 1)]
+    q_table = CountTable("pe-overlap:quality", fastq_quality.quality_fields(ev.m), "base", False, ev.quality)
+    q_lags = lags[: Component(quality_tokens[0]).args[0]]
+    quality_head = quality.fit(
+        replace(q_table.marginal(*q_lags, "pos_start", "pos_end", "mate", "context", "q"), meta={"flank": ev.flank}),
+        quality_tokens,
+        alphabet,
+    )
     first = np.full(len(groups), 0.5)
     error_head: tuple[Component, ...] | None = None
     for _ in range(max(iterations, 1)):
@@ -271,20 +322,12 @@ def fit(
         )
         if not groups:
             break
-        update = _posterior(ev, groups, error_head)
+        update = _posterior(ev, groups, error_head, quality_head)
         moved, first = np.abs(update - first).max(), update
         if moved < tol:
             break
     assert error_head is not None
 
-    lags = [f"q-{i}" for i in range(1, ev.m + 1)]
-    q_table = CountTable("pe-overlap:quality", fastq_quality.quality_fields(ev.m), "base", False, ev.quality)
-    q_lags = lags[: Component(quality_tokens[0]).args[0]]
-    quality_head = quality.fit(
-        replace(q_table.marginal(*q_lags, "pos_start", "pos_end", "mate", "context", "q"), meta={"flank": ev.flank}),
-        quality_tokens,
-        alphabet,
-    )
     bias = error_head[0].params["bias"].copy()
     bias[5:] = -np.inf  # indels are not identified by gapless overlaps
     head0 = error_head[0]

@@ -248,6 +248,20 @@ def log_likelihood(components: Sequence[Component], alphabet: Sequence[int], tab
     return float(_row_log_likelihood(components, alphabet, table)[0].sum())
 
 
+def log_prob(components: Sequence[Component], alphabet: Sequence[int], table: CountTable) -> Array:
+    """log P(q | covariates) under fitted head Q for each of `table`'s keys, in `table.counts` order."""
+    _check(components)
+    _, rows, _ = _table(table, components, alphabet)
+    logits = _matrix(components, rows, len(alphabet)) @ _theta(components, len(alphabet))
+    logp = logits - special.logsumexp(logits, axis=1, keepdims=True)
+    qi = table.fields.index("q")
+    covariates = {k[:qi] + k[qi + 1 :]: None for k in table.counts}  # `_table`'s row order
+    row = {c: i for i, c in enumerate(covariates)}
+    q_index: dict[Any, int] = {q: i for i, q in enumerate(alphabet)}
+    keys = list(table.counts)
+    return np.asarray(logp[[row[k[:qi] + k[qi + 1 :]] for k in keys], [q_index[k[qi]] for k in keys]])
+
+
 def read_log_likelihood(
     components: Sequence[Component], alphabet: Sequence[int], table: CountTable, n_reads: int
 ) -> Array:

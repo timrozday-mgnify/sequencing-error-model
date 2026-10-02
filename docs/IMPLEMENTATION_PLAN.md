@@ -1445,14 +1445,39 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
     is the calibrated run's Q37 at 1.12, the alignment's mismatch floor, and unmasked variants (carried at every
     Q alike) inflate the cleanest bin most. So the guard's per-Q bar is the tolerance at Q >= 12 and a bound on
     the lowest-error bin. Test: `tests/test_sites.py`, ANI 95% with the joint model (13 s).
-  - **Open: `pe-overlap` does not follow a reversed Q, even clonal.** On 8,000 clonal pairs it reads
-    [6.5, 1.8, 1.0, 0.83] by Q against [1.01, 0.94, 0.94, 1.01] calibrated. Ruled out: the EM start (started from
-    the truth's own posterior it converges to the same point, [5.74, 1.70, 0.97, 0.83] against the coin flip's
-    [5.78, 1.71, 0.97, 0.82]), the curvature prior across Q (`smooth=0` gives [6.3, 1.8, 1.0, 0.84]), and the pair
-    drops (39% of pairs go as `indel`; disabling them gives [32, 10.6, 3.5, 1.5], since real indel pairs then
-    read gaplessly). Not ruled out: the selection those drops make in this truth, where the noisy mate is the
-    high-Q mate 1, and the `Mate` term absorbing it. The phase 8 exit's miscalibrated-Q bullet fails for
-    `pe-overlap` until this is explained; `kmer` is not yet run under it.
+  - ✓ **`pe-overlap` follows a reversed Q once attribution uses head Q.** On 8,000 clonal pairs it read
+    [6.5, 1.8, 1.0, 0.83] by Q (calibrated: [1.01, 0.94, 0.94, 1.01]). EM start, the curvature prior and the
+    pair drops were ruled out before. **Mechanism: the EM's dispute likelihood dropped head Q.** The two
+    explanations of a disagreement put different template bases under one mate's reported Q, and head Q makes Q
+    depend on that base (the example's low Q on G, a 20x odds swing). Weighing them by head E alone is not the
+    joint likelihood. Measured on 3,000 reversed-truth pairs (60 kb, seed 1), rate ratio by Q:
+
+    | | Q2 | Q12 | Q23 | Q37 |
+    |---|---|---|---|---|
+    | EM, head E only (as was) | 6.49 | 2.11 | 1.15 | 0.88 |
+    | same, pairs with a mispaired disagreement dropped (oracle) | 5.73 | 1.88 | 1.09 | 0.90 |
+    | true attribution, all kept pairs | 2.29 | 1.42 | 1.15 | 0.94 |
+    | true attribution, mispaired pairs dropped | 1.07 | 0.96 | 0.98 | 0.97 |
+    | EM with the truth's head Q, mispaired pairs dropped | 1.11 | 1.01 | 1.01 | 0.96 |
+
+    The data were never the problem. On kept clean pairs the true per-mate rate in each (Q1, Q2) cell is
+    additive and matches the truth: at (37, 2) it is 0.0545 for mate 1 and 0.0027 for mate 2. Yet the head-E-only
+    EM point out-scored the truth-attributed head by 274 log-likelihood units on the same disputes, because the
+    likelihood it maximised was wrong. Fix: `fit` now fits head Q first (it never depended on attribution), and
+    `_posterior` multiplies each explanation by head Q's P(Q | context) over the rows whose context covers the
+    site. That is Q as a modelled output, not a rate. Through `bias --miscalibrate`, 8,000 clonal pairs:
+    **[1.51, 1.16, 0.96, 0.98]** (calibrated: [0.95, 0.96, 1.01, 1.04]).
+    - Residual: ~9% of disagreements in kept pairs come from mates misaligned by an indel `place` does not
+      catch (gain under `min_gain`, or near an overlap end). They land in the lowest-rate bin, as the
+      `reference` arm's alignment floor does: Q2 here, Q37 when calibrated. So `pe-overlap` holds to the same
+      bar as `reference`, a bound on that bin, with Q12 at 1.16 just over tolerance. A gapped overlap alignment
+      would take it, but is not built yet.
+    - Head Q is fitted on observed bases, which blurs P(Q | true base) at high error. On the calibrated unit
+      truth that costs a few percent in its lowest-rate bin at 3,000 pairs, which is noise: at 10,000 pairs
+      Q37 reads 1.02 and 0.97 over two seeds, against 1.08 and 1.03 without head Q. The recovery test now uses
+      5,000 pairs. Tests: `tests/test_pe_overlap.py` (the head Q weighting moves a G-at-Q2 dispute's
+      posterior, and the recovery test).
+    - `kmer` is not yet run under the miscalibrated truth.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.
 - **Carried from phase 7**, where a global rate could not show either: the repeat case (a 500 bp copy at 97%
   identity is 1.7% of a 30 kb genome, so it moves no marginal rate even though it is a per-site failure) and

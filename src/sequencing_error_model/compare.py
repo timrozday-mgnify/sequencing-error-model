@@ -435,7 +435,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ev = pe_overlap.collect(
         islice(pe_overlap.read_pairs(args.r1, args.r2), args.max_pairs), m, flank, min_overlap=args.min_overlap
     )
-    overlap = pe_overlap.table(ev, a.error_head)
+    overlap = pe_overlap.table(ev, a.error_head, a.quality_head)
     masked = None
     if args.mask_alt_freq is not None:
         masked = bam.masks(bam.pileup(args.bam, args.reference, args.min_mapq), args.reference, args.mask_alt_freq)[0]
