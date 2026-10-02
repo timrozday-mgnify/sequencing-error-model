@@ -1420,7 +1420,39 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
       (`tests/test_fit_kmer.py`); on the committed skiver fixture the test calls no key as it stands and calls
       all 30 keys with a planted 40% allele, with the level below 0.9 (`tests/test_sites.py`).
     - Deferred: enhanced mode's linkage through read ids, and a per-Q level (needs per-key Q, enhanced mode).
-- **Q diagnostic:** mismatch rate by reported Q at called variant sites vs retained sites. The miscalibrated-Q guard (§10) is rerun with variation present.
+- ✓ **Q diagnostic** (`sites.q_diagnostic`, in the `reference` arm's report whenever a site model runs):
+  substitution mismatch rate by reported Q at the sites a mask dropped and at those it kept. A report, never an
+  input. On the test-size ANI 95% point (6 kb, 2x120, 18x, two haplotypes at 50%) with the joint model and the
+  calibrated truth, kept sites fall with Q (18.8%, 7.0%, 2.3%, 0.6% at Q 2, 12, 23, 37) and dropped sites read
+  flat at 35-44%: a variant is a correctly read allele, so it carries a correct base's Q. A dropped curve shaped
+  like the kept one would say the mask took error hotspots instead.
+- ✓ **Miscalibrated-Q guard with variants** (`recovery.miscalibrate`, `bias --miscalibrate`): there was no
+  such guard yet, so this builds it. The truth's `QualityWindow` is reversed along the alphabet at every offset,
+  so Q37 carries Q2's error odds and the reverse; head Q is untouched. Reversal alone moves the marginal to ~10%,
+  where every mode fails for reasons that have nothing to do with Q, so the guard runs it at
+  `--error-rate-scale 0.05` (~4.6% marginal, against the calibrated grid's ~4.2%).
+  - **`reference` follows the injected truth**, rate ratio by Q at ANI 95% (two seeds):
+
+    | | Q2 | Q12 | Q23 | Q37 | marginal |
+    |---|---|---|---|---|---|
+    | clonal | 1.73, 1.73 | 0.92, 1.14 | 0.99, 1.00 | 0.97, 0.98 | 0.976, 0.988 |
+    | ANI 95%, unmasked | 10.4, 9.6 | 4.45, 4.54 | 2.17, 2.06 | 1.27, 1.30 | 1.462, 1.480 |
+    | ANI 95%, conservative | 2.86, 2.81 | 1.60, 1.96 | 1.27, 1.22 | 0.98, 1.03 | 1.027, 1.078 |
+    | ANI 95%, joint | 1.85, 1.21 | 1.02, 1.16 | 1.06, 1.01 | 0.91, 0.95 | 0.927, 0.956 |
+
+    The fitted rate rises with Q as the truth does, and the kept-site diagnostic curve rises with it. Residual
+    error always lands in the bin with the *lowest* true rate, whatever its Q: the clonal run's Q2 at 1.73 here
+    is the calibrated run's Q37 at 1.12, the alignment's mismatch floor, and unmasked variants (carried at every
+    Q alike) inflate the cleanest bin most. So the guard's per-Q bar is the tolerance at Q >= 12 and a bound on
+    the lowest-error bin. Test: `tests/test_sites.py`, ANI 95% with the joint model (13 s).
+  - **Open: `pe-overlap` does not follow a reversed Q, even clonal.** On 8,000 clonal pairs it reads
+    [6.5, 1.8, 1.0, 0.83] by Q against [1.01, 0.94, 0.94, 1.01] calibrated. Ruled out: the EM start (started from
+    the truth's own posterior it converges to the same point, [5.74, 1.70, 0.97, 0.83] against the coin flip's
+    [5.78, 1.71, 0.97, 0.82]), the curvature prior across Q (`smooth=0` gives [6.3, 1.8, 1.0, 0.84]), and the pair
+    drops (39% of pairs go as `indel`; disabling them gives [32, 10.6, 3.5, 1.5], since real indel pairs then
+    read gaplessly). Not ruled out: the selection those drops make in this truth, where the noisy mate is the
+    high-Q mate 1, and the `Mate` term absorbing it. The phase 8 exit's miscalibrated-Q bullet fails for
+    `pe-overlap` until this is explained; `kmer` is not yet run under it.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.
 - **Carried from phase 7**, where a global rate could not show either: the repeat case (a 500 bp copy at 97%
   identity is 1.7% of a 30 kb genome, so it moves no marginal rate even though it is a per-site failure) and

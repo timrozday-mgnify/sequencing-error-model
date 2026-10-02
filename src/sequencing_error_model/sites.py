@@ -348,3 +348,33 @@ def keys(
     }
     tested = [replace(r, passes_filter=not drop[i]) for r, i in zip(a.kvmer, row_of, strict=True)]
     return replace(a, kvmer=tested), report
+
+
+def q_diagnostic(alignments: Iterable[Alignment], masks: dict[str, Array] | None) -> dict[str, dict[int, Any]]:
+    """Mismatch rate by reported Q at the sites a mask dropped and at the sites it kept (§6.6, phase 8).
+
+    A report, never an input: no site is called and no rate is fitted from it. At kept sites the curve is the
+    sequencer's calibration as the reads show it; at dropped sites that are real variants a mismatch is a
+    correctly read allele, so it carries a correct base's Q and the curve flattens, or rises, at high Q. A dropped
+    curve that looks like the kept one says the mask took error hotspots, not variants. Substitutions only, since
+    an indel has no one base to read a Q off. `masks` is `True` = dropped, as `sources.bam.apply_masks` reads it.
+    """
+    tally: dict[str, Counter[tuple[int, bool]]] = {"kept": Counter(), "dropped": Counter()}
+    for contig, start, end, reverse, template, read, _ in alignments:
+        mask = (masks or {}).get(contig)
+        rows, tq = align(template, read)
+        for t, op in rows:
+            if op[0] == "-" or op[-1] == "-":
+                continue
+            q, site = tq[t], end - 1 - t if reverse else start + t
+            assert q is not None  # only deletions lack a read Q
+            side = "dropped" if mask is not None and site < len(mask) and mask[site] else "kept"
+            tally[side][(q, op != "=")] += 1
+    out: dict[str, dict[int, Any]] = {}
+    for side, c in tally.items():
+        qs = sorted({q for q, _ in c})
+        out[side] = {
+            q: {"bases": c[(q, False)] + c[(q, True)], "mismatch_rate": c[(q, True)] / (c[(q, False)] + c[(q, True)])}
+            for q in qs
+        }
+    return out
