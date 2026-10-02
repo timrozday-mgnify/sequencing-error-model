@@ -35,6 +35,11 @@ from sequencing_error_model.spec import Component, ErrorModelSpec
 # v=1 observes no errors at all ("reject inputs with tiny v").
 MIN_V = 4
 GOOD_V = 13
+# Phase 6b: keys must be (nearly) single-locus. On a 5 Mb isolate, 90% of key observations sit at multi-locus
+# keys at k = 11, 5.4% at 15, 2.6% at 17 and 2.1% at 21 (`multiplicity.py`). skiver's own default is 21.
+MIN_K = 15
+GOOD_K = 17
+DEFAULT_K = 21
 
 _CONTEXT = frozenset(("QualityWindow", "Context", "Homopolymer"))
 _MARGINAL = frozenset(("Position", "Strand", "GC"))
@@ -82,6 +87,27 @@ def _check_v(v: int) -> None:
         )
 
 
+def _check_k(k: int, min_k: int = MIN_K) -> None:
+    """Refuse a key length at which a real genome's keys repeat, and warn below the length that keeps them unique.
+
+    A key at several loci has several true values: skiver reads the minority ones as errors or filters the key
+    (phase 6b: at k = 11, 54% of the error mass passing skiver's filter on SRR24523812 came from repeated keys).
+    Synthetic random genomes are single-locus at any k, so the harnesses pass `min_k` to measure small k.
+    """
+    if k < min_k:
+        raise ValueError(
+            f"skiver ran with k={k}: keys repeat across a real genome at this length (90% of observations at "
+            f"k=11 on a 5 Mb isolate). Rerun `skiver analyze` with -k {DEFAULT_K} (skiver's default), or pass "
+            f"min_k for a genome known to be single-locus at k={k}."
+        )
+    if k < GOOD_K:
+        warnings.warn(
+            f"skiver ran with k={k} < {GOOD_K}: multi-locus keys will inflate the error rate (5% of a 5 Mb "
+            f"isolate's observations at k=15); complex metagenomes may need more than k={DEFAULT_K}",
+            stacklevel=2,
+        )
+
+
 def _split(error_tokens: Sequence[str]) -> tuple[list[str], list[Component]]:
     """(the tokens the kvmer fit takes, the marginal components to append), checked against default mode."""
     if list(error_tokens[:1]) != ["QualityWindow(0)"]:
@@ -112,11 +138,13 @@ def fit(
     use_all: bool = False,
     flank: tuple[int, int] | None = None,
     level: float = 1.0,
+    min_k: int = MIN_K,
 ) -> ErrorModelSpec:
     """Both heads for `kmer` default mode. `flank` widens the context window the kvmer fit carries, and `level`
     scales `summary_phred.csv`'s rates, which is how a key filter other than skiver's own reaches the level
-    (`sites.keys`)."""
+    (`sites.keys`). `min_k` lowers the key-length refusal (`_check_k`) for genomes known to be single-locus."""
     _check_v(a.v)
+    _check_k(a.k, min_k)
     context_tokens, marginal = _split(error_tokens)
     exposure = next(t for t in fastq_quality.tables(profile) if t.source.endswith(":context"))
     kvmer = next(t for t in skiver_analyze.tables(a, use_all) if t.source.endswith(":kvmer"))
@@ -158,6 +186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--use-all", action="store_true", help="keep kvmer keys skiver's outlier filter rejected")
     p.add_argument("--flank", type=int, nargs=2, metavar=("LEFT", "RIGHT"), default=[2, 2], help="context window")
     p.add_argument("--max-reads", type=int)
+    p.add_argument("--min-k", type=int, default=MIN_K, help="refuse skiver runs with a shorter key (phase 6b)")
     args = p.parse_args(argv)
     flank = (args.flank[0], args.flank[1])
     m = Component(args.quality_tokens[0]).args[0]
@@ -171,7 +200,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "identified_ops": ["substitution", "insertion", "deletion"],  # kvmer.csv reports all three, 1 bp only
     }
     spec = fit(
-        a, profile, q_table, args.error_tokens, args.quality_tokens, provenance, use_all=args.use_all, flank=flank
+        a,
+        profile,
+        q_table,
+        args.error_tokens,
+        args.quality_tokens,
+        provenance,
+        use_all=args.use_all,
+        flank=flank,
+        min_k=args.min_k,
     )
     spec.save(args.output)
     print(json.dumps({"reads": profile.n_reads, "quality_alphabet": spec.quality_alphabet, **filter_stats(a)}))

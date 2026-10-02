@@ -10,6 +10,9 @@ on:
       reads:
         description: Number of training reads (held-out reads are half this)
         default: "40000"
+      k:
+        description: skiver key length (skiver's default; real genomes repeat keys below ~17, plan phase 6b)
+        default: "21"
       v:
         description: skiver value length (the guard rejects tiny v)
         default: "13"
@@ -47,22 +50,24 @@ jobs:
       - name: Synthetic recovery
         env:
           READS: ${{ inputs.reads || '40000' }}
+          K: ${{ inputs.k || '21' }}
           V: ${{ inputs.v || '13' }}
           SEED: ${{ inputs.seed || '0' }}
         run: |
           uv run python -m sequencing_error_model.recovery --skiver "$RUNNER_TEMP/skiver" \
-            --reads "$READS" -v "$V" --seed "$SEED" --output kmer-recovery.json
+            --reads "$READS" -k "$K" -v "$V" --seed "$SEED" --output kmer-recovery.json
 
       # Reported, not blocking: a filter that removes nothing here is the result we want to see.
       - name: Outlier-filter clonal cost
         if: always()
         env:
           READS: ${{ inputs.reads || '40000' }}
+          K: ${{ inputs.k || '21' }}
           V: ${{ inputs.v || '13' }}
           SEED: ${{ inputs.seed || '0' }}
         run: |
           uv run python -m sequencing_error_model.recovery --skiver "$RUNNER_TEMP/skiver" --filter-cost \
-            --reads "$READS" -v "$V" --seed "$SEED" --output kmer-filter-cost.json
+            --reads "$READS" -k "$K" -v "$V" --seed "$SEED" --output kmer-filter-cost.json
 
       - name: Upload reports
         if: always()

@@ -183,7 +183,7 @@ def scenario(
     unclip: bool = True,
     site_mask: str | None = None,
     skiver: str | None = None,
-    k: int = 11,
+    k: int = kmer_source.DEFAULT_K,
     v: int = kmer_source.GOOD_V,
     c: int = 8,
     use_all: bool = False,
@@ -366,6 +366,7 @@ def _fit(
             use_all=kw["use_all"],
             flank=flank,
             level=level,
+            min_k=1,  # the harnesses measure any k; the refusal is for real data (`_check_k`)
         )
         if tuple(fitted.quality_alphabet) != tuple(truth.quality_alphabet):
             return None, {"skipped": f"the reads carry qualities {list(fitted.quality_alphabet)}"}
@@ -452,7 +453,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("--skiver", help="path to a released skiver binary, for the `kmer` mode")
     p.add_argument("--use-all", action="store_true", help="run skiver with --use-all")
-    p.add_argument("-k", type=int, default=11)
+    p.add_argument("-k", type=int, default=kmer_source.DEFAULT_K)
     p.add_argument("-v", type=int, default=kmer_source.GOOD_V)
     p.add_argument("-c", type=int, default=8, help="FracMinHash denominator")
     p.add_argument("--skiver-arg", action="append", default=[], metavar="ARG")

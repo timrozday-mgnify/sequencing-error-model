@@ -8,6 +8,7 @@ the stub checks is the loop's plumbing, not its numbers - the real numbers need 
 import json
 import random
 import sys
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -50,7 +51,7 @@ def test_refuses_a_value_too_short_to_observe_errors() -> None:
     empty = fastq_quality.QualityProfile(1, (2, 2))
 
     def fit(v: int) -> None:
-        kmer_source.fit(replace(a, v=v), empty, None, ["QualityWindow(0)"], QUALITY_TOKENS, {})  # type: ignore[arg-type]
+        kmer_source.fit(replace(a, v=v), empty, None, ["QualityWindow(0)"], QUALITY_TOKENS, {}, min_k=11)  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match="too short to observe errors"):
         fit(2)
@@ -59,18 +60,40 @@ def test_refuses_a_value_too_short_to_observe_errors() -> None:
         fit(8)
 
 
+def test_refuses_a_key_short_enough_to_repeat_across_a_real_genome() -> None:
+    """The committed fixture is k = 11 on a random 4 kb genome, single-locus (`test_multiplicity`); a real genome
+    is not, so the fit refuses it unless told the genome is single-locus at that k."""
+    a = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    empty = fastq_quality.QualityProfile(1, (2, 2))
+
+    def fit(k: int, **kw: int) -> None:
+        kmer_source.fit(replace(a, k=k), empty, None, ["QualityWindow(0)"], QUALITY_TOKENS, {}, **kw)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="keys repeat"):
+        fit(11)
+    # past the refusal, the warning band, then the empty profile stops the fit for want of an alphabet
+    for k, kw in ((15, {}), (11, {"min_k": 11})):
+        with pytest.warns(UserWarning, match="multi-locus keys"), pytest.raises(ValueError, match="no qualities"):
+            fit(k, **kw)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match="no qualities"):
+            fit(kmer_source.DEFAULT_K)
+
+
 def test_rejects_tokens_default_mode_cannot_identify() -> None:
     a = skiver_analyze.read_analyze(FIXTURES / "analyze")
     profile = fastq_quality.QualityProfile(1, (2, 2))
     with pytest.raises(ValueError, match="starts with QualityWindow"):
-        kmer_source.fit(a, profile, None, ["Context(1,1)"], QUALITY_TOKENS, {})  # type: ignore[arg-type]
+        kmer_source.fit(a, profile, None, ["Context(1,1)"], QUALITY_TOKENS, {}, min_k=11)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="not identifiable"):
-        kmer_source.fit(a, profile, None, ["QualityWindow(0)", "Mate"], QUALITY_TOKENS, {})  # type: ignore[arg-type]
+        kmer_source.fit(a, profile, None, ["QualityWindow(0)", "Mate"], QUALITY_TOKENS, {}, min_k=11)  # type: ignore[arg-type]
 
 
 def test_cli_composes_a_spec_the_generator_draws_from(reads_fastq: Path, tmp_path: Path) -> None:
     out = tmp_path / "spec"
-    argv = [str(FIXTURES / "analyze"), str(reads_fastq), "--output", str(out), "--quality-tokens", *QUALITY_TOKENS]
+    argv = [str(FIXTURES / "analyze"), str(reads_fastq), "--output", str(out), "--quality-tokens", *QUALITY_TOKENS,
+            "--min-k", "11"]  # fmt: skip
     assert kmer_source.main(argv) == 0
     spec = spec_io.load(out)
     assert spec.provenance["mode"] == "kmer" and spec.provenance["v"] == 13
