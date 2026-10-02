@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Phase 6 (`kmer`) has met its exit criteria: the fitters, the evidence and model checks, the synthetic recovery run, the outlier filter's clonal cost and the real three-mode run on SRR24523812 have landed (the `kmer` shape agrees with the other two modes as a flat multiple, the level does not, and the gap is skiver's own reported rate; no real dataset settles the level, since every mode there is a biased estimate, which is what phases 7-8 exist for); its non-blocking ReSeq/Badread comparison remains. Phase 6b reopens default mode (2026-10-02): every real `kmer` run so far used k = 11, where 90 % of a 5 Mb genome's key observations sit at multi-locus keys, so the real-data level and context results are void until rerun at k >= 17; at skiver's default k = 21 the level reads low (0.62x) and the mates differ (R2/R1 1.39x), and per-mate skiver runs are the planned fix for the paired-read bias. Phase 7 (variation simulator and the problem-size grid) has met its exits bar the repeat case, carried to phase 8, where the conservative mask has landed (`sites.py`: it takes `reference`'s ANI 95% inflation from 1.485 to 1.082 at no clonal cost), along with the joint latent-site model and the `kmer` key test (which shows skiver's own filter suffices at 100x and nothing separates a 20% minor strain at 30x in default mode). Phase 9 (wave-1 exporters: ART, InSilicoSeq, Badread, PBSIM3) has met its exit criteria; its `kmer`-mode re-estimation remains. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
+Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Phase 6 (`kmer`) has met its exit criteria: the fitters, the evidence and model checks, the synthetic recovery run, the outlier filter's clonal cost and the real three-mode run on SRR24523812 have landed (the `kmer` shape agrees with the other two modes as a flat multiple, the level does not, and the gap is skiver's own reported rate; no real dataset settles the level, since every mode there is a biased estimate, which is what phases 7-8 exist for); its non-blocking ReSeq/Badread comparison remains. Phase 6b reopens default mode (2026-10-02): every real `kmer` run so far used k = 11, where 90 % of a 5 Mb genome's key observations sit at multi-locus keys, so the real-data level and context results are void until rerun at k >= 17; at skiver's default k = 21 the level reads low (0.62x) and the mates differ (R2/R1 1.39x), and per-mate skiver runs are the planned fix for the paired-read bias. Phase 7 (variation simulator and the problem-size grid) has met its exits bar the repeat case, carried to phase 8, where the conservative mask has landed (`sites.py`: it takes `reference`'s ANI 95% inflation from 1.485 to 1.082 at no clonal cost), along with the joint latent-site model and the `kmer` key test (which shows skiver's own filter suffices at 100x for the marginal but not per Q, and nothing separates a 20% minor strain at 30x in default mode). Phase 9 (wave-1 exporters: ART, InSilicoSeq, Badread, PBSIM3) has met its exit criteria; its `kmer`-mode re-estimation remains. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
 
 ## 1. Goal
 
@@ -1277,15 +1277,20 @@ fixture's keys, joined to the genome they were made from, are single-locus with 
      `pe-overlap`/`reference` rows, that context effects are shared by the mates;
    - cost: half the coverage per mate run, which matters at the coverage floor; skiver's `-c` can be lowered;
    - test: phase 7's paired clonal point must come back to ~1.00 from 1.19-1.22, and `sources.kmer` stops refusing
-     `Mate` when per-mate inputs are given. This needs no fork, so it stays in default mode.
+     `Mate` when per-mate inputs are given. This needs no fork, so it stays in default mode;
+   - a second test point: under the miscalibrated-Q truth the pooled head already reads 0.979/1.019 clonal, with
+     the fitted `Mate` term at 1.09x/0.92x against 1.48x/1.10x calibrated (phase 8, `kmer` under the guard). So
+     the bias depends on how Q and error line up across the mates, and per-mate runs must hold both truths.
 4. **Weak context on real data (slope 0.30).** Re-measure at k = 21 before acting: multi-locus keys contributed
    paralog differences as "errors" in whatever contexts paralogs differ. If it stays weak, compare the kvmer fit's
    context against `reference` on single-locus keys only, then check the latent-position EM on real (clustered)
    errors, which the unit test never had.
 5. **Coverage floor (10x reads 0.836).** Item 2's `-l` sweep; then state the floor per k (higher k means fewer
    keys per genome and fewer error-free keys).
-6. **Not yet run:** default mode under the miscalibrated-Q truth (`bias --miscalibrate`), and on long reads, where
-   P(error-free 21-mer) at 5 % error is 0.34 so k, v and the key-conditioning bias all trade off differently.
+6. ✓ **Miscalibrated-Q truth, synthetic short reads** (`bias --miscalibrate`, phase 8): default mode follows the
+   injected truth (clonal 100x: 0.40% at Q2 up to 6.9% at Q37, against 0.29% and 6.8%), run at k = 11 on a
+   random genome; rerun at k = 21 with item 1. **Not yet run:** long reads, where P(error-free 21-mer) at 5 % error
+   is 0.34 so k, v and the key-conditioning bias all trade off differently.
 
 **Toward metagenomes.** What default mode must survive, and how:
 
@@ -1538,7 +1543,8 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
       Against the clonal point (the ~1.2 there is phase 7's paired-read default-mode bias, not variation),
       skiver's filter leaves +16.1% at 30x and +0.4% at 100x, and the key test +12.9% and **-2.1%**. It costs
       the clonal point nothing, takes a fifth of the inflation off at 30x and undershoots at 100x - the same
-      outcome-dependence `joint` shows at depth. **skiver's own filter is already enough at 100x**, and at 30x
+      outcome-dependence `joint` shows at depth. **skiver's own filter is already enough at 100x** for the
+      marginal (per Q it is not; see the miscalibrated-Q guard below), and at 30x
       neither separates: a key sees ~14 observations, so a 20% minor strain leaves it 1-2 counts, the count two
       errors make (§6.6 signal 2). That is the `kmer` floor the exit asks for - minor-strain separation needs
       per-key coverage well above 14x in default mode - and the key test stays opt-in (`--site-mask joint`).
@@ -1603,7 +1609,37 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
       Q37 reads 1.02 and 0.97 over two seeds, against 1.08 and 1.03 without head Q. The recovery test now uses
       5,000 pairs. Tests: `tests/test_pe_overlap.py` (the head Q weighting moves a G-at-Q2 dispute's
       posterior, and the recovery test).
-    - `kmer` is not yet run under the miscalibrated truth.
+  - ✓ **`kmer` follows the injected truth too** (2026-10-02). Setup: phase 8's grid point (30 kb random genome,
+    2x150, 230 bp insert, seed 7, two haplotypes at 20% minor). Unmodified skiver v0.3.2 built from its tag,
+    k = 11, which cannot collide on a 30 kb random genome (phase 6b's multiplicity problem is a real-genome
+    one). `--miscalibrate --error-rate-scale 0.05`. The same command at scale 0.2, calibrated, reproduces the
+    phase 8 table above (1.217, 1.187, 1.413, 1.192). Rate ratio by Q (Q 2, 12, 23, 37) and marginal:
+
+    | | 30x | 100x |
+    |---|---|---|
+    | clonal | 1.25, 1.17, 1.00, 0.97 (0.979) | 1.39, 1.10, 1.03, 1.01 (1.019) |
+    | ANI 95%, skiver filter | 3.40, 1.77, 1.41, 1.17 (1.214) | 2.79, 1.68, 1.28, 1.13 (1.169) |
+    | ANI 95%, key test | 3.37, 1.75, 1.40, 1.15 (1.202) | 2.74, 1.65, 1.26, 1.11 (1.145) |
+    | calibrated, clonal | 1.15, 1.27, 1.29, 1.40 (1.217) | 1.13, 1.23, 1.29, 1.35 (1.187) |
+    | calibrated, ANI 95%, skiver filter | 1.21, 1.42, 1.65, 2.47 (1.413) | 1.08, 1.24, 1.34, 1.64 (1.192) |
+
+    - The fitted rate rises with Q as the truth does (clonal 100x: 0.40% at Q2 up to 6.9% at Q37, against
+      0.29% and 6.8%). Default mode's per-Q shape is skiver's `summary_phred.csv`, counted against k-mer
+      consensus, so no Q enters as a rate, and the guard holds. The residual lands in the lowest-rate bin, as
+      in both other modes: Q2 here, Q37 when calibrated. Clonal at 100x meets the guard's bar (tolerance at
+      Q >= 12); at 30x Q12 reads 1.17.
+    - **The ~1.2 paired-read clonal bias is gone under the reversed truth** (0.979, 1.019). It is not a fixed
+      default-mode offset: it depends on how Q and error line up across the mates. The fitted `Mate`
+      component reads mate 1 1.48x and mate 2 1.10x calibrated, against 1.09x and 0.92x reversed. That is
+      consistent with phase 6b item 3 (one pooled centre-Q head misplaces the mate difference), and the
+      reversed truth is a second test point for its per-mate runs.
+    - **Variants are not separated at either coverage**, and the marginal hid the calibrated case. A variant
+      is a correctly read allele, so its excess (~0.4-0.8% per base at 100x) sits at whatever Q the base
+      carried. Calibrated, that excess falls on bins whose true rates are already high; with the level from
+      skiver, the bins move in opposite directions: Q2 at 0.95x clonal, Q37 at 1.22x. The marginal reads
+      +0.4%, which is why "skiver's own filter is already enough at 100x" (above) holds only for the
+      marginal. Reversed, nothing cancels: +15% at 100x. The key test takes 1,897 keys and moves it to +12%.
+      So the default-mode floor above stands at 100x as well, per Q.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.
 - **Carried from phase 7**, where a global rate could not show either: the repeat case (a 500 bp copy at 97%
   identity is 1.7% of a 30 kb genome, so it moves no marginal rate even though it is a per-site failure) and
