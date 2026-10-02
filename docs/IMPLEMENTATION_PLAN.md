@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Phase 6 (`kmer`) has met its exit criteria: the fitters, the evidence and model checks, the synthetic recovery run, the outlier filter's clonal cost and the real three-mode run on SRR24523812 have landed (the `kmer` shape agrees with the other two modes as a flat multiple, the level does not, and the gap is skiver's own reported rate; no real dataset settles the level, since every mode there is a biased estimate, which is what phases 7-8 exist for); its non-blocking ReSeq/Badread comparison remains. Phase 7 (variation simulator and the problem-size grid) has met its exits bar the repeat case, carried to phase 8, where the conservative mask has landed (`sites.py`: it takes `reference`'s ANI 95% inflation from 1.485 to 1.082 at no clonal cost). Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
+Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Phase 6 (`kmer`) has met its exit criteria: the fitters, the evidence and model checks, the synthetic recovery run, the outlier filter's clonal cost and the real three-mode run on SRR24523812 have landed (the `kmer` shape agrees with the other two modes as a flat multiple, the level does not, and the gap is skiver's own reported rate; no real dataset settles the level, since every mode there is a biased estimate, which is what phases 7-8 exist for); its non-blocking ReSeq/Badread comparison remains. Phase 7 (variation simulator and the problem-size grid) has met its exits bar the repeat case, carried to phase 8, where the conservative mask has landed (`sites.py`: it takes `reference`'s ANI 95% inflation from 1.485 to 1.082 at no clonal cost), along with the joint latent-site model and the `kmer` key test (which shows skiver's own filter suffices at 100x and nothing separates a 20% minor strain at 30x in default mode). Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
 
 ## 1. Goal
 
@@ -1324,7 +1324,7 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   - ✓ **conservative mask** (`sites.conservative`, `sites.linked`): coverage, single-copy coverage, no linked
     variants, Q-free; reports what each criterion dropped and the op and reference-base composition of the
     dropped and the kept sites. It returns `sources.bam`-shaped masks, so the mask plugs into the existing
-    `apply_masks` path and `bias.scenario(site_mask=True)` reruns the phase 7 grid with it.
+    `apply_masks` path and `bias.scenario(site_mask="conservative")` reruns the phase 7 grid with it.
     - **Coverage and single copy** are the two Q-free covariates that are not the outcome: a site below
       `min_depth` (5) has no power, and a site outside a factor `copy_ratio` (2) of the contig's median depth
       is two collapsed copies or a coverage hole.
@@ -1349,8 +1349,77 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
     - Deferred: linkage across a pair's two mates (records are linked one at a time, so an insert longer than
       the read links nothing across its gap), per-window median depth, and the `sources.bam` CLI flags - the
       mask is exercised through the bias harness until the grid says which defaults to ship.
-  - **joint latent-site model** over `reference` tuples: site allele counts under head E's expected counts, a linkage term from read and pair co-occurrence, an optional multi-sample term; alternates with head E fitting and warm starts, as `pe-overlap`'s EM does;
-  - **`kmer` default:** a key-level test of each key's op counts against head E's expected counts at the key's coverage, beside or instead of skiver's outlier filter; enhanced mode adds linkage through read ids.
+  - ✓ **joint latent-site model** (`sites.joint`, `bias.scenario(site_mask="joint")`): the second layer, the
+    DADA2 loop with head E in place of DADA2's abundance p-value. It keeps the conservative mask's two
+    coverage criteria as hard drops, turns linkage from a verdict into a term, and asks of every remaining
+    site whether its own allele counts are more than head E predicts **for the reads that cover it**.
+    - **The test.** Per site and per error category, `log BF` between head E's predicted rate at those reads'
+      contexts, qualities and positions, and the MLE rate the observation implies; the posterior adds a site
+      prior and, for a site in a linked pair, `linkage_log_odds`. This is inStrain's coverage-dependent count
+      test with head E's expected count where inStrain assumes Q30, so no rate is ever read off a reported Q.
+    - **The loop.** Row counts are scaled by `1 - P(variant)` at their site, head E is refitted warm-started
+      on those fractional counts, the posteriors are rescored, repeat. It starts from the conservative mask
+      (linked sites at posterior 1), never from Q, and converges in 3 passes on every point below.
+    - **Measured** (the conservative mask's grid: 8 kb genome, 2x120 reads, 4.2% true error, `reference` mode
+      on the consensus, ANI 95% with two haplotypes; rate ratio, then the share of sites dropped):
+
+      | coverage | unmasked | conservative | joint | clonal point (joint) |
+      |---|---|---|---|---|
+      | 20x | 1.553 | 1.057 (7.7%) | **0.942** (8.9%) | 0.956 (4.8%, 13 sites called variant) |
+      | 30x | 1.565 | 1.064 (7.3%) | **0.950** (8.4%) | 0.980 (4.2%, 15) |
+      | 100x | 1.551 | **0.979** (15.6%) | 0.911 (11.7%) | 0.969 (3.3%, 68) |
+
+      Against the clonal point at the same coverage - the fitter's own floor, which is the honest comparison -
+      the conservative mask leaves +10.0%, +8.1% and +0.6% of residual inflation and the joint model leaves
+      -1.5%, -3.1% and **-6.4%**. So the joint model is the better of the two at 20x and 30x, where the
+      conservative mask's linkage has no power, and the *worse* of the two at 100x, where it starts to
+      undershoot.
+    - **Why it undershoots at depth, and what that costs.** The count test is outcome-dependent by
+      construction (§6.6): head E supplies the expected count, but the decision is still taken on the observed
+      one, so a site where errors happen to pile up above head E's expectation is dropped with the variants.
+      The test's power grows with coverage, so at 100x it reaches into the error count's own upper tail and
+      shaves the fitted rate. The clonal point bounds that cost directly and it is small (0.956, 0.980, 0.969
+      against 0.960, 0.984, 0.977 unmasked; 13 to 68 sites of 8000 called variant), but it is the mechanism
+      behind the ANI 95% undershoot, where 743 sites are called variant at 100x. `prior` is the knob and it is
+      left at 1e-3 until the exit criteria say which way to tune it - the floor is set before the methods are.
+    - Tests (`tests/test_sites.py`): a hand-built 800 bp pileup at 60x and 2% error where a 40% variant is
+      found and the matching clonal pileup calls nothing; a minor allele at 1 read in 60, the count two errors
+      would make, which is correctly *not* separable (§6.6 signal 2); and the ANI 95% contrast beside the
+      clonal point through `bias.scenario`.
+    - Deferred: §6.6's multi-sample term (no multi-sample scenario exists yet); soft weights on the way out,
+      so the mask the harness consumes is still a hard drop; and the posterior is the best single category's,
+      not a sum over alleles, which costs a little power where two real alternative alleles share a site.
+  - ✓ **`kmer` default key test** (`sites.keys`, `fit.kmer.predicted`, `bias.scenario(site_mask="joint")` in the
+    `kmer` arm): `joint`'s count test with a key as the locus. Per key and op, `log BF` between the observed
+    single-edit count under head E's predicted share for that key's own contexts (`predicted`: R_op / (1 + sum R),
+    the likelihood `fit.kmer.fit` maximises) and the MLE share; head E refitted on the keys left clonal; the loop
+    starts from skiver's outlier filter. The one coverage criterion kept is `copy_ratio` off the median key
+    coverage (two-sided, so at ANI 95% it also drops keys only the minor strain carries); skiver's `-c` is the
+    depth floor, and linkage waits for enhanced mode's read ids.
+    - **The level is skiver's, not the kvmer table's.** skiver v0.3.2 writes `summary_phred.csv` over the keys
+      *its* filter keeps (`phred_summary.to_csv(&indices, ...)`), and that file sets default mode's level. So a
+      different key set reaches the level only through `sources.kmer.fit(level=...)`: the single-edit share over
+      the test's kept keys over that share on skiver's. One factor for every Q - a variant's excess sits at a
+      correct base's Q, and default mode has no per-key Q to place it (§6.2).
+    - **Measured** (the phase 7 grid: 30 kb, 2x150, 230 bp insert, seed 7, 4.15% true error, two haplotypes at
+      20% minor; skiver v0.3.2 built from its tag; rate ratio):
+
+      | coverage | clonal, skiver filter | clonal, key test | ANI 95%, skiver filter | ANI 95%, key test |
+      |---|---|---|---|---|
+      | 30x | 1.217 | 1.214 | 1.413 | 1.370 (260 keys called, level 0.968) |
+      | 100x | 1.187 | 1.185 | 1.192 | 1.160 (869 called, level 0.971) |
+
+      Against the clonal point (the ~1.2 there is phase 7's paired-read default-mode bias, not variation),
+      skiver's filter leaves +16.1% at 30x and +0.4% at 100x, and the key test +12.9% and **-2.1%**. It costs
+      the clonal point nothing, takes a fifth of the inflation off at 30x and undershoots at 100x - the same
+      outcome-dependence `joint` shows at depth. **skiver's own filter is already enough at 100x**, and at 30x
+      neither separates: a key sees ~14 observations, so a 20% minor strain leaves it 1-2 counts, the count two
+      errors make (§6.6 signal 2). That is the `kmer` floor the exit asks for - minor-strain separation needs
+      per-key coverage well above 14x in default mode - and the key test stays opt-in (`--site-mask joint`).
+    - Tests: `predicted` gives back the simulated single-edit counts in total and by class under the true head
+      (`tests/test_fit_kmer.py`); on the committed skiver fixture the test calls no key as it stands and calls
+      all 30 keys with a planted 40% allele, with the level below 0.9 (`tests/test_sites.py`).
+    - Deferred: enhanced mode's linkage through read ids, and a per-Q level (needs per-key Q, enhanced mode).
 - **Q diagnostic:** mismatch rate by reported Q at called variant sites vs retained sites. The miscalibrated-Q guard (§10) is rerun with variation present.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.
 - **Carried from phase 7**, where a global rate could not show either: the repeat case (a 500 bp copy at 97%
