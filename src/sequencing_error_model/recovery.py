@@ -834,7 +834,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--genome-length", type=int, default=20_000, help="with --mask-cost")
     p.add_argument("--depth", type=float, default=30.0, help="with --mask-cost")
     p.add_argument("--aligner", choices=sorted(ALIGNER_READS), help="report aligner bias instead (uses --reads)")
-    p.add_argument("--error-rate-scale", type=float, default=1.0, help="with --aligner")
+    p.add_argument("--error-rate-scale", type=float, default=1.0, help="with --aligner or --skiver")
     p.add_argument("--preset", default="map-ont", help="minimap2 preset, with --aligner minimap2")
     p.add_argument("--unclip", action="store_true", help="with --aligner: realign soft-clipped reads end to end")
     p.add_argument("--skiver", help="path to a released skiver binary: run the `kmer` default-mode loop instead")
@@ -847,7 +847,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--skiver-arg", action="append", default=[], metavar="ARG", help="extra `skiver analyze` argument")
     args = p.parse_args(argv)
     if args.skiver:
-        truth = spec_io.load(args.spec) if args.spec else example_spec()
+        truth = scale_error_rate(spec_io.load(args.spec) if args.spec else example_spec(), args.error_rate_scale)
         shared: dict[str, Any] = dict(
             n_reads=args.reads,
             read_length=args.read_length,
