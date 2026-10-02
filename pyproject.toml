@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 sem-generate = "sequencing_error_model.generate:main"
+sem-export = "sequencing_error_model.export:main"
 
 [dependency-groups]
 dev = [

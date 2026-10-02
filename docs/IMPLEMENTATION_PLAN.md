@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Phase 6 (`kmer`) has met its exit criteria: the fitters, the evidence and model checks, the synthetic recovery run, the outlier filter's clonal cost and the real three-mode run on SRR24523812 have landed (the `kmer` shape agrees with the other two modes as a flat multiple, the level does not, and the gap is skiver's own reported rate; no real dataset settles the level, since every mode there is a biased estimate, which is what phases 7-8 exist for); its non-blocking ReSeq/Badread comparison remains. Phase 7 (variation simulator and the problem-size grid) has met its exits bar the repeat case, carried to phase 8, where the conservative mask has landed (`sites.py`: it takes `reference`'s ANI 95% inflation from 1.485 to 1.082 at no clonal cost), along with the joint latent-site model and the `kmer` key test (which shows skiver's own filter suffices at 100x and nothing separates a 20% minor strain at 30x in default mode). Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
+Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Phase 6 (`kmer`) has met its exit criteria: the fitters, the evidence and model checks, the synthetic recovery run, the outlier filter's clonal cost and the real three-mode run on SRR24523812 have landed (the `kmer` shape agrees with the other two modes as a flat multiple, the level does not, and the gap is skiver's own reported rate; no real dataset settles the level, since every mode there is a biased estimate, which is what phases 7-8 exist for); its non-blocking ReSeq/Badread comparison remains. Phase 7 (variation simulator and the problem-size grid) has met its exits bar the repeat case, carried to phase 8, where the conservative mask has landed (`sites.py`: it takes `reference`'s ANI 95% inflation from 1.485 to 1.082 at no clonal cost), along with the joint latent-site model and the `kmer` key test (which shows skiver's own filter suffices at 100x and nothing separates a 20% minor strain at 30x in default mode). Phase 9 (wave-1 exporters: ART, InSilicoSeq, Badread, PBSIM3) has met its exit criteria; its `kmer`-mode re-estimation remains. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
 
 ## 1. Goal
 
@@ -143,7 +143,7 @@ Maintenance data is from the GitHub API on 2026-09-15. "Q coupling" describes ho
 | Simulator | Reads | Last push / ★ | Error model format | Q coupling | Where it's used | Export fidelity from our model |
 |---|---|---|---|---|---|---|
 | **ART** / **art_modern** | Illumina (+ MGI, AVITI, Onso profiles) | art_modern 2026-07 / 39 (original ART unmaintained, still ubiquitous) | Text quality profiles (per-position Q distributions, optionally per base); indel rates as CLI flags (`-ir/-dr/-ir2/-dr2`) | Q sampled per position, then substitution probability = 10^(−Q/10), i.e. assumes perfectly calibrated Q; no neighbour or context effects | MeSS, CAMISIM, countless pipelines | Medium. Per-position Q marginals map well. Our calibration can't be expressed without distorting either the Q distribution or the error rate (§6.3). Context and Q-window effects are lost |
-| **InSilicoSeq** | Illumina (MiSeq/HiSeq/NextSeq/NovaSeq) | 2026-09 / 227 | `.npz` with `read_length`, `insert_size`, `mean_count_{forward,reverse}`, `quality_hist_{forward,reverse}`, `subst_choices_*` (per position × base), `ins_*`, `del_*` | Q-driven substitutions (to verify in phase 9) plus per-position substitution choices and indel rates | Metagenome benchmarking | Medium. Per-position Q histograms and substitution/indel tables are populated from marginals of both heads; same calibration caveat as ART |
+| **InSilicoSeq** | Illumina (MiSeq/HiSeq/NextSeq/NovaSeq) | 2026-09 / 227 | `.npz` with `read_length`, `insert_size`, `mean_count_{forward,reverse}`, `quality_hist_{forward,reverse}`, `subst_choices_*` (per position × base), `ins_*`, `del_*` | Substitution with probability 10^(−Q/10) (verified in phase 9), target base from per-position choices; per-position indel rates | Metagenome benchmarking | Medium. Per-position Q histograms and substitution/indel tables are populated from marginals of both heads; same calibration caveat as ART |
 | **NEAT v4** | Illumina | 2026-08 / 72 | gzip-pickle dict `{error_model1, error_model2, qual_score_model1, qual_score_model2}` (`SequencingErrorModel` + quality Markov model per mate) | Errors from Q-derived probabilities; Q from a Markov model | Variant-calling benchmarks | Medium. The Q head maps onto NEAT's quality Markov model (order 1, per mate). Needs NEAT's classes to pickle |
 | **Mason2** (SeqAn) | Illumina/454/Sanger | seqan 2026-08 / 502 | CLI parameters only (mismatch/indel probabilities, begin/end ramps, quality mean/sd for correct and wrong bases) | Separate Q mean/sd for correct vs erroneous bases | Aligner benchmarks | Low (parametric), but trivial to emit. The correct/wrong Q split comes from the joint model |
 | **wgsim** | Illumina | 2021 / 288 (unmaintained) | CLI base error rate | none | CAMISIM | Low. Emit a rate only, for CAMISIM compatibility |
@@ -1496,15 +1496,62 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   - with miscalibrated Q and variants, fitted rates follow the injected truth, not the reported Q;
   - on D6331, `reference` and `kmer` specs agree with `pe-overlap` or a clonal spike-in on shared support within tolerance, or the report explains each gap; variant-site precision and recall against the known strain differences are reported, not blocking.
 
-### Phase 9: exporters, wave 1 (ART/art_modern, InSilicoSeq, Badread, PBSIM3)
+### Phase 9: exporters, wave 1 (ART/art_modern, InSilicoSeq, Badread, PBSIM3) (exit met)
+- ✓ `export/` with `sem-export <art|iss|badread|pbsim3>`. Every exporter projects one **sample** of the spec: reads
+  drawn by the native generator from uniform random templates, with their true alignments, counted the way the
+  simulator's own profiler counts real alignments (Badread's `error_model`/`qscore_model` loops are ported). So no
+  closed form per component is needed, and each export is as faithful as its format allows.
 - Each exporter:
-  - implements `--q-policy`, where the simulator couples errors to Q;
-  - supports a base-profile fallback;
-  - emits a fidelity report.
-- Badread gets both the error model and the Q model. PBSIM3 gets QSHMM (Q-bearing) and ERRHMM.
-- **Round-trip tests.** Export, run the real simulator, re-estimate, and compare both the error rate and the Q marginals to the spec within tolerance. Re-estimation uses the `reference` mode against the simulator's source genome (cheap and exact), plus the `kmer` mode where the default path must be exercised. Simulators come from bioconda in a separate `export-roundtrip` workflow (weekly + `workflow_dispatch` + PRs touching `export/`), so the core Testing workflow stays fast.
-- Unit tests validate generated files against each simulator's own loader where one is importable (InSilicoSeq `KDErrorModel`, Badread model parser). Confirm how InSilicoSeq couples substitutions to Q.
-- **Exit:** all four simulators run on exported models; under the chosen `--q-policy`, the preserved quantity is within 10% of the spec, and the violated one is quantified in the fidelity report.
+  - ✓ implements `--q-policy` where the simulator couples errors to Q. Checked in each simulator's source:
+    ART, InSilicoSeq and PBSIM3 QSHMM all draw an error with probability exactly 10^(−Q/10) (QSHMM splits it by
+    `--difference-ratio`); Badread and PBSIM3 ERRHMM don't use Q for errors. `preserve-errors` replaces each Q
+    by the empirical Q of the spec's errors in its (mate, read position, Q) cell (positions pooled for PBSIM3),
+    shrunk toward the (mate, Q) rate with a one-error prior;
+  - ✓ supports a base-profile fallback: `--base-profile R1 [R2]` draws Q from ART-format profiles instead of
+    head Q (snapped to the spec's alphabet), recorded in the report;
+  - ✓ emits `fidelity.json`: preserved quantity, the spec's rate and Q histogram, the rate the simulator will
+    produce from the exported Q, the Q TV the remap costs, what the format drops, unidentified components, and
+    the simulator arguments to use.
+- ✓ Badread: 7-mer error model + CIGAR-window Q model; `--identity` from the sample's per-read identities, its
+  own artefacts (junk, chimeras, glitches, adapters) switched off. PBSIM3: QSHMM (Q-value states, merged to its
+  50-state cap; order-1 Q chain) and ERRHMM (one state per op; order-1 op chain, so clustering survives), each
+  repeated at every accuracy level so `--accuracy-mean` doesn't change the model.
+- Simulator quirks found on the way:
+  - **ART `-sp`** keys per-base profiles by the forward-strand reference base: reverse-strand reads drew G's
+    profile at C, shifting the Q marginal (TV 0.05) and the error rate (+17% under `preserve-errors`). Without
+    `-sp` ART reproduces the profile exactly, so the export leaves it off and drops Q-by-base.
+  - **InSilicoSeq's own modeller** divides deletion counts by all bases at a position while its simulator reads
+    them as per-base rates (about 4x low); the export writes per-base rates. Its bioconda recipe misses run
+    dependencies, so CI installs it from PyPI.
+  - **PBSIM3** quantises QSHMM probabilities to 1/100 (rare Q transitions vanish: Q TV 0.02 measured), its
+    gamma length model overflows for a small length sd (sd 500 at mean 5000 fails), and ERRHMM level 100 is
+    error-free (keep `--accuracy-mean` ≤ 0.95).
+- ✓ **Round trips** (`export/roundtrip.py`, workflow `export-roundtrip`): export, run the real simulator on a
+  random genome, align (minibwa / minimap2, soft clips realigned as in `reference` mode) and re-estimate. Short
+  reads: the recovery example at 1/10 of its error rate (2.2% substitutions, Q understating errors 3.4x);
+  long reads: an ONT-like spec (Q 0-50, 5.8% errors, Q overstating accuracy). Measured 2026-10-02
+  (bioconda ART 3.19.15, PBSIM3 3.0.5, Badread 0.4.2; InSilicoSeq 2.0.1):
+
+  | Simulator | `--q-policy` | Preserves | Spec error % | Predicted % | Measured % | Spec mean Q | Measured mean Q | Q TV | Aligned reads |
+  |---|---|---|---|---|---|---|---|---|---|
+  | InSilicoSeq | preserve-quality | Q | 2.16 (subst.) | 7.36 | 4.67 | 27.7 | 27.7 | 0.001 | 2743 / 4000 |
+  | InSilicoSeq | preserve-errors | errors | 2.16 | 2.16 | 2.12 | 27.7 | 21.5 | 0.976 | 3940 / 4000 |
+  | ART | preserve-quality | Q | 2.16 | 7.36 | 4.97 | 27.7 | 27.8 | 0.002 | 2859 / 4000 |
+  | ART | preserve-errors | errors | 2.16 | 2.16 | 2.10 | 27.7 | 21.6 | 0.975 | 3974 / 4000 |
+  | Badread | – | both | 5.79 (all) | – | 5.79 | 18.0 | 18.0 | 0.001 | 400 |
+  | PBSIM3 QSHMM | preserve-quality | Q | 5.79 | 2.45 | 2.34 | 18.0 | 18.0 | 0.019 | 401 |
+  | PBSIM3 QSHMM | preserve-errors | errors | 5.79 | 5.76 | 5.48 | 18.0 | 12.7 | 0.713 | 394 |
+  | PBSIM3 ERRHMM | – | errors | 5.79 | – | 5.51 | – | – | – | 413 |
+
+  Every preserved quantity is within 10% (the largest gap is PBSIM3's −5%, minimap2 merging adjacent edits). The
+  violated one matches the report's prediction where it can be measured: QSHMM 2.34% against 2.45%. Under
+  ART/InSilicoSeq `preserve-quality` the measured rate (4.7-5.0%) undershoots the predicted 7.4% because a
+  third of those reads, the worst, don't align; the prediction is the number to trust there.
+- ✓ Unit tests check the generated files against InSilicoSeq's `KDErrorModel` and Badread's model parsers where
+  installed (the `export-roundtrip` workflow runs them; the core Testing workflow skips them).
+- Open: `kmer`-mode re-estimation of the exported reads (the plan's second check on the default path); the
+  `reference` check above covers the exit.
+- **Exit:** all four simulators run on exported models; under the chosen `--q-policy`, the preserved quantity is within 10% of the spec, and the violated one is quantified in the fidelity report. ✓ (table above)
 
 ### Phase 10: exporters, wave 2, and wrapper recipes
 - NEAT v4 (quality Markov + error model; optional dependency), Mason2 (including correct/wrong-base Q parameters) and wgsim parameter sets, and NanoSim error and quality model parts on a base model.
@@ -1573,7 +1620,8 @@ The standard matches `EBI-Metagenomics/mimicc-ena-submission-assistant`: uv + Py
 - **Testing** (`test`): pytest.
 - **Release**: a `v*` tag checks that the tag matches the version, then tests, builds and creates a GitHub release with sdist + wheel.
 - **Ruleset on `main`**: PR required, required checks `lint` + `test` (strict, up to date), no force-push, no deletion. Approvals are not required while there is a single maintainer; raise to 1 when collaborators join.
-- To be added in later phases: `skiver-compat` (phase 1), `export-roundtrip` (phase 9), PyPI trusted publishing (phase 13).
+- **export-roundtrip** (phase 9): weekly, on dispatch and on PRs touching `export/`; real simulators from bioconda (InSilicoSeq from PyPI).
+- To be added in later phases: PyPI trusted publishing (phase 13).
 
 ---
 

@@ -94,8 +94,10 @@ def generate(
     *,
     max_ins_run: int = 10,
     error_rate_scale: float = 1.0,
+    tracks: Sequence[Array] | None = None,
 ) -> list[Read]:
-    """One read per template; mate 2 also uses the "-" strand covariate."""
+    """One read per template; mate 2 also uses the "-" strand covariate. `tracks` replaces head Q's draw with given
+    template-indexed Q tracks (values in the alphabet), e.g. an exporter's base profile."""
     if max_ins_run < 1:
         raise ValueError("max_ins_run must be at least 1")
     templates = [t.upper() for t in templates]
@@ -104,7 +106,8 @@ def generate(
     if model.latent is not None:
         prior = model.latent.params["prior"]
         classes = rng.choice(len(prior), size=len(templates), p=prior / prior.sum())
-    tracks = quality.sample(model.quality_head, model.quality_alphabet, templates, mates, rng, classes)
+    if tracks is None:
+        tracks = quality.sample(model.quality_head, model.quality_alphabet, templates, mates, rng, classes)
     lengths = np.array([len(t) for t in templates], np.int64)
     n = int(lengths.sum())
     starts = np.r_[0, np.cumsum(lengths)[:-1]].astype(np.int64)
