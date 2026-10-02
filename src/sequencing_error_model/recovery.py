@@ -686,7 +686,7 @@ def skiver_recovery(
     n_reads: int = 20_000,
     read_length: int = 150,
     genome_length: int = 20_000,
-    k: int = 11,
+    k: int = kmer_source.DEFAULT_K,
     v: int = kmer_source.GOOD_V,
     c: int = 8,
     seed: int = 0,
@@ -733,6 +733,7 @@ def skiver_recovery(
         {"mode": "kmer", "skiver_build": "default", "sources": ["synthetic-recovery"]},
         use_all=use_all,
         flank=flank,
+        min_k=1,  # the harnesses measure any k; the refusal is for real data (`_check_k`)
     )
     if tuple(fitted.quality_alphabet) != tuple(truth.quality_alphabet):
         raise ValueError(
@@ -765,7 +766,7 @@ def outlier_filter_cost(
     n_reads: int = 20_000,
     read_length: int = 150,
     genome_length: int = 20_000,
-    k: int = 11,
+    k: int = kmer_source.DEFAULT_K,
     v: int = kmer_source.GOOD_V,
     c: int = 8,
     seed: int = 0,
@@ -839,7 +840,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--skiver", help="path to a released skiver binary: run the `kmer` default-mode loop instead")
     p.add_argument("--filter-cost", action="store_true", help="with --skiver: the outlier filter's clonal cost")
     p.add_argument("--use-all", action="store_true", help="with --skiver: run skiver with --use-all")
-    p.add_argument("-k", type=int, default=11, help="with --skiver")
+    p.add_argument("-k", type=int, default=kmer_source.DEFAULT_K, help="with --skiver")
     p.add_argument("-v", type=int, default=kmer_source.GOOD_V, help="with --skiver")
     p.add_argument("-c", type=int, default=8, help="with --skiver: FracMinHash denominator")
     p.add_argument("--read-length", type=int, default=150, help="with --skiver")
