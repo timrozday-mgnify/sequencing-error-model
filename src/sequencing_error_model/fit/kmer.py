@@ -180,6 +180,12 @@ def _log_likelihood(loci: _Loci, p: Array, ratios: Array) -> float:
     return ll
 
 
+def _contexts(table: CountTable, loci: _Loci, flank: tuple[int, int]) -> CountTable:
+    """One row per distinct locus context, for `error.probabilities`."""
+    rows: Counter[Key] = Counter({(c, DUMMY_Q): 1 for c in loci.contexts})
+    return CountTable(table.source, ("context", "q"), "base", False, rows, {"flank": list(flank)})
+
+
 def fit(
     table: CountTable,
     tokens: Sequence[str],
@@ -204,14 +210,7 @@ def fit(
         raise ValueError(f"kvmer fits need QualityWindow(0) then Context(L,R)/Homopolymer, got {list(tokens)}")
     window = _flank(tokens) if flank is None else flank
     loci = _prepare(table, window)
-    contexts = CountTable(
-        table.source,
-        ("context", "q"),
-        "base",
-        False,
-        Counter({(c, DUMMY_Q): 1 for c in loci.contexts}),
-        {"flank": list(window)},
-    )
+    contexts = _contexts(table, loci, window)
     weights = _weights(loci, _ratios(np.ones((len(loci.contexts), len(error.CATEGORIES))) / len(error.CATEGORIES)))
     components: tuple[Component, ...] | None = None
     last = -np.inf
@@ -227,6 +226,32 @@ def fit(
         last = total
     assert components is not None
     return components
+
+
+def predicted(
+    table: CountTable, components: Sequence[Component], flank: tuple[int, int] | None = None
+) -> tuple[list[str], list[str], Array, Array, Array]:
+    """Head E's own prediction for the single-edit counts of a `skiver_analyze:kvmer` table.
+
+    Of a locus's N observations that matched or carried one edit, the share carrying `op` is
+    R_op / (1 + sum_op' R_op'), with R_op = sum_t r_op(t): the likelihood `fit` maximises, conditioned on at most
+    one edit. Returns (loci in `table` order, the ops counted anywhere, N per locus, observed counts and predicted
+    shares as [loci, ops]).
+    """
+    window = _flank([c.token for c in components]) if flank is None else flank
+    loci = _prepare(table, window)
+    ratios = _ratios(error.probabilities(components, (DUMMY_Q,), _contexts(table, loci, window)))
+    norm = 1.0 + ratios[loci.ctx, 1:].sum(axis=(1, 2))  # masked self-substitutions have p = 0
+    ops = sorted(loci.rows)
+    observed = np.zeros((len(loci.total), len(ops)))
+    shares = np.zeros_like(observed)
+    for j, op in enumerate(ops):
+        idx, n = loci.rows[op]
+        observed[idx, j] = n
+        cat, base = _target(op)
+        r = ratios[loci.ctx, cat]
+        shares[:, j] = (r if base is None else np.where(loci.centre == base, r, 0.0)).sum(axis=1) / norm
+    return list(dict.fromkeys(str(locus) for locus, _ in table.counts)), ops, loci.total, observed, shares
 
 
 def _rates(phred: Sequence[RateBin]) -> dict[int, float]:

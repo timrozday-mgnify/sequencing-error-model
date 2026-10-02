@@ -1,5 +1,6 @@
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +8,7 @@ import pytest
 
 from sequencing_error_model import bias, recovery, sites
 from sequencing_error_model import generate as gen
-from sequencing_error_model.sources import bam
+from sequencing_error_model.sources import bam, skiver_analyze
 
 
 def _aln(template: str, read: str, start: int = 0, reverse: bool = False) -> bam.Alignment:
@@ -185,3 +186,28 @@ def test_the_joint_model_removes_the_reference_modes_variant_inflation(tmp_path:
     clonal, clonal_share = _reference_ratio(tmp_path, 1.0, site_mask="joint")
     assert abs(clonal - 1) < 0.1, clonal
     assert clonal_share is not None and clonal_share < 0.2, clonal_share
+
+
+def test_keys_drops_a_planted_variant_and_leaves_the_clonal_fixture_alone() -> None:
+    """The `kmer` key test on the committed skiver fixture (713 keys at ~44x, clonal, 1.1% error): it calls no
+    key a variant as it stands, and with a 40% allele planted in 30 keys - the count a minor strain would leave -
+    it calls those 30 and carries their excess into the level."""
+    a = skiver_analyze.read_analyze(Path(__file__).parent / "fixtures" / "skiver-v0.3.2" / "analyze")
+    tokens = ["QualityWindow(0)", "Context(1,1)"]
+    _, clean = sites.keys(a, tokens)
+    assert clean["dropped_variant"] == 0
+    assert abs(clean["level"] - 1) < 0.01
+
+    planted = {}
+    for i, r in enumerate(a.kvmer[:30]):
+        moved = int(0.4 * r.consensus_count)
+        op = f"{r.consensus_value[6]}>{'C' if r.consensus_value[6] == 'A' else 'A'}"
+        planted[i] = replace(
+            r, consensus_count=r.consensus_count - moved, op_counts={**r.op_counts, op: r.op_counts[op] + moved}
+        )
+    variant = replace(a, kvmer=[planted.get(i, r) for i, r in enumerate(a.kvmer)])
+    tested, report = sites.keys(variant, tokens)
+    called = {i for i, r in enumerate(tested.kvmer) if not r.passes_filter}
+    assert set(planted) <= called, sorted(set(planted) - called)
+    assert report["dropped_variant"] <= 30 + 2
+    assert report["level"] < 0.9  # the planted keys' excess, removed from summary_phred.csv's level

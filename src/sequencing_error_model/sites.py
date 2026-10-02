@@ -37,10 +37,12 @@ from typing import Any
 import numpy as np
 from scipy import special
 
-from sequencing_error_model.fit import error
+from sequencing_error_model.fit import error, kmer
 from sequencing_error_model.fit.quality import Array
 from sequencing_error_model.generate import Read, align, observations
+from sequencing_error_model.sources import skiver_analyze
 from sequencing_error_model.sources.bam import _BASE, _COMPLEMENT, Alignment, apply_masks
+from sequencing_error_model.sources.skiver_analyze import SkiverAnalyze
 from sequencing_error_model.spec import Component
 
 _OP_NAMES = ("alt_A", "alt_C", "alt_G", "alt_T", "deletion", "insertion")
@@ -261,3 +263,88 @@ def joint(
             }
         )
     return masks, report
+
+
+def keys(
+    a: SkiverAnalyze,
+    context_tokens: Sequence[str],
+    *,
+    flank: tuple[int, int] | None = None,
+    copy_ratio: float = 2.0,
+    prior: float = 1e-3,
+    iterations: int = 3,
+    threshold: float = 0.5,
+    tol: float = 1e-3,
+) -> tuple[SkiverAnalyze, dict[str, Any]]:
+    """`joint`'s count test for `kmer` default mode (§6.6): each `kvmer.csv` key's op counts against head E's
+    expected counts at that key's coverage, alternating with head E refitted on the keys left clonal.
+
+    The same `log BF` as `joint`, per key and op: the observed count under `fit.kmer.predicted`'s share for the
+    key's own contexts, against the MLE share the count implies. A key is the locus here, so coverage is its
+    observations, and the one coverage criterion kept is single copy (a key off the median coverage by
+    `copy_ratio` is a collapsed copy); skiver's own `-c` sets the depth floor. Linkage needs read ids, which only
+    enhanced mode has. The loop starts from skiver's outlier filter (its rejected keys at posterior 1), never
+    from Q, and `context_tokens` are `fit.kmer.fit`'s.
+
+    Returns `a` with each key's `passes_filter` replaced by the test's verdict, so `sources.kmer.fit` takes it
+    unchanged, and a report. `summary_phred.csv`, which sets default mode's level, was counted by skiver over
+    *its* filter's keys, so the level is carried across by `level`: the ratio of the single-edit share over the
+    test's kept keys to that over skiver's (`sources.kmer.fit(level=...)`).
+
+    ponytail: that level ratio is one number for every Q, while a variant's excess sits at the Q of a correct
+    base; default mode has no per-key Q to do better (§6.2), enhanced mode's per-read output would.
+    """
+    full = next(t for t in skiver_analyze.tables(a, use_all=True) if t.source.endswith(":kvmer"))
+    loci = list(dict.fromkeys(str(locus) for locus, _ in full.counts))
+    index = {locus: i for i, locus in enumerate(loci)}
+    row_of = np.array([index[r.key + r.consensus_value] for r in a.kvmer])
+    skiver_drop = np.zeros(len(loci), bool)
+    skiver_drop[row_of] = [not r.passes_filter for r in a.kvmer]
+
+    total = np.zeros(len(loci))
+    for (locus, _), n in full.counts.items():
+        total[index[str(locus)]] += n
+    median = float(np.median(total))
+    copies = (total > copy_ratio * median) | (total * copy_ratio < median)
+
+    gamma = skiver_drop.astype(float)
+    step = 0
+    while step < iterations:
+        step += 1
+        keep = 1.0 - np.maximum(gamma, copies)
+        weighted = Counter(
+            {k: n * keep[index[str(k[0])]] for k, n in full.counts.items() if keep[index[str(k[0])]] > 0}
+        )
+        head = kmer.fit(replace(full, counts=weighted), context_tokens, flank=flank)
+        _, _, _, observed, share = kmer.predicted(full, head, flank)
+        d = np.maximum(total, 1.0)[:, None]
+        p0 = np.clip(share, 1e-9, 0.5)
+        p1 = np.clip(observed / d, p0, 1 - 1e-9)
+        log_bf = observed * np.log(p1 / p0) + (d - observed) * (np.log1p(-p1) - np.log1p(-p0))
+        moved = special.expit(np.log(prior / (1 - prior)) + log_bf.max(axis=1))
+        gap = float(np.abs(moved - gamma).max())
+        gamma = moved
+        if gap < tol:
+            break
+
+    variant = (gamma >= threshold) & ~copies
+    drop = variant | copies
+
+    def edits(which: Array) -> float:
+        """The single-edit share of the observations at the keys `which`."""
+        errors = sum(n for (locus, op), n in full.counts.items() if op != "=" and which[index[str(locus)]])
+        return float(errors / max(total[which].sum(), 1.0))
+
+    report = {
+        "keys": len(loci),
+        "median_coverage": median,
+        "iterations": step,
+        "dropped": int(drop.sum()),
+        "dropped_multi_copy": int(copies.sum()),
+        "dropped_variant": int(variant.sum()),
+        "skiver_dropped": int(skiver_drop.sum()),
+        "both_dropped": int((drop & skiver_drop).sum()),
+        "level": edits(~drop) / max(edits(~skiver_drop), 1e-12),
+    }
+    tested = [replace(r, passes_filter=not drop[i]) for r, i in zip(a.kvmer, row_of, strict=True)]
+    return replace(a, kvmer=tested), report

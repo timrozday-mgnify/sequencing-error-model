@@ -411,3 +411,17 @@ def test_the_default_mode_head_composes_and_generates() -> None:
     )
     edits = 1 - per_base[:, 0]
     assert edits[-10:].mean() > edits[:10].mean(), (edits[:10], edits[-10:])
+
+
+def test_predicted_shares_reproduce_the_single_edit_counts_under_the_true_head() -> None:
+    """`predicted` is the key test's expectation (`sites.keys`): under the head that generated the loci, its
+    shares times each locus's observations give back the single-edit counts, in total and per error class."""
+    true = truth()
+    table = simulate(true, n_loci=1500, observations=40, seed=3)
+    loci, ops, total, observed, shares = kmer.predicted(table, true, FLANK)
+    assert len(loci) == len(total) == len(observed) == len({str(locus) for locus, _ in table.counts})
+    expected = shares * total[:, None]
+    assert abs(expected.sum() / observed.sum() - 1) < 0.03
+    insertion = np.array([op.startswith("->") for op in ops])
+    for which in (~insertion, insertion):  # substitutions and deletions, then insertions
+        assert abs(expected[:, which].sum() / observed[:, which].sum() - 1) < 0.08

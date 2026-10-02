@@ -20,6 +20,7 @@ import json
 import sys
 import warnings
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -110,8 +111,11 @@ def fit(
     *,
     use_all: bool = False,
     flank: tuple[int, int] | None = None,
+    level: float = 1.0,
 ) -> ErrorModelSpec:
-    """Both heads for `kmer` default mode. `flank` widens the context window the kvmer fit carries."""
+    """Both heads for `kmer` default mode. `flank` widens the context window the kvmer fit carries, and `level`
+    scales `summary_phred.csv`'s rates, which is how a key filter other than skiver's own reaches the level
+    (`sites.keys`)."""
     _check_v(a.v)
     context_tokens, marginal = _split(error_tokens)
     exposure = next(t for t in fastq_quality.tables(profile) if t.source.endswith(":context"))
@@ -120,7 +124,8 @@ def fit(
     if not alphabet:
         raise ValueError("the FASTQ profile has no qualities, so there is no alphabet to fit over")
     context_head = kmer.fit(kvmer, context_tokens, flank=flank)
-    head = list(kmer.fit_centre_q(context_head, a.phred, exposure, context_tokens, alphabet))
+    phred = [replace(b, per_base_error_rate=b.per_base_error_rate * level) for b in a.phred]
+    head = list(kmer.fit_centre_q(context_head, phred, exposure, context_tokens, alphabet))
     for c in marginal:
         if c.name == "Position":
             head.append(kmer.position(a.read_position, profile.lengths, c.args[0]))

@@ -349,6 +349,11 @@ def _fit(
         recovery.run_skiver(kw["skiver"], fastq, prefix, kw["k"], kw["v"], kw["c"], extra)
         a = skiver_analyze.read_analyze(prefix)
         flank, m = bam.window(recovery._ERROR_TOKENS, recovery._QUALITY_TOKENS)
+        key_report, level = None, 1.0
+        if kw.get("site_mask") == "joint":
+            # phase 8's key-level count test (§6.6) in place of skiver's outlier filter
+            a, key_report = sites.keys(a, kmer_source._split(recovery._ERROR_TOKENS)[0], flank=flank)
+            level = key_report["level"]
         fitted = kmer_source.fit(
             a,
             fastq_quality.profile_fastq(fastq, order=m, flank=flank),
@@ -358,12 +363,14 @@ def _fit(
             {"mode": "kmer", "skiver_build": "default", "sources": ["variation-grid"]},
             use_all=kw["use_all"],
             flank=flank,
+            level=level,
         )
         if tuple(fitted.quality_alphabet) != tuple(truth.quality_alphabet):
             return None, {"skipped": f"the reads carry qualities {list(fitted.quality_alphabet)}"}
         return fitted, {
             "outlier_filter": kmer_source.filter_stats(a),
             "skiver_error_rate": a.error_rate.per_base_error_rate,
+            "key_test": key_report,
         }
     raise ValueError(f"unknown mode {name!r}; use one of {MODES}")
 
