@@ -1,0 +1,66 @@
+name: export-roundtrip
+
+# Exporter round trips with the real simulators (plan phase 9): export, simulate, align, re-estimate, and
+# check the preserved quantity is within 10% of the spec. Slow (~10 min), so not part of Testing.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/sequencing_error_model/export/**"
+      - "src/sequencing_error_model/generate.py"
+      - "tests/test_export*"
+      - ".github/workflows/export-roundtrip.yml"
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  export-roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      # bioconda's insilicoseq recipe misses run dependencies, so InSilicoSeq comes from PyPI into the same env.
+      - name: Install simulators
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: sims
+          create-args: >-
+            -c conda-forge -c bioconda python=3.12 art=3.19.15 pbsim3=3.0.5 badread=0.4.2 edlib
+          init-shell: bash
+
+      - name: Install InSilicoSeq and aligners
+        shell: bash -el {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m pip install "InSilicoSeq==2.0.1"
+          gh release download v0.7 -R lh3/minibwa -p "minibwa-*_x64-linux.tar.bz2" -D "$RUNNER_TEMP"
+          gh release download v2.31 -R lh3/minimap2 -p "minimap2-*_x64-linux.tar.bz2" -D "$RUNNER_TEMP"
+          for f in "$RUNNER_TEMP"/*_x64-linux.tar.bz2; do tar -xjf "$f" -C "$RUNNER_TEMP"; done
+          cp "$RUNNER_TEMP"/minibwa-*_x64-linux/minibwa "$RUNNER_TEMP"/minimap2-*_x64-linux/minimap2 "$CONDA_PREFIX/bin/"
+          echo "$CONDA_PREFIX/bin" >> "$GITHUB_PATH"
+
+      - name: Loader checks and round trips
+        run: |
+          # The loader checks import InSilicoSeq and Badread, so they run in the simulators' env.
+          python -m pip install -e . pytest
+          python -m pytest -vv tests/test_export.py
+          uv run python -m sequencing_error_model.export.roundtrip --workdir "$RUNNER_TEMP/rt" --require --output roundtrip.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: export-roundtrip-report
+          path: roundtrip.json
