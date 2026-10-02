@@ -22,7 +22,9 @@ on:
 jobs:
   kmer-recovery:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # The measured cost of one loop at the default 40,000 reads: 38 min for the recovery fit, and roughly twice
+    # that for the filter cost, which runs skiver and fits twice. 120 min left no headroom for a larger --reads.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7
 
