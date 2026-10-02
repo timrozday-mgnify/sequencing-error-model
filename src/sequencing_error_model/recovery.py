@@ -479,6 +479,18 @@ def scale_error_rate(truth: ErrorModelSpec, scale: float) -> ErrorModelSpec:
     return replace(truth, error_head=scaled)
 
 
+def miscalibrate(truth: ErrorModelSpec) -> ErrorModelSpec:
+    """`truth` with head E's dependence on Q reversed along the alphabet: the bases reported at the top Q get the
+    bottom Q's error odds and vice versa, at every window offset. Head Q is untouched, so the qualities read the
+    same and only what they mean changes - the "Q is never a label" guard's truth (§10), where a fit that read
+    rates off 10^(-Q/10) would come out backwards."""
+    head0 = truth.error_head[0]
+    window = head0.params["window"].copy()
+    a = len(truth.quality_alphabet)
+    window[:, :a] = window[:, a - 1 :: -1]  # row `a` (no base there) keeps its weights
+    return replace(truth, error_head=(replace(head0, params={**head0.params, "window": window}), *truth.error_head[1:]))
+
+
 def aligner_bias(
     truth: ErrorModelSpec,
     aligner: str,

@@ -211,3 +211,45 @@ def test_keys_drops_a_planted_variant_and_leaves_the_clonal_fixture_alone() -> N
     assert set(planted) <= called, sorted(set(planted) - called)
     assert report["dropped_variant"] <= 30 + 2
     assert report["level"] < 0.9  # the planted keys' excess, removed from summary_phred.csv's level
+
+
+def test_q_diagnostic_and_fit_follow_miscalibrated_q_through_variation(tmp_path: Path) -> None:
+    """The "Q is never a label" guard with variants (§10, phase 8): the truth's Q dependence reversed, so the top
+    reported Q carries the worst error, then ANI 95% and the joint site model. The fitted rate rises with Q as the
+    injected truth does - a fit reading 10^(-Q/10) would fall - and so does the diagnostic's kept-site curve,
+    while the dropped sites read flat and high, as real alleles do."""
+    if shutil.which("minibwa") is None:
+        if os.environ.get("REQUIRE_ALIGNERS") == "1":
+            pytest.fail("minibwa is not on PATH")
+        pytest.skip("minibwa is not on PATH")
+    # scale 0.05 puts the reversed truth's marginal (~4.6%) at the calibrated grid's ~4.2%
+    truth = recovery.miscalibrate(recovery.scale_error_rate(recovery.example_spec(), 0.05))
+    doc = bias.scenario(
+        truth,
+        tmp_path,
+        ani=0.95,
+        n_haplotypes=2,
+        minor_fraction=0.5,
+        coverage=18.0,
+        genome_length=6000,
+        read_length=120,
+        insert_mean=180.0,
+        insert_sd=15.0,
+        modes=("reference",),
+        q_reads=400,
+        seed=1,
+        site_mask="joint",
+    )
+    mode = doc["modes"]["reference"]
+    assert abs(mode["rate_ratio"] - 1) < 0.1, mode["rate_ratio"]
+    assert (np.diff(mode["rate_by_q_fit"]) > 0).all(), mode["rate_by_q_fit"]
+    # Q >= 12 within 20%; the lowest-error bin (now Q2) carries the alignment's mismatch floor, as the clonal run
+    # does at 1.7x, and is bounded rather than held to the tolerance.
+    ratio = mode["rate_by_q_ratio"]
+    assert max(abs(r - 1) for r in ratio[1:]) < 0.2 and ratio[0] < 2.5, ratio
+
+    kept, dropped = (mode["q_diagnostic"][side] for side in ("kept", "dropped"))
+    assert (np.diff([kept[q]["mismatch_rate"] for q in sorted(kept)]) > 0).all(), kept
+    low, high = min(dropped), max(dropped)
+    assert dropped[low]["mismatch_rate"] > 10 * kept[low]["mismatch_rate"], (kept, dropped)
+    assert dropped[high]["mismatch_rate"] > 2 * kept[high]["mismatch_rate"], (kept, dropped)

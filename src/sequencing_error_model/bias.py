@@ -151,6 +151,7 @@ def _summary(truth: ErrorModelSpec, fitted: ErrorModelSpec, report: recovery.Rep
         "context_log_odds_slope": parts["context"].get("log_odds_slope"),
         "context_r": parts["context"].get("r"),
         "rate_by_q_ratio": [round(float(x), 3) for x in by_q],
+        "rate_by_q_fit": [float(x) for x in report.curves["rate_by_q_fit"]],
         "position_ratio_max": float(np.nanmax(np.abs(by_pos - 1))),
         "failures": _error_failures(report),
         "components": parts,
@@ -339,6 +340,7 @@ def _fit(
             "mapped_fraction": len(aligned) / len(reads),
             "site_model": kw.get("site_mask"),
             "site_mask": site_report,
+            "q_diagnostic": sites.q_diagnostic(alignments, masked) if masked is not None else None,
         }
     if name == "kmer":
         if not kw.get("skiver"):
@@ -457,10 +459,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--q-reads", type=int, default=20_000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--workdir", type=Path, help="keep the intermediate files here instead of a temporary directory")
+    p.add_argument(
+        "--miscalibrate", action="store_true", help="reverse the truth's Q dependence (the Q-is-never-a-label guard)"
+    )
     args = p.parse_args(argv)
     truth = recovery.scale_error_rate(
         spec_io.load(args.spec) if args.spec else recovery.example_spec(), args.error_rate_scale
     )
+    if args.miscalibrate:
+        truth = recovery.miscalibrate(truth)
     shared: dict[str, Any] = dict(
         modes=args.modes,
         n_haplotypes=args.haplotypes,
