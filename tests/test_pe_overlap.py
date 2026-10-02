@@ -52,13 +52,13 @@ def test_pe_overlap_recovers_substitution_head() -> None:
     example = recovery.example_spec()
     head0 = example.error_head[0]
     # ~3.5% errors, not the example's 14%: overlaps that noisy fail placement. (At ~1% the per-Q rates need
-    # ~10k pairs to settle within 10%, too slow for CI.)
+    # ~10k pairs to settle within 10%, too slow for CI.) Q37, the lowest-rate bin, needs 5,000 pairs here.
     bias = head0.params["bias"] - np.r_[0, np.full(9, 1.5)]
     quiet = (replace(head0, params={**head0.params, "bias": bias}), *example.error_head[1:])
     truth = replace(example, error_head=quiet)
     fitted, report = recovery.recover(
         truth,
-        n_reads=6000,
+        n_reads=10000,
         seed=4,
         mode=pe_overlap.mode,
         draw=recovery.paired_draw(40, 45, 8),
@@ -78,3 +78,21 @@ def test_long_inserts_give_no_overlap_evidence_and_say_so() -> None:
     reads = gen.generate(truth, templates, mates, rng)
     with pytest.raises(ValueError, match="no pair overlapped"):
         pe_overlap.mode(templates, reads, mates, truth)
+
+
+def test_attribution_weighs_each_explanation_by_head_q() -> None:
+    """A low Q on G is likelier if the template base there is G, so a disagreement where mate 1 reads G at Q2 and
+    mate 2 reads A at Q37 leans further to mate 1 with head Q than with head E alone (the reversed-Q truth's
+    failure, plan phase 8)."""
+    truth = recovery.example_spec()
+    rng = np.random.default_rng(0)
+    template = "".join(rng.choice(list("ACGT"), size=40))
+    template = template[:20] + "A" + template[21:]
+    r1, q1 = template[:20] + "G" + template[21:], [37] * 20 + [2] + [37] * 19
+    ev = pe_overlap.collect([(r1, q1, gen._revcomp(template), [37] * 40)], 1, (2, 2))
+    ev.alphabet = set(truth.quality_alphabet)
+    groups = list(ev.disputed.items())
+    assert len(groups) == 1
+    alone = pe_overlap._posterior(ev, groups, truth.error_head)
+    with_q = pe_overlap._posterior(ev, groups, truth.error_head, truth.quality_head)
+    assert with_q[0] > alone[0]
