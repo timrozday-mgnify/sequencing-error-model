@@ -1477,7 +1477,37 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
       Q37 reads 1.02 and 0.97 over two seeds, against 1.08 and 1.03 without head Q. The recovery test now uses
       5,000 pairs. Tests: `tests/test_pe_overlap.py` (the head Q weighting moves a G-at-Q2 dispute's
       posterior, and the recovery test).
-    - `kmer` is not yet run under the miscalibrated truth.
+  - ✓ **`kmer` follows the injected truth too** (2026-10-02). Setup: phase 8's grid point (30 kb random genome,
+    2x150, 230 bp insert, seed 7, two haplotypes at 20% minor). Unmodified skiver v0.3.2 built from its tag,
+    k = 11, which cannot collide on a 30 kb random genome (phase 6b's multiplicity problem is a real-genome
+    one). `--miscalibrate --error-rate-scale 0.05`. The same command at scale 0.2, calibrated, reproduces the
+    phase 8 table above (1.217, 1.187, 1.413, 1.192). Rate ratio by Q (Q 2, 12, 23, 37) and marginal:
+
+    | | 30x | 100x |
+    |---|---|---|
+    | clonal | 1.25, 1.17, 1.00, 0.97 (0.979) | 1.39, 1.10, 1.03, 1.01 (1.019) |
+    | ANI 95%, skiver filter | 3.40, 1.77, 1.41, 1.17 (1.214) | 2.79, 1.68, 1.28, 1.13 (1.169) |
+    | ANI 95%, key test | 3.37, 1.75, 1.40, 1.15 (1.202) | 2.74, 1.65, 1.26, 1.11 (1.145) |
+    | calibrated, clonal | 1.15, 1.27, 1.29, 1.40 (1.217) | 1.13, 1.23, 1.29, 1.35 (1.187) |
+    | calibrated, ANI 95%, skiver filter | 1.21, 1.42, 1.65, 2.47 (1.413) | 1.08, 1.24, 1.34, 1.64 (1.192) |
+
+    - The fitted rate rises with Q as the truth does (clonal 100x: 0.40% at Q2 up to 6.9% at Q37, against
+      0.29% and 6.8%). Default mode's per-Q shape is skiver's `summary_phred.csv`, counted against k-mer
+      consensus, so no Q enters as a rate, and the guard holds. The residual lands in the lowest-rate bin, as
+      in both other modes: Q2 here, Q37 when calibrated. Clonal at 100x meets the guard's bar (tolerance at
+      Q >= 12); at 30x Q12 reads 1.17.
+    - **The ~1.2 paired-read clonal bias is gone under the reversed truth** (0.979, 1.019). It is not a fixed
+      default-mode offset: it depends on how Q and error line up across the mates. The fitted `Mate`
+      component reads mate 1 1.48x and mate 2 1.10x calibrated, against 1.09x and 0.92x reversed. That is
+      consistent with phase 6b item 3 (one pooled centre-Q head misplaces the mate difference), and the
+      reversed truth is a second test point for its per-mate runs.
+    - **Variants are not separated at either coverage**, and the marginal hid the calibrated case. A variant
+      is a correctly read allele, so its excess (~0.4-0.8% per base at 100x) sits at whatever Q the base
+      carried. Calibrated, that excess falls on bins whose true rates are already high; with the level from
+      skiver, the bins move in opposite directions: Q2 at 0.95x clonal, Q37 at 1.22x. The marginal reads
+      +0.4%, which is why "skiver's own filter is already enough at 100x" (above) holds only for the
+      marginal. Reversed, nothing cancels: +15% at 100x. The key test takes 1,897 keys and moves it to +12%.
+      So the default-mode floor above stands at 100x as well, per Q.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.
 - **Carried from phase 7**, where a global rate could not show either: the repeat case (a 500 bp copy at 97%
   identity is 1.7% of a 30 kb genome, so it moves no marginal rate even though it is a per-site failure) and
