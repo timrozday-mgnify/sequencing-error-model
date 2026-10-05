@@ -10,10 +10,8 @@ Runs that take more than ~10 minutes locally go here. One Nextflow workflow, two
 - **sweep**: one Slurm task per row of `sweeps/phase6b.csv` (`id,module,args,truth`), running
   `python -m sequencing_error_model.<module> --skiver ... <args> [--spec <truth>] --output <id>.json` into
   `results/sweep/`. `truth` names a spec from the real arm (`latent2`, `latent3`); those rows wait for it.
-  The 105 rows are phase 6b item 2: seeds 0-9 at k 11-31 (`pool_*`), a 200 kb genome (`big_*`) and skiver's
-  `-l` floor at 10/30/100x (`lb*`). The `Latent` truth rows (`latent{2,3}_k{11..31}_s{0..4}`) are not in yet:
-  `recovery --skiver --spec` refuses a `Latent` truth (its compare has no `latent` field) until that is
-  implemented. A row whose tolerances fail
+  The 155 rows are phase 6b item 2: seeds 0-9 at k 11-31 (`pool_*`), a 200 kb genome (`big_*`), the
+  `Latent(2)`/`Latent(3)` truths at k 11-31 (`latent*`) and skiver's `-l` floor at 10/30/100x (`lb*`). A row whose tolerances fail
   still publishes its report; a row that crashes is skipped and logged.
 
 The image (`Dockerfile`) holds skiver v0.3.2 (the release binary), minibwa, minimap2 and the locked Python

@@ -167,6 +167,24 @@ def _lag1(tracks: Sequence[Array]) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def _classes(model: ErrorModelSpec, n: int, rng: np.random.Generator) -> Array | None:
+    """Each of `n` reads' `Latent(S)` class, drawn from the prior; None without `Latent`."""
+    if model.latent is None:
+        return None
+    prior = model.latent.params["prior"]
+    return rng.choice(len(prior), size=n, p=prior / prior.sum())
+
+
+def _with_class(table: CountTable, classes: Array) -> CountTable:
+    """`table` with its `read` field replaced by that read's class (`latent`), merging rows that then coincide."""
+    ri = table.fields.index("read")
+    counts: Counter[Key] = Counter()
+    for key, n in table.counts.items():
+        counts[(*key[:ri], *key[ri + 1 : -1], int(classes[int(str(key[ri]))]), key[-1])] += n
+    fields = (*table.fields[:ri], *table.fields[ri + 1 : -1], "latent", table.fields[-1])
+    return replace(table, fields=fields, counts=counts)
+
+
 def compare(
     truth: ErrorModelSpec,
     fitted: ErrorModelSpec,
@@ -179,9 +197,16 @@ def compare(
     """Metrics of `fitted` against `truth` on reads generated from `templates`; Q-track statistics use at least
     `q_reads` sampled tracks per spec. `substitutions_only` compares both heads E conditional on no indel, the
     support of `pe-overlap`."""
+    if fitted.latent is not None:
+        # ponytail: its classes need not match the truth's; scoring it needs a per-read class posterior.
+        raise ValueError("compare cannot score a fitted Latent(S) spec, only a Latent(S) truth")
     alphabet = np.asarray(truth.quality_alphabet)
-    true_reads = generate(truth, templates, mates, rng)
+    # A Latent(S) truth is scored at each held-out read's own class, which the generator is handed.
+    classes = _classes(truth, len(templates), rng)
+    true_reads = generate(truth, templates, mates, rng, classes=classes)
     table = _tuples(truth, templates, true_reads, mates, fitted)
+    if classes is not None:
+        table = _with_class(table, classes)
     n = np.array(list(table.counts.values()), float)
     p_true, p_fit = (
         error.probabilities(indel.split(s.error_head)[0], truth.quality_alphabet, table) for s in (truth, fitted)
@@ -201,7 +226,8 @@ def compare(
     reps = -(-q_reads // len(templates))
     tiled, tiled_mates = list(templates) * reps, list(mates) * reps
     q_true, q_fit = (
-        quality.sample(s.quality_head, truth.quality_alphabet, tiled, tiled_mates, rng) for s in (truth, fitted)
+        quality.sample(s.quality_head, truth.quality_alphabet, tiled, tiled_mates, rng, _classes(s, len(tiled), rng))
+        for s in (truth, fitted)
     )
     top = min(len(t) for t in templates)
     tv = 0.5 * np.abs(_q_hist(q_true, alphabet, top) - _q_hist(q_fit, alphabet, top)).sum(axis=1)

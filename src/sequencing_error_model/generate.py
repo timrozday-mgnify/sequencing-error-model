@@ -95,15 +95,16 @@ def generate(
     max_ins_run: int = 10,
     error_rate_scale: float = 1.0,
     tracks: Sequence[Array] | None = None,
+    classes: Array | None = None,
 ) -> list[Read]:
     """One read per template; mate 2 also uses the "-" strand covariate. `tracks` replaces head Q's draw with given
-    template-indexed Q tracks (values in the alphabet), e.g. an exporter's base profile."""
+    template-indexed Q tracks (values in the alphabet), e.g. an exporter's base profile. `classes` gives each
+    read's `Latent(S)` class instead of drawing it from the prior, so a caller can label the reads' tuples."""
     if max_ins_run < 1:
         raise ValueError("max_ins_run must be at least 1")
     templates = [t.upper() for t in templates]
     alphabet = np.asarray(model.quality_alphabet)
-    classes = None
-    if model.latent is not None:
+    if model.latent is not None and classes is None:
         prior = model.latent.params["prior"]
         classes = rng.choice(len(prior), size=len(templates), p=prior / prior.sum())
     if tracks is None:
