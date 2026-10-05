@@ -68,3 +68,17 @@ def test_heads_must_carry_the_latent_token() -> None:
         replace(truth, latent=None)
     with pytest.raises(SpecError, match="latent layer's token"):
         replace(truth, latent=Component("Latent(3)", {"prior": np.ones(3) / 3}))
+
+
+def test_compare_scores_a_latent_truth() -> None:
+    # A flat fit to a Latent(2) truth's reads carries its marginal rate and Q profile, so it compares within
+    # tolerance only if the held-out tuples are scored at each read's own class (all class 0 reads ~1.4x high).
+    truth = latent_spec()
+    flat = recovery.example_spec()
+    fitted, report = recovery.recover(truth, 3000, mode=lambda t, r, m, _: recovery.cigar_mode(t, r, m, flat))
+    assert fitted.latent is None
+    assert abs(report.scalars["rate_ratio"] - 1) < 0.05, report.scalars
+    assert report.scalars["q_position_tv_max"] < 0.05, report.scalars
+
+    with pytest.raises(ValueError, match="fitted Latent"):
+        recovery.compare(truth, truth, *_draw(np.random.default_rng(0), 10), np.random.default_rng(0))

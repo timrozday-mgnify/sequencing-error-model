@@ -1180,7 +1180,7 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
       14.5 where the tiny fixture is integral, and the `int()` parse raised (`sources/skiver_analyze.py`).
 - **Exit:**
   - ✓ the synthetic loop passes at v=13 within the phase 2 tolerances (rate ratio 0.986, op TV 0.027, `failures` empty; run above), and the documented failure at small v is reproduced as a guarded error or warning (`sources/kmer._check_v`);
-    **At k = 11 only:** at skiver's default k = 21, now this repo's default (phase 6b item 1), the same loop reads 0.914 and fails (phase 6b item 2);
+    **At seed 0 only:** over seeds 0-5 the loop reads 0.951 ± 0.047 at k = 11 and 0.947 ± 0.033 at k = 21 (skiver's default, now this repo's) and fails 4 of 6 at either k (phase 6b item 2);
     **Single-end only.** `skiver_recovery` generates all mate 1 (§6.2: default mode identifies no mate
     effect), and phase 7's grid found that on *paired* reads from the same truth the same loop reads
     1.19-1.22 rather than ~1.00, at every coverage from 30x to 100x. The truth's head Q makes mate 2 low-Q
@@ -1240,6 +1240,13 @@ fixture's keys, joined to the genome they were made from, are single-locus with 
   check: each single-mate run reports median key coverage 18 against 14 for both together.)
 
 **Diagnosis, one item per evident issue.** Each gets a synthetic test with a known answer before a real one.
+Runs longer than ~10 minutes go to Slurm through `workflows/hpc` (its README): item 1's real rerun at k = 17/21/31
+with the `Latent(2)`/`Latent(3)` reference refits, and item 2's sweeps (`sweeps/phase6b.csv`: seeds 0-9 at
+k 11-31, a 200 kb genome, the `Latent` truths, the `-l` floor at 10/30/100x). `recovery.compare` scores a
+`Latent(S)` truth at each held-out read's own class (drawn from the prior, handed to the generator, and written
+into the tuples), and samples its Q tracks the same way; a fitted `Latent(S)` spec is refused, since its classes
+need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads compares within tolerance (rate ratio
+1.391 if every read is scored as class 0).
 
 1. **Key multiplicity (k too small).** Confirmed above. Remediation:
    - ✓ default `-k 21` everywhere (`recovery`, `bias`, `kmer-recovery` workflow, which also takes a `k` input;
@@ -1280,8 +1287,35 @@ fixture's keys, joined to the genome they were made from, are single-locus with 
      neighbours, which default mode cannot see (§6.2), are the candidates. The truth's 7 % is extreme: at
      Illumina's ~0.8 %, P(error-free key) is 0.91 and 0.85, so the effect should be far smaller there. Until this
      is corrected, the weekly `kmer-recovery` workflow (now at k = 21) fails, and that failure is this item's
-     baseline. Next: sweep k (11-31) and `--error-rate-scale` on the example spec to fit how the shortfall scales
-     with P(error-free key), then the `Latent` truths below;
+     baseline. **Superseded by the sweep below: the k = 11 / 21 difference at seed 0 is the seed, not k;**
+   - ✓ **measured: neither k nor the error rate moves the level; seed 0's key set does** (2026-10-02, same loop,
+     `recovery --skiver ... --error-rate-scale S`, which now scales the truth for the skiver loop as it does for
+     `--aligner`). Fitted / true rate over k x scale, seed 0 (truth 7.03 / 4.11 / 2.32 / 1.02 % per base):
+
+     | scale \ k | 11 | 13 | 15 | 17 | 21 | 25 | 31 |
+     |---|---|---|---|---|---|---|---|
+     | 1 | 0.989 | 0.878 | 0.910 | 0.988 | 0.914 | 1.005 | 0.988 |
+     | 0.5 | 0.961 | 0.870 | 0.907 | 0.956 | 0.904 | 1.016 | 0.951 |
+     | 0.25 | 0.934 | 0.856 | 0.925 | 0.964 | 0.877 | 1.004 | 0.969 |
+     | 0.1 | 0.990 | 0.925 | 0.973 | 0.997 | 0.945 | 1.063 | 1.039 |
+
+     log(ratio) against -log (1 - r)^k has slope 0.006 at r = 0.06: no key-conditioning signal from P(error-free
+     key) 0.10 to 0.89. The profile over k is not monotone and is the same at every scale (correlation 0.89-0.97
+     between scales); k explains SD 0.047 of the 0.054 in log ratio, scale almost none (1.04 / 0.98 / 0.98 / 1.00),
+     residual 0.012. A fixed genome and seed give each k one FracMinHash key set (~3.7-5.2 k keys on 20 kb), whatever
+     the error rate, so this is that set's sampling error. Seeds 0-5 confirm it (new genome and reads each):
+
+     | | mean | SD | range | fails |
+     |---|---|---|---|---|
+     | k = 11 | 0.951 | 0.047 | 0.865-0.999 | 4 of 6 |
+     | k = 21 | 0.947 | 0.033 | 0.914-0.993 | 4 of 6 |
+
+     So: phase 6's 0.986 at k = 11 was a good seed, the loop fails most seeds at either k, and k = 21 costs nothing
+     here. What is left is a ~5 % low level common to every k and error rate (grid mean 0.948), plus a seed SD of
+     ~0.04 that moves with skiver's own reported rate (its rate / truth tracks the fitted ratio seed by seed:
+     0.705-0.799), i.e. it enters through the `summary_phred.csv` level marginal matching inherits. Op TV is flat in
+     k (0.027 at scale 1). Next: a larger genome (or pooled seeds) so one recovery run resolves 5 %, then the
+     Weibull-level item below for the 5 %; the `Latent` truths below stay the test of key conditioning proper;
    - *key conditioning under read-level clustering.* A value is observed only after an error-free key, so
      error-prone reads (and stretches) are under-sampled. Real Illumina NM is overdispersed (variance/mean 4.0,
      phase 5), so the bias is real and grows with k; phase 6's synthetic truth had no `Latent` term, so it could not
