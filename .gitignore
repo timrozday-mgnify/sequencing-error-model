@@ -26,3 +26,11 @@ htmlcov/
 
 # Serena tool state
 .serena/
+
+# Nextflow (workflows/hpc)
+work/
+.nextflow/
+.nextflow.log*
+results-test/
+sem-tools.tar
+*.sif

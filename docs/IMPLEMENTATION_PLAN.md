@@ -1240,6 +1240,10 @@ fixture's keys, joined to the genome they were made from, are single-locus with 
   check: each single-mate run reports median key coverage 18 against 14 for both together.)
 
 **Diagnosis, one item per evident issue.** Each gets a synthetic test with a known answer before a real one.
+Runs longer than ~10 minutes go to Slurm through `workflows/hpc` (its README): item 1's real rerun at k = 17/21/31
+with the `Latent(2)`/`Latent(3)` reference refits, and item 2's sweeps (`sweeps/phase6b.csv`: seeds 0-9 at
+k 11-31, a 200 kb genome, the `-l` floor at 10/30/100x). The `Latent` truth sweep waits on `recovery`: its skiver
+loop's compare raises on a `Latent` truth (head E needs a `latent` field the held-out table lacks).
 
 1. **Key multiplicity (k too small).** Confirmed above. Remediation:
    - ✓ default `-k 21` everywhere (`recovery`, `bias`, `kmer-recovery` workflow, which also takes a `k` input;
