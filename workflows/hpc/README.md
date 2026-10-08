@@ -99,4 +99,13 @@ RUNS=$BASE/sequencing-error-model_runs/sem-hpc
    alone, `--k 21`. Re-submitting resumes.
 
 The head job stages the two FASTQs from ENA (~1.5 GB) once into `work/stage-*`, so compute nodes need no
-internet. If the head job's node has none either, download them on a login node and pass `--r1`/`--r2` paths.
+internet. If the head job's node has none either, the run fails with `Can't stage file ... Connection refused`.
+Fetch them on a login node instead:
+
+```bash
+cd $RUNS/data
+wget https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR245/012/SRR24523812/SRR24523812_{1,2}.fastq.gz
+```
+
+then uncomment `params.r1` / `params.r2` in `site.config` (or pass `--r1 ../data/SRR24523812_1.fastq.gz
+--r2 ../data/SRR24523812_2.fastq.gz` on the `sbatch` line). Relative paths resolve against the run directory.
