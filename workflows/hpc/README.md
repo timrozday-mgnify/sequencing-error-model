@@ -76,8 +76,10 @@ RUNS=$BASE/sequencing-error-model_runs/sem-hpc
    singularity build sem-tools.sif docker-archive://sem-tools.tar && rm sem-tools.tar
    ```
 
-   `site.config` already points at `../containers/sem-tools.sif` and `../data/SRR24523812_contigs.fa`, so the
-   names above matter. Edit it for the site's `process.queue` / `process.clusterOptions` before submitting.
+   `site.config` already points at `../containers/sem-tools.sif` and `../data/SRR24523812_contigs.fa`,
+   relative to the launch directory, so both the names and the layout above matter. Edit it for the site's
+   `process.queue` / `process.clusterOptions` before submitting. If Nextflow reports pulling
+   `docker://quay.io/sem-tools:latest`, it did not see this file: the `.sif` is a local path, never pulled.
 
 4. **Clone the repo** next to the runs tree (no venv needed; `git pull` is how code updates reach a run):
 

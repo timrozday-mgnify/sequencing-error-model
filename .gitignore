@@ -32,5 +32,6 @@ work/
 .nextflow/
 .nextflow.log*
 results-test/
-sem-tools.tar
+sem-tools*.tar
+sem-tools*.tar.gz
 *.sif
