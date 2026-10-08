@@ -99,8 +99,10 @@ RUNS=$BASE/sequencing-error-model_runs/sem-hpc
    alone, `--k 21`. Re-submitting resumes.
 
 The head job stages the two FASTQs from ENA (~1.5 GB) once into `work/stage-*`, so compute nodes need no
-internet. If the head job's node has none either, the run fails with `Can't stage file ... Connection refused`.
-Fetch them on a login node instead:
+internet. If the head job's node cannot reach ENA, the run fails with `Can't stage file ... Connection
+refused` even where `curl` on the URL works, since Nextflow's own https staging also has to get out (a dead
+`http_proxy`/`https_proxy` in the job environment refuses it this way; `env | grep -i proxy` on the node says).
+Either way, fetch the files once where it does work and skip the staging:
 
 ```bash
 cd $RUNS/data
