@@ -1,6 +1,6 @@
 # Implementation plan: sequencing-error-model
 
-Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Phase 6 (`kmer`) has met its exit criteria: the fitters, the evidence and model checks, the synthetic recovery run, the outlier filter's clonal cost and the real three-mode run on SRR24523812 have landed (the `kmer` shape agrees with the other two modes as a flat multiple, the level does not, and the gap is skiver's own reported rate; no real dataset settles the level, since every mode there is a biased estimate, which is what phases 7-8 exist for); its non-blocking ReSeq/Badread comparison remains. Phase 6b reopens default mode (2026-10-02): every real `kmer` run so far used k = 11, where 90 % of a 5 Mb genome's key observations sit at multi-locus keys, so the real-data level and context results are void until rerun at k >= 17; at skiver's default k = 21 the level reads low (0.62x) and the mates differ (R2/R1 1.39x), and per-mate skiver runs are the planned fix for the paired-read bias. k = 21 is now the default, with a guard refusing k < 15; at k = 21 the synthetic loop itself reads 0.914 and fails, the key-conditioning bias phase 6b item 2 addresses. Phase 7 (variation simulator and the problem-size grid) has met its exits bar the repeat case, carried to phase 8, where the conservative mask has landed (`sites.py`: it takes `reference`'s ANI 95% inflation from 1.485 to 1.082 at no clonal cost), along with the joint latent-site model and the `kmer` key test (which shows skiver's own filter suffices at 100x for the marginal but not per Q, and nothing separates a 20% minor strain at 30x in default mode). Phase 9 (wave-1 exporters: ART, InSilicoSeq, Badread, PBSIM3) has met its exit criteria; its `kmer`-mode re-estimation remains. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
+Status: **draft, revised 2026-09-16**. Phases 0 (repo, CI and PR policy) and 1 (inputs) are done; phase 2 is in progress (`spec.py`, the head Q and head E fitters and per-head selection landed; the insertion-quality sub-head waits for `reference` tuples); phase 3 (generator, paired output and recovery harness) is done; phase 4 (`pe-overlap`) has met its exit criteria. The source, EM fit, recovery test, real-data placement guards and a real-run spec have landed, along with Q smoothing of head E and a finer default head Q (user guide: [pe_overlap.md](pe_overlap.md)). Its open items and the non-blocking ErrorProfiler comparison remain. Phase 5 (`reference`) is in progress: the core of `sources/bam.py`, site masks, the contig filter, the per-contig report, the `pe-overlap` vs `reference` comparison, the aligner bias check against an observable truth with a soft-clipping correction, and the real near-clonal run (SRR24523812: `pe-overlap` vs `reference` disagreements explained, `QualityWindow` beats centre Q) and the baseline harness with its Illumina (vs ReSeq) and ONT (vs Badread, PBSIM3, CycSim) runs have landed, and so has `Latent(S)` (a read-level class shared by both heads, fitted by EM), which closes most of the Illumina per-read heterogeneity gap and halves the ONT one. Its apparent error-rate loss on both platforms was training size: refitted on the full training sets it gives the best error rate of any spec or baseline on Illumina (0.019) and the best native ONT row (1.62 % against 1.97 %). Phase 6 (`kmer`) has met its exit criteria: the fitters, the evidence and model checks, the synthetic recovery run, the outlier filter's clonal cost and the real three-mode run on SRR24523812 have landed (the `kmer` shape agrees with the other two modes as a flat multiple, the level does not, and the gap is skiver's own reported rate; no real dataset settles the level, since every mode there is a biased estimate, which is what phases 7-8 exist for); its non-blocking ReSeq/Badread comparison remains. Phase 6b reopens default mode (2026-10-02): every real `kmer` run so far used k = 11, where 90 % of a 5 Mb genome's key observations sit at multi-locus keys, so the real-data level and context results are void until rerun at k >= 17. k = 21 is now the default, with a guard refusing k < 15. Its first full HPC run (2026-10-08, `workflows/hpc`) settles four of the six items: at k = 21 the real `kmer` level agrees with `reference` (ratio 1.012, from 0.60 at k = 11) and context agrees with `pe-overlap` (slope 0.98), but read position does not (3-4x low at the read start, 1.5-2x high at the end) and a `Latent` truth still recovers 1.36-1.42x high, because key conditioning pulls skiver's own level down with k (0.89 to 0.64 on `Latent(3)`) while marginal matching lifts it by a homogeneous-truth factor. The coverage floor is stated (coverage must exceed `-l`, `-l` >= 5) and k costs nothing on a flat truth (~5 % low at every k). Per-mate runs (item 3) and the position and level corrections are what remain. Phase 7 (variation simulator and the problem-size grid) has met its exits bar the repeat case, carried to phase 8, where the conservative mask has landed (`sites.py`: it takes `reference`'s ANI 95% inflation from 1.485 to 1.082 at no clonal cost), along with the joint latent-site model and the `kmer` key test (which shows skiver's own filter suffices at 100x for the marginal but not per Q, and nothing separates a 20% minor strain at 30x in default mode). Phase 9 (wave-1 exporters: ART, InSilicoSeq, Badread, PBSIM3) has met its exit criteria; its `kmer`-mode re-estimation remains. Everything else is planned. This revision adds the `pe-overlap` and `reference` evidence modes beside the `kmer` (skiver) mode, and builds them first so they can check the `kmer` evidence (§1.1, §9). The latest revision adds separating biological variation (strains, minor alleles, divergent repeats) from sequencing error (§6.6): every method is first shown unbiased on clonal simulations, then a variation simulator (phase 7) measures the problem, and separation methods (phase 8) are developed on it before real metagenomes. Later phases are renumbered 9–13.
 
 ## 1. Goal
 
@@ -1190,7 +1190,7 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   - ✓ on the phase 5 near-clonal real dataset, skiver's marginals and the `kmer` spec are compared with both other modes on shared support, and the report states agreement per component (run above: the shape agrees as a flat multiple, the level does not, and the gap is skiver's own reported rate rather than the fit - bracketed, since the alignment is itself biased, low by a few percent through hidden edits and excluded reads and high through assembly consensus error);
   - reported, not blocking: the default-mode model's held-out likelihood and marginals vs ReSeq (Illumina) and Badread (long reads) profiles trained on the aligned reads (§4.4, risk 2).
 
-### Phase 6b: `kmer` default mode, diagnosis and remediation (planned; reopened 2026-10-02)
+### Phase 6b: `kmer` default mode, diagnosis and remediation (in progress; reopened 2026-10-02, measured 2026-10-08)
 Phase 6's exit stands for what it tested: clonal, single-end, synthetic reads from a random genome. Everything
 past that is either failing or untested: paired reads read ~1.2x high (phase 7), the real isolate's level is off by
 1.2-1.9x, its context slope is 0.30, the filter removes ~89 % of real error mass, depth raises skiver's rate, and 10x
@@ -1240,7 +1240,8 @@ fixture's keys, joined to the genome they were made from, are single-locus with 
   check: each single-mate run reports median key coverage 18 against 14 for both together.)
 
 **Diagnosis, one item per evident issue.** Each gets a synthetic test with a known answer before a real one.
-Runs longer than ~10 minutes go to Slurm through `workflows/hpc` (its README): item 1's real rerun at k = 17/21/31
+Runs longer than ~10 minutes go to Slurm through `workflows/hpc` (its README); items 1, 2, 4 and 5 below were
+measured by its first full run (2026-10-08): item 1's real rerun at k = 17/21/31
 with the `Latent(2)`/`Latent(3)` reference refits, and item 2's sweeps (`sweeps/phase6b.csv`: seeds 0-9 at
 k 11-31, a 200 kb genome, the `Latent` truths, the `-l` floor at 10/30/100x). `recovery.compare` scores a
 `Latent(S)` truth at each held-out read's own class (drawn from the prior, handed to the generator, and written
@@ -1263,8 +1264,31 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
      >= 2-edit value is another locus. It is a function of other values, not of the single-edit outcome head E is
      fitted on, so it can join `copy_ratio` in the conservative layer of `sites.keys`; its clonal cost is measured
      as every mask's is;
-   - rerun phase 6's real three-mode comparison at k = 21 (and 17, 31): level, context slope, op shares,
-     filter share. This is the first real-data number for default mode that means anything;
+   - ✓ **rerun of phase 6's real three-mode comparison at k = 17/21/31** (2026-10-08, SRR24523812, the phase 6
+     subset and the 1,000,000-pair depth slice, `workflows/hpc`, 137 of 155 sweep rows plus all six real
+     comparisons). **At k = 21 the `kmer` level agrees with `reference`**: the fitted spec predicts 0.86 %
+     against `reference`'s 0.87 % on the same 5.99 M reference rows (ratio 1.012, from 0.60 at k = 11), and the
+     level is monotone in k, bracketing the alignment:
+
+     | ratio `reference` / `kmer`, reference rows | k = 17 | k = 21 | k = 31 |
+     |---|---|---|---|
+     | subset, 15x | 0.954 | **1.012** | 1.308 |
+     | depth slice, 37x | 0.873 | 0.937 | 1.107 |
+
+     skiver's own reported per-base rate still reads low and falls with k (subset 0.569 / 0.505 / 0.377 %,
+     depth 0.722 / 0.646 / 0.509 %, against the alignment's 0.83 %), so the agreement at k = 21 is skiver's
+     0.61x level times marginal matching's ~1.7x lift, not either one being right; the synthetic rows below
+     measure that lift directly. beta rises to 1 with k (0.921 / 0.938 / 0.982 on the subset), confirming
+     k = 11's beta 0.80 was mixture clustering. Depth no longer pulls the level away (0.937 at k = 21 against
+     0.53 at k = 11). **Shape is now the open gap, not level:** per Q the ratio is 0.99 / 1.09 / 1.16 / 1.40 /
+     1.15 (Q14-36), op TV 0.105 (`>A` 0.384 against 0.463, `>T` 0.295 against 0.204), GC sloped 1.39 to 0.78,
+     strand 0.86 / 1.24, mate 0.90 / 1.11 (item 3), and **read position is badly wrong**: `kmer` reads 3-4x low
+     at the read start and 1.5-2x high at the read end, worsening with k (8x at k = 31), with skiver's own
+     position marginal 2.0x `reference`'s (1.20x at k = 11). That shape error is also why `kmer` agrees on
+     reference rows but not on `pe-overlap` rows (2.09x `pe-overlap`, 1.52x `reference`-on-those-rows, against
+     the modes' own 1.31x evidence gap): only 1,687 of 20,000 pairs overlap at a 365 bp median insert, so
+     overlap rows sit at read ends, where `kmer` over-predicts. To check: the position curve against
+     `reference` restricted to the overlap's own rows;
    - add a `bias.py` collision scenario: a real (repeat-bearing) genome, not a random one, at k = 11/15/21.
 2. **Low level at k = 21 (0.62x).** Candidate causes, each separable:
    - ✓ **measured on synthetic reads: k alone moves the level.** Phase 6's synthetic loop (example spec, 40,000
@@ -1316,15 +1340,52 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
      0.705-0.799), i.e. it enters through the `summary_phred.csv` level marginal matching inherits. Op TV is flat in
      k (0.027 at scale 1). Next: a larger genome (or pooled seeds) so one recovery run resolves 5 %, then the
      Weibull-level item below for the 5 %; the `Latent` truths below stay the test of key conditioning proper;
-   - *key conditioning under read-level clustering.* A value is observed only after an error-free key, so
-     error-prone reads (and stretches) are under-sampled. Real Illumina NM is overdispersed (variance/mean 4.0,
-     phase 5), so the bias is real and grows with k; phase 6's synthetic truth had no `Latent` term, so it could not
-     show it. Test: `skiver_recovery` from the phase 5 `Latent(2)` / `Latent(3)` real-data specs, k = 11-31,
-     clonal single-end. Prediction: ratio ~1 without `Latent`, falling with k with it. Remedy if confirmed: correct
-     the level with head Q's read-level state (P(error-free key | state) is computable from the spec), or take the
-     level from `pe-overlap` when it exists;
-   - *the `-l 10` consensus floor.* Requiring >= 10 consensus copies selects keys whose values erred less, most
-     at low coverage, which is also the candidate mechanism for 10x reading 0.836. Test: `-l` sweep at 10/30/100x;
+   - ✓ **key conditioning under read-level clustering: the prediction holds for skiver's level, and marginal
+     matching then overshoots** (2026-10-08, 50 `Latent` rows and 60 `pool` rows, seeds, clonal single-end,
+     40,000 reads from a 20 kb random genome). skiver's own level falls with k only when the truth is clustered,
+     exactly as predicted, and is flat in k without it:
+
+     | skiver's rate / true rate | k = 11 | k = 15 | k = 21 | k = 25 | k = 31 |
+     |---|---|---|---|---|---|
+     | flat truth (`pool`, 7 % per base) | 0.751 | 0.733 | 0.745 | 0.766 | 0.781 |
+     | `Latent(2)` truth (0.77 %) | 0.936 | 0.858 | 0.823 | 0.760 | 0.726 |
+     | `Latent(3)` truth (0.76 %) | 0.891 | 0.827 | 0.766 | 0.697 | 0.642 |
+
+     So key conditioning is real, is a function of k, and scales with how much read-level heterogeneity the
+     truth has - `Latent(3)` loses 0.89 to 0.64 over the same k range. **But the fitted level moves the other
+     way**, because marginal matching lifts skiver's level by a factor that is itself calibrated for a
+     homogeneous truth (fit / skiver ~1.27 on `pool`, 1.67 on `Latent(2)` at k = 11, 2.81 at k = 31):
+
+     | fitted rate / true rate | k = 11 | k = 15 | k = 21 | k = 25 | k = 31 |
+     |---|---|---|---|---|---|
+     | flat truth (`pool`, 10 seeds) | 0.950 | 0.938 | 0.948 | 0.972 | 0.985 |
+     | `Latent(2)` truth (5 seeds) | 1.560 | 1.532 | **1.417** | 1.419 | 2.041 |
+     | `Latent(3)` truth (5 seeds) | 1.574 | 1.513 | **1.362** | 1.343 | 1.687 |
+
+     Not the class-0 scoring artifact (1.391 for `Latent(2)`): these are scored at each held-out read's own
+     class, and the value moves with k, which the artifact cannot. k = 21-25 is the best of a bad set and
+     k = 31 is unstable (SD 0.46 on `Latent(2)`). The `pool` rows also settle the residual: ~5 % low at every k
+     with seed SD falling from 0.046 to 0.018 as k rises, so **k costs nothing on a flat truth** and the ~5 %
+     is the level item below. Remedy, now testable: correct the level with head Q's read-level state
+     (P(error-free key | state) is computable from the spec, and the table above is the size of the correction
+     per k), or take the level from `pe-overlap` when it exists;
+   - ✓ **the consensus floor: the hypothesis had the sign backwards** (2026-10-08, `-l` 3/5/10/20 at 10/30/100x
+     on a 200 kb genome, 3 seeds each, k = 21). A floor does not bias the level downward by selecting clean
+     keys; too *low* a floor at low coverage biases it upward, because a consensus taken from 3 copies is
+     unreliable and calls true bases errors:
+
+     | fitted / true (skiver's own / true) | 10x | 30x | 100x |
+     |---|---|---|---|
+     | `-l 3` | 1.494 (1.315) | 1.141 (0.947) | 0.994 (0.787) |
+     | `-l 5` | 1.220 (0.960) | 1.029 (0.818) | 0.973 (0.766) |
+     | `-l 10` (default) | - | 0.994 (0.774) | 0.972 (0.765) |
+     | `-l 20` | - | - | 0.964 (0.754) |
+
+     At 100x every floor is equivalent, and skiver's own level sits at 0.75-0.79 of truth whatever the floor, so
+     the floor is not what makes it read low. The dashes are rows where the floor is at or above the coverage
+     and no key reaches consensus: `-l 10` at 10x and `-l 20` at 10/30x produced nothing and were skipped, which
+     is itself the statement of the floor's own limit. beta tracks it (0.85 at `-l 3`, 10x, against 1.00 at
+     100x), so a low beta at low coverage is a consensus-quality warning, not clustering;
    - *the outlier filter* removes 17 % of single-edit mass at k = 21, and failing single-locus keys carry 19.4 %
      single-edit values per observation against 4.4 % passing. Join failing keys to the `reference` pileup:
      minor allele, assembly error, or error hotspot. If hotspots, the filter is biasing context, and `sites.keys`
@@ -1344,12 +1405,19 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
    - a second test point: under the miscalibrated-Q truth the pooled head already reads 0.979/1.019 clonal, with
      the fitted `Mate` term at 1.09x/0.92x against 1.48x/1.10x calibrated (phase 8, `kmer` under the guard). So
      the bias depends on how Q and error line up across the mates, and per-mate runs must hold both truths.
-4. **Weak context on real data (slope 0.30).** Re-measure at k = 21 before acting: multi-locus keys contributed
-   paralog differences as "errors" in whatever contexts paralogs differ. If it stays weak, compare the kvmer fit's
-   context against `reference` on single-locus keys only, then check the latent-position EM on real (clustered)
-   errors, which the unit test never had.
-5. **Coverage floor (10x reads 0.836).** Item 2's `-l` sweep; then state the floor per k (higher k means fewer
-   keys per genome and fewer error-free keys).
+4. ✓ **Context on real data: 0.30 was mostly multiplicity, and the sign is the other way round** (2026-10-08).
+   At k = 21 the log-odds slope of `reference` on `kmer` is 0.504 at r = 0.773 over 1,512 contexts (mean |log
+   ratio| 0.40), from 0.30 at r = 0.70; at k = 17 it is 0.525 and at k = 31 0.441. A slope of 0.5 with b =
+   `reference` means `kmer`'s context effect is about **twice** `reference`'s, not weak - the k = 11 reading was
+   paralog differences standing in for context. Against `pe-overlap` the same slope is 0.98 at r = 0.78, i.e.
+   `kmer` and `pe-overlap` agree on context and `reference` is the odd one out, which is the expected direction
+   for an aligner (context-dependent mismatches are what it scores away). Next: the same slope on single-locus
+   keys only, and against `reference` with the phase 5 soft-clipping correction, to see which of the two is
+   shrunk.
+5. ✓ **Coverage floor.** Answered by item 2's `-l` sweep above: at k = 21 the default `-l 10` reads 0.994 at
+   30x and 0.972 at 100x, and 10x is not usable at that floor at all (no key reaches consensus), so the floor
+   below which default mode is not used is `-l`'s own: **coverage must exceed `-l`, and `-l` must be at least 5
+   for the level to stay inside 1.22x**. The k = 11 "10x reads 0.836" did not reproduce at k = 21.
 6. ✓ **Miscalibrated-Q truth, synthetic short reads** (`bias --miscalibrate`, phase 8): default mode follows the
    injected truth (clonal 100x: 0.40% at Q2 up to 6.9% at Q37, against 0.29% and 6.8%), run at k = 11 on a
    random genome; rerun at k = 21 with item 1. **Not yet run:** long reads, where P(error-free 21-mer) at 5 % error
@@ -1373,13 +1441,26 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
   near-identical relatives, several distinct real genomes sharing some genes, recombination on (phase 7 deferred
   it), paired 2x150. Measured for every mode, with and without each remediation above.
 
-**Exit:**
-- the phase 7 paired clonal point reads within the phase 2 tolerances with per-mate runs;
-- a `Latent` truth's synthetic recovery at k = 21 is within tolerance, or its bias is explained and corrected;
+**Exit** (status after the 2026-10-08 HPC run):
+- the phase 7 paired clonal point reads within the phase 2 tolerances with per-mate runs - **not started**
+  (item 3; this run pooled the mates, and the real mate ratio is 0.90 / 1.11 at k = 21);
+- a `Latent` truth's synthetic recovery at k = 21 is within tolerance, or its bias is explained and corrected -
+  **explained, not corrected**: 1.417 (`Latent(2)`) and 1.362 (`Latent(3)`), from skiver's level falling with k
+  under clustering and marginal matching lifting it by a homogeneous-truth factor (item 2). The correction is
+  the next piece of work;
 - on SRR24523812 at k = 21, the `kmer` level and context agree with `reference` and `pe-overlap` within the
-  bracket phase 6 set for the alignment's own biases (a few percent), or each gap is explained;
+  bracket phase 6 set for the alignment's own biases (a few percent), or each gap is explained - **level met**
+  (1.012 against `reference`), **context explained** (`kmer` agrees with `pe-overlap` at 0.98, `reference` is
+  the outlier), **read position not met and not explained** (3-4x low at the read start, 1.5-2x high at the
+  end), which also accounts for the `pe-overlap`-row gap (item 1);
 - the long-tail scenario's bias is reported per mode, with the coverage and divergence floor below which default
-  mode is not used.
+  mode is not used - **coverage floor done** (item 5: coverage must exceed `-l`, and `-l` >= 5), long-tail
+  scenario not started.
+
+**Outstanding from the run itself**: the 9 `big_*` rows (400,000 reads on a 200 kb genome, the larger-genome
+test that would resolve the 5 % flat-truth level in one run) produced nothing and need the head job's log to
+say whether it was the 8 h or the 8 GB; the 9 skipped `-l` rows are the floor-above-coverage cases and are a
+result, not a failure.
 
 ### Phase 7: biological variation simulator and the size of the problem (exits met bar the repeat case, carried to phase 8)
 Test infrastructure only (§1 scope): it exists so separation methods have per-base truth.
