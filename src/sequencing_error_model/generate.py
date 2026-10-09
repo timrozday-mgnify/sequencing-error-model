@@ -96,10 +96,16 @@ def generate(
     error_rate_scale: float = 1.0,
     tracks: Sequence[Array] | None = None,
     classes: Array | None = None,
+    strands: Sequence[int] | None = None,
 ) -> list[Read]:
     """One read per template; mate 2 also uses the "-" strand covariate. `tracks` replaces head Q's draw with given
     template-indexed Q tracks (values in the alphabet), e.g. an exporter's base profile. `classes` gives each
-    read's `Latent(S)` class instead of drawing it from the prior, so a caller can label the reads' tuples."""
+    read's `Latent(S)` class instead of drawing it from the prior, so a caller can label the reads' tuples.
+
+    `strands` (0 forward, 1 reverse, per read) replaces that mate convention, which makes strand and mate the
+    same covariate and so unidentifiable together: a real library draws each fragment's orientation, so mate 1
+    is reverse half the time. The reads come back carrying it, which is what `_tuples` then records.
+    """
     if max_ins_run < 1:
         raise ValueError("max_ins_run must be at least 1")
     templates = [t.upper() for t in templates]
@@ -128,7 +134,9 @@ def generate(
         "pos_start": within + 1,
         "pos_end": rlen - within,
         "mate": mate,
-        "strand": (mate == 2).astype(np.int64),
+        "strand": (mate == 2).astype(np.int64)
+        if strands is None
+        else np.repeat(np.asarray(strands, np.int64), lengths),
         "gc": np.repeat([sum(gc_bin(t)) / 2 for t in templates], lengths),
         "latent": np.repeat(np.zeros(len(templates), np.int64) if classes is None else classes, lengths),
     }
@@ -201,7 +209,16 @@ def generate(
     for i, track in enumerate(tracks):
         a, b = bounds[i], bounds[i + 1]
         e = emit[a:b]
-        reads.append(Read(seq[a:b][e].tobytes().decode(), qual[a:b][e].tobytes().decode(), _cigar(ops[a:b]), track))
+        on = None if strands is None else ("-" if strands[i] else "+")
+        reads.append(
+            Read(
+                seq[a:b][e].tobytes().decode(),
+                qual[a:b][e].tobytes().decode(),
+                _cigar(ops[a:b]),
+                track,
+                strand=on,
+            )
+        )
     return reads
 
 

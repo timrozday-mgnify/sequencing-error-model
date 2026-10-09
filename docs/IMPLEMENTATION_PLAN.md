@@ -1393,7 +1393,37 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
    - *skiver's Weibull level.* Marginal matching takes the level from `summary_phred.csv`'s per-Q Weibull rate.
      Compute a level directly from `kvmer.csv` (single-edit counts over the `consensus_count_up_to_v*` exposure,
      on the keys we keep) and compare; if they disagree, own the level rather than inherit it.
-3. **Paired reads (1.2x clonal, 1.39x R2/R1 on real data).** Run skiver once per mate and fit a `Mate` term:
+3. ✓ **Paired reads: per-mate runs land the clonal point** (2026-10-09). `sources.kmer.fit` takes `mates`, one
+   `skiver analyze` run and FASTQ profile per mate, and rakes each mate's centre Q against *its own*
+   `summary_phred.csv` and exposure (`fit.kmer.rake_mates`), which is what identifies `Mate`; context stays with
+   the pooled `kvmer.csv`. `--mate-analyze` on the CLI, `--per-mate` on `bias.py`. Unit test: two mates differing
+   by a known 2x come back as 2.00x in the fitted heads' predicted rates.
+   - **The harness had to be fixed first: `generate` set strand = (mate == 2)**, so strand and mate were one
+     column and head E could not carry both terms - and no synthetic run could attribute a bias to either. The
+     opt-in `--orient` draws each fragment's orientation as a library does (mate 1 is reverse half the time);
+     `generate(strands=)` applies it, the reads carry it, and `compare(strands=)` scores the held-out reads the
+     same way. The default is unchanged, so every number recorded before this stands. Test: without `strands`
+     the tuples hold only (1,+) and (2,-); with it, all four.
+   - **Result on the paired clonal point** (k = 21, 100x, 20 kb clonal, oriented, `example_spec`):
+
+     | | rate ratio | mate 1 / 2 | strand + / - | per Q | failures |
+     |---|---|---|---|---|---|
+     | pooled (today's default) | 1.0296 | **1.266 / 0.961** | 1.035 / 1.022 | 0.99-1.13 | per-Q |
+     | per-mate | 0.9583 | 0.922 / 0.967 | 0.962 / 0.951 | 0.94-1.00 | **none** |
+
+     So **the pooled bias is a mate effect and not a strand effect** (1.27x on mate 1 against 1.03/1.02 by
+     strand), which is what the confounded harness could not say, and per-mate cuts the mate spread from 1.32x
+     to 1.05x and passes every phase 2 tolerance. The residual 4 % low is item 2's level baseline, not the mate
+     term: the same run with `Mate` replacing skiver's `Strand` gives 0.9366 against 0.9390 with both, so
+     nothing here is double-counting. Unoriented, the same point reads 1.0497 pooled and 0.9390 per-mate (a
+     failure), which is the artefact the orientation fix removes.
+   - At k = 21 the pooled paired bias is already 1.03-1.05, not phase 7's 1.19-1.22: **that figure was measured
+     at k = 11**, so most of it was key multiplicity (item 1) rather than the mates.
+   - Still open: the real arm with `--mate-analyze` (where strand and mate separate without `--orient`), which
+     needs a per-mate arm in `workflows/hpc`; and whether context really is shared by the mates, which
+     `pe-overlap`/`reference` rows can test.
+
+   The original plan for this item, for reference:
    - each run gives mate-specific `summary_phred.csv`, `summary_read_position.csv` and spectrum; rake the centre-Q
      term per mate against that mate's FASTQ exposure (`fastq_quality` is already per mate), giving
      `QualityWindow` + `Mate` (and per-mate `Position`) instead of one pooled head;
@@ -1442,8 +1472,9 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
   it), paired 2x150. Measured for every mode, with and without each remediation above.
 
 **Exit** (status after the 2026-10-08 HPC run):
-- the phase 7 paired clonal point reads within the phase 2 tolerances with per-mate runs - **not started**
-  (item 3; this run pooled the mates, and the real mate ratio is 0.90 / 1.11 at k = 21);
+- the phase 7 paired clonal point reads within the phase 2 tolerances with per-mate runs - **met on the
+  oriented synthetic point** (2026-10-09: 0.9583 with no failures, against 1.0296 and a per-Q failure pooled;
+  item 3), and outstanding on real data, which needs a per-mate arm in `workflows/hpc`;
 - a `Latent` truth's synthetic recovery at k = 21 is within tolerance, or its bias is explained and corrected -
   **explained, not corrected**: 1.417 (`Latent(2)`) and 1.362 (`Latent(3)`), from skiver's level falling with k
   under clustering and marginal matching lifting it by a homogeneous-truth factor (item 2). The correction is
@@ -1567,6 +1598,11 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   - **The reference you pick is worth more than the method**: at ANI 99%, the majority strain gives 1.039, the
     consensus 1.112, and an external relative at 95% gives 1.663 with mapping down to 0.950. Aligning to the
     abundant strain removes most variant mismatches because the reads mostly are that strain.
+  - **(2026-10-09, phase 6b item 3) Two caveats on the paragraph below.** It was measured at k = 11, and at
+    k = 21 the same point reads 1.03-1.05, so most of the bias was key multiplicity. And `generate` set
+    strand = (mate == 2) at the time, so "a paired-read effect" could not be separated from a strand effect
+    there; with `--orient` it now can be, and it is a mate effect (1.27x on mate 1, against 1.03/1.02 by
+    strand).
   - **`kmer`'s clonal bias of ~1.19-1.22 is a paired-read effect, not coverage and not variation.** It is 1.219
     at 30x and 1.187 at 100x, but single-end reads from the same truth at the same coverage give 1.018 with no
     failures, and phase 6's run replicates at 0.9997. The mechanism is in the truth: head Q's `Mate` term makes

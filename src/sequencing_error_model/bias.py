@@ -196,6 +196,7 @@ def scenario(
     use_all: bool = False,
     skiver_args: Sequence[str] = (),
     per_mate: bool = False,
+    orient: bool = False,
     q_reads: int = 20_000,
     seed: int = 0,
 ) -> dict[str, Any]:
@@ -224,7 +225,12 @@ def scenario(
     frags = variation.fragments(pop, sample, insert_sizes(insert_mean, insert_sd), n_pairs, read_length, rng)
     templates = [t for f in frags for t in f.templates]
     mates = [1, 2] * len(frags)
-    reads = generate(truth, templates, mates, rng)
+    # `generate`'s own convention is strand = (mate == 2), which makes strand and mate one covariate, so head E
+    # cannot carry both. `orient` draws each fragment's orientation as a library does, which separates them: the
+    # two mates of a fragment are on opposite strands, but mate 1 is reverse half the time.
+    forward = rng.random(len(frags)) < 0.5 if orient else None
+    strands = None if forward is None else [int(f) ^ (m - 1) for f in forward for m in (1, 2)]
+    reads = generate(truth, templates, mates, rng, strands=strands)
 
     consensus = pop.sequences["g"]
     n_held = max(n_pairs, 2)
@@ -278,6 +284,7 @@ def scenario(
                 use_all=use_all,
                 skiver_args=skiver_args,
                 per_mate=per_mate,
+                orient=orient,
                 read_length=read_length,
             )
         except (ValueError, OSError, subprocess.CalledProcessError) as e:
@@ -287,10 +294,21 @@ def scenario(
             doc["modes"][name] = extra
             continue
         substitutions_only = name == "pe-overlap"
+        held_strands = None if not orient else list(rng.integers(0, 2, len(held)))
         report = recovery.compare(
-            truth, fitted, held, held_mates, rng, q_reads=q_reads, substitutions_only=substitutions_only
+            truth,
+            fitted,
+            held,
+            held_mates,
+            rng,
+            q_reads=q_reads,
+            substitutions_only=substitutions_only,
+            strands=held_strands,
         )
-        table = recovery._tuples(truth, held, generate(truth, held, held_mates, rng), held_mates, fitted)
+        # the same orientation convention as the training and scored reads, or `mate` and `strand` come back
+        # as one column in the per-component report
+        held_reads = generate(truth, held, held_mates, rng, strands=held_strands)
+        table = recovery._tuples(truth, held, held_reads, held_mates, fitted)
         doc["modes"][name] = {**_summary(truth, fitted, report, table), **extra}
     return doc
 
@@ -375,6 +393,12 @@ def _fit(
                         fastq_quality.profile_fastq(mate_fastq, order=m, flank=flank),
                     )
                 )
+            # Without `orient`, `generate` sets strand = (mate == 2): Strand and Mate are then the same column
+            # and only their sum is identified, so Mate replaces skiver's Strand (which assumes equal strand
+            # exposure, the weaker of two estimates of one effect). With `orient`, or on real data, both mates
+            # map to both strands and the two terms are separable, so both are kept.
+            if not kw.get("orient"):
+                error_tokens = [t for t in error_tokens if t != "Strand"]
             error_tokens.append("Mate")
         key_report, level = None, 1.0
         if kw.get("site_mask") == "joint":
@@ -480,6 +504,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--skiver", help="path to a released skiver binary, for the `kmer` mode")
     p.add_argument("--use-all", action="store_true", help="run skiver with --use-all")
     p.add_argument(
+        "--orient",
+        action="store_true",
+        help="draw each fragment's orientation, so strand and mate are separable (plan phase 6b item 3)",
+    )
+    p.add_argument(
         "--per-mate",
         action="store_true",
         help="run skiver once per mate as well, and fit a Mate term from the three runs (plan phase 6b item 3)",
@@ -517,6 +546,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         skiver=args.skiver,
         use_all=args.use_all,
         per_mate=args.per_mate,
+        orient=args.orient,
         k=args.k,
         v=args.v,
         c=args.c,

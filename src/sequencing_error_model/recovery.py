@@ -193,17 +193,19 @@ def compare(
     rng: np.random.Generator,
     q_reads: int = 20000,
     substitutions_only: bool = False,
+    strands: Sequence[int] | None = None,
 ) -> Report:
     """Metrics of `fitted` against `truth` on reads generated from `templates`; Q-track statistics use at least
     `q_reads` sampled tracks per spec. `substitutions_only` compares both heads E conditional on no indel, the
-    support of `pe-overlap`."""
+    support of `pe-overlap`. `strands` gives the held-out reads their own orientation, as the training reads
+    had, so a fitted `Strand` term is scored on the convention it was fitted under (`generate`)."""
     if fitted.latent is not None:
         # ponytail: its classes need not match the truth's; scoring it needs a per-read class posterior.
         raise ValueError("compare cannot score a fitted Latent(S) spec, only a Latent(S) truth")
     alphabet = np.asarray(truth.quality_alphabet)
     # A Latent(S) truth is scored at each held-out read's own class, which the generator is handed.
     classes = _classes(truth, len(templates), rng)
-    true_reads = generate(truth, templates, mates, rng, classes=classes)
+    true_reads = generate(truth, templates, mates, rng, classes=classes, strands=strands)
     table = _tuples(truth, templates, true_reads, mates, fitted)
     if classes is not None:
         table = _with_class(table, classes)
