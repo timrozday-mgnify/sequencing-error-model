@@ -85,10 +85,17 @@ def labels(fragments: Sequence[variation.Fragment], reads: Sequence[Read]) -> di
     return {"bases": float(counts.total()), **{k: counts[k] / total for k in ("match", "variant", "error", "adapter")}}
 
 
-def _fastq(path: Path, fragments: Sequence[variation.Fragment], reads: Sequence[Read], mate_suffix: bool) -> None:
+def _fastq(
+    path: Path,
+    fragments: Sequence[variation.Fragment],
+    reads: Sequence[Read],
+    mate_suffix: bool,
+    only: int | None = None,
+) -> None:
+    """Both mates interleaved, or `only` that mate alone, which is what a per-mate skiver run takes."""
     with path.open("w") as out:
         for i, frag in enumerate(fragments):
-            for mate in (1, 2):
+            for mate in (1, 2) if only is None else (only,):
                 r = reads[2 * i + mate - 1]
                 name = f"{frag.name}:m{mate}" if mate_suffix else f"{frag.name}/{mate}"
                 out.write(f"@{name}\n{r.sequence}\n+\n{r.quality}\n")
@@ -188,6 +195,8 @@ def scenario(
     c: int = 8,
     use_all: bool = False,
     skiver_args: Sequence[str] = (),
+    per_mate: bool = False,
+    orient: bool = False,
     q_reads: int = 20_000,
     seed: int = 0,
 ) -> dict[str, Any]:
@@ -216,7 +225,12 @@ def scenario(
     frags = variation.fragments(pop, sample, insert_sizes(insert_mean, insert_sd), n_pairs, read_length, rng)
     templates = [t for f in frags for t in f.templates]
     mates = [1, 2] * len(frags)
-    reads = generate(truth, templates, mates, rng)
+    # `generate`'s own convention is strand = (mate == 2), which makes strand and mate one covariate, so head E
+    # cannot carry both. `orient` draws each fragment's orientation as a library does, which separates them: the
+    # two mates of a fragment are on opposite strands, but mate 1 is reverse half the time.
+    forward = rng.random(len(frags)) < 0.5 if orient else None
+    strands = None if forward is None else [int(f) ^ (m - 1) for f in forward for m in (1, 2)]
+    reads = generate(truth, templates, mates, rng, strands=strands)
 
     consensus = pop.sequences["g"]
     n_held = max(n_pairs, 2)
@@ -269,6 +283,8 @@ def scenario(
                 c=c,
                 use_all=use_all,
                 skiver_args=skiver_args,
+                per_mate=per_mate,
+                orient=orient,
                 read_length=read_length,
             )
         except (ValueError, OSError, subprocess.CalledProcessError) as e:
@@ -278,10 +294,21 @@ def scenario(
             doc["modes"][name] = extra
             continue
         substitutions_only = name == "pe-overlap"
+        held_strands = None if not orient else list(rng.integers(0, 2, len(held)))
         report = recovery.compare(
-            truth, fitted, held, held_mates, rng, q_reads=q_reads, substitutions_only=substitutions_only
+            truth,
+            fitted,
+            held,
+            held_mates,
+            rng,
+            q_reads=q_reads,
+            substitutions_only=substitutions_only,
+            strands=held_strands,
         )
-        table = recovery._tuples(truth, held, generate(truth, held, held_mates, rng), held_mates, fitted)
+        # the same orientation convention as the training and scored reads, or `mate` and `strand` come back
+        # as one column in the per-component report
+        held_reads = generate(truth, held, held_mates, rng, strands=held_strands)
+        table = recovery._tuples(truth, held, held_reads, held_mates, fitted)
         doc["modes"][name] = {**_summary(truth, fitted, report, table), **extra}
     return doc
 
@@ -350,23 +377,46 @@ def _fit(
         extra = ["--use-all", *kw["skiver_args"]] if kw["use_all"] else list(kw["skiver_args"])
         recovery.run_skiver(kw["skiver"], fastq, prefix, kw["k"], kw["v"], kw["c"], extra)
         a = skiver_analyze.read_analyze(prefix)
+        error_tokens = list(recovery._ERROR_TOKENS)
         flank, m = bam.window(recovery._ERROR_TOKENS, recovery._QUALITY_TOKENS)
+        # phase 6b item 3: one skiver run per mate, so the centre Q is raked per mate and `Mate` is identified.
+        # It costs two more skiver runs at half the coverage each, so it stays opt-in and the grid measures both.
+        per_mate: list[tuple[Any, Any]] = []
+        if kw.get("per_mate") and set(mates) == {1, 2}:
+            for mate in (1, 2):
+                mate_fastq, mate_prefix = workdir / f"reads_m{mate}.fastq", workdir / f"analyze_m{mate}"
+                _fastq(mate_fastq, frags, reads, mate_suffix=False, only=mate)
+                recovery.run_skiver(kw["skiver"], mate_fastq, mate_prefix, kw["k"], kw["v"], kw["c"], extra)
+                per_mate.append(
+                    (
+                        skiver_analyze.read_analyze(mate_prefix),
+                        fastq_quality.profile_fastq(mate_fastq, order=m, flank=flank),
+                    )
+                )
+            # Without `orient`, `generate` sets strand = (mate == 2): Strand and Mate are then the same column
+            # and only their sum is identified, so Mate replaces skiver's Strand (which assumes equal strand
+            # exposure, the weaker of two estimates of one effect). With `orient`, or on real data, both mates
+            # map to both strands and the two terms are separable, so both are kept.
+            if not kw.get("orient"):
+                error_tokens = [t for t in error_tokens if t != "Strand"]
+            error_tokens.append("Mate")
         key_report, level = None, 1.0
         if kw.get("site_mask") == "joint":
             # phase 8's key-level count test (§6.6) in place of skiver's outlier filter
-            a, key_report = sites.keys(a, kmer_source._split(recovery._ERROR_TOKENS)[0], flank=flank)
+            a, key_report = sites.keys(a, kmer_source._split(error_tokens, per_mate=bool(per_mate))[0], flank=flank)
             level = key_report["level"]
         fitted = kmer_source.fit(
             a,
             fastq_quality.profile_fastq(fastq, order=m, flank=flank),
             fastq_quality.quality_table(fastq, m=m, flank=flank),
-            recovery._ERROR_TOKENS,
+            error_tokens,
             recovery._QUALITY_TOKENS,
             {"mode": "kmer", "skiver_build": "default", "sources": ["variation-grid"]},
             use_all=kw["use_all"],
             flank=flank,
             level=level,
             min_k=1,  # the harnesses measure any k; the refusal is for real data (`_check_k`)
+            mates=per_mate,
         )
         if tuple(fitted.quality_alphabet) != tuple(truth.quality_alphabet):
             return None, {"skipped": f"the reads carry qualities {list(fitted.quality_alphabet)}"}
@@ -453,6 +503,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("--skiver", help="path to a released skiver binary, for the `kmer` mode")
     p.add_argument("--use-all", action="store_true", help="run skiver with --use-all")
+    p.add_argument(
+        "--orient",
+        action="store_true",
+        help="draw each fragment's orientation, so strand and mate are separable (plan phase 6b item 3)",
+    )
+    p.add_argument(
+        "--per-mate",
+        action="store_true",
+        help="run skiver once per mate as well, and fit a Mate term from the three runs (plan phase 6b item 3)",
+    )
     p.add_argument("-k", type=int, default=kmer_source.DEFAULT_K)
     p.add_argument("-v", type=int, default=kmer_source.GOOD_V)
     p.add_argument("-c", type=int, default=8, help="FracMinHash denominator")
@@ -485,6 +545,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         site_mask=args.site_mask,
         skiver=args.skiver,
         use_all=args.use_all,
+        per_mate=args.per_mate,
+        orient=args.orient,
         k=args.k,
         v=args.v,
         c=args.c,

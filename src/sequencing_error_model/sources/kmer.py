@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 import warnings
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -28,7 +29,7 @@ from sequencing_error_model.fit import kmer, quality
 from sequencing_error_model.observations import CountTable
 from sequencing_error_model.sources import fastq_quality, skiver_analyze
 from sequencing_error_model.sources.fastq_quality import QualityProfile
-from sequencing_error_model.sources.skiver_analyze import SkiverAnalyze
+from sequencing_error_model.sources.skiver_analyze import RateBin, SkiverAnalyze
 from sequencing_error_model.spec import Component, ErrorModelSpec
 
 # Lesson §3.1, measured on the fork's amplicon recovery: v=13 recovers the source rate, v=6 is ~20% low, and
@@ -43,6 +44,8 @@ DEFAULT_K = 21
 
 _CONTEXT = frozenset(("QualityWindow", "Context", "Homopolymer"))
 _MARGINAL = frozenset(("Position", "Strand", "GC"))
+# Identified only by per-mate skiver runs, and only in the raked fit: `kvmer.csv` has no mate (phase 6b item 3).
+_PER_MATE = frozenset(("Mate",))
 
 
 def filter_stats(a: SkiverAnalyze) -> dict[str, Any]:
@@ -108,23 +111,38 @@ def _check_k(k: int, min_k: int = MIN_K) -> None:
         )
 
 
-def _split(error_tokens: Sequence[str]) -> tuple[list[str], list[Component]]:
-    """(the tokens the kvmer fit takes, the marginal components to append), checked against default mode."""
+def _split(error_tokens: Sequence[str], per_mate: bool = False) -> tuple[list[str], list[str], list[Component]]:
+    """(the kvmer fit's tokens, the raked fit's tokens, the marginal components), checked against default mode.
+
+    The two token lists differ only by the per-mate terms: `kvmer.csv` carries no mate, so a `Mate` term is
+    fitted on the raked counts alone, and only when per-mate skiver runs were given.
+    """
     if list(error_tokens[:1]) != ["QualityWindow(0)"]:
         raise ValueError(f"default mode identifies the centre Q only, so head E starts with QualityWindow(0): "
                          f"{list(error_tokens)}")  # fmt: skip
-    context, marginal = [], []
+    context: list[str] = []
+    raked: list[str] = []
+    marginal: list[Component] = []
     for t in error_tokens:
         c = Component(t)
         if c.name in _CONTEXT:
             context.append(t)
+            raked.append(t)
         elif c.name in _MARGINAL:
             marginal.append(c)
+        elif c.name in _PER_MATE:
+            if not per_mate:
+                raise ValueError(
+                    f"{t} needs one `skiver analyze` run per mate (plan phase 6b item 3): pass `mates`, or "
+                    f"--mate-analyze on the command line"
+                )
+            raked.append(t)
         else:
             raise ValueError(
-                f"{t} is not identifiable in `kmer` default mode (§6.2); usable: {sorted(_CONTEXT | _MARGINAL)}"
+                f"{t} is not identifiable in `kmer` default mode (§6.2); "
+                f"usable: {sorted(_CONTEXT | _MARGINAL | _PER_MATE)}"
             )
-    return context, marginal
+    return context, raked, marginal
 
 
 def fit(
@@ -139,21 +157,37 @@ def fit(
     flank: tuple[int, int] | None = None,
     level: float = 1.0,
     min_k: int = MIN_K,
+    mates: Sequence[tuple[SkiverAnalyze, QualityProfile]] = (),
 ) -> ErrorModelSpec:
     """Both heads for `kmer` default mode. `flank` widens the context window the kvmer fit carries, and `level`
     scales `summary_phred.csv`'s rates, which is how a key filter other than skiver's own reaches the level
-    (`sites.keys`). `min_k` lowers the key-length refusal (`_check_k`) for genomes known to be single-locus."""
+    (`sites.keys`). `min_k` lowers the key-length refusal (`_check_k`) for genomes known to be single-locus.
+
+    `mates` is one (`skiver analyze`, FASTQ profile) pair per mate, in mate order, from skiver runs on that mate
+    alone. It is what identifies a `Mate` term in `error_tokens`: each mate's centre Q is raked against its own
+    reported rates and exposure (`fit.kmer.rake_mates`), while context, position, strand and GC stay with the
+    pooled run `a` (plan phase 6b item 3)."""
     _check_v(a.v)
     _check_k(a.k, min_k)
-    context_tokens, marginal = _split(error_tokens)
+    context_tokens, raked_tokens, marginal = _split(error_tokens, per_mate=bool(mates))
     exposure = next(t for t in fastq_quality.tables(profile) if t.source.endswith(":context"))
     kvmer = next(t for t in skiver_analyze.tables(a, use_all) if t.source.endswith(":kvmer"))
     alphabet = profile.alphabet
     if not alphabet:
         raise ValueError("the FASTQ profile has no qualities, so there is no alphabet to fit over")
     context_head = kmer.fit(kvmer, context_tokens, flank=flank)
-    phred = [replace(b, per_base_error_rate=b.per_base_error_rate * level) for b in a.phred]
-    head = list(kmer.fit_centre_q(context_head, phred, exposure, context_tokens, alphabet))
+
+    def scaled(bins: Sequence[RateBin]) -> list[RateBin]:
+        return [replace(b, per_base_error_rate=b.per_base_error_rate * level) for b in bins]
+
+    phred = scaled(a.phred)
+    per_mate = []
+    for mate_a, mate_profile in mates:
+        _check_v(mate_a.v)
+        _check_k(mate_a.k, min_k)
+        mate_exposure = next(t for t in fastq_quality.tables(mate_profile) if t.source.endswith(":context"))
+        per_mate.append((scaled(mate_a.phred), mate_exposure))
+    head = list(kmer.fit_centre_q(context_head, phred, exposure, raked_tokens, alphabet, mates=per_mate))
     for c in marginal:
         if c.name == "Position":
             head.append(kmer.position(a.read_position, profile.lengths, c.args[0]))
@@ -164,7 +198,14 @@ def fit(
     quality_head = quality.fit(q_table, quality_tokens, alphabet)
     return ErrorModelSpec(
         tuple(alphabet),
-        {"k": a.k, "v": a.v, "use_all": use_all, "outlier_filter": filter_stats(a), **provenance},
+        {
+            "k": a.k,
+            "v": a.v,
+            "use_all": use_all,
+            "outlier_filter": filter_stats(a),
+            "per_mate_skiver": [{"k": m.k, "v": m.v, "reads": p.n_reads} for m, p in mates],
+            **provenance,
+        },
         quality_head,
         tuple(head),
         marginals=kmer.hazard(a.error_rate),
@@ -184,6 +225,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("--quality-tokens", nargs="+", default=["QualityMarkov(1)", "Position(48)", "Context(1,1)"])
     p.add_argument("--use-all", action="store_true", help="keep kvmer keys skiver's outlier filter rejected")
+    p.add_argument(
+        "--mate-analyze",
+        type=Path,
+        nargs="+",
+        metavar="PREFIX",
+        help="one `skiver analyze -o` prefix per mate, in mate order, from skiver run on that mate alone; "
+        "what a Mate error token needs (plan phase 6b item 3). The FASTQ arguments must then be one per mate.",
+    )
     p.add_argument("--flank", type=int, nargs=2, metavar=("LEFT", "RIGHT"), default=[2, 2], help="context window")
     p.add_argument("--max-reads", type=int)
     p.add_argument("--min-k", type=int, default=MIN_K, help="refuse skiver runs with a shorter key (phase 6b)")
@@ -192,11 +241,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     m = Component(args.quality_tokens[0]).args[0]
     a = skiver_analyze.read_analyze(args.analyze)
     profile = fastq_quality.profile_fastq(*args.fastq, order=m, flank=flank, max_reads=args.max_reads)
-    q_table = fastq_quality.quality_table(*args.fastq, m=m, flank=flank, max_reads=args.max_reads)
+    mates = []
+    if args.mate_analyze:
+        if len(args.mate_analyze) != len(args.fastq):
+            p.error(f"--mate-analyze takes one prefix per mate FASTQ: {len(args.mate_analyze)} and {len(args.fastq)}")
+        mates = [
+            (
+                skiver_analyze.read_analyze(prefix),
+                fastq_quality.profile_fastq(fastq, order=m, flank=flank, max_reads=args.max_reads),
+            )
+            for prefix, fastq in zip(args.mate_analyze, args.fastq, strict=True)
+        ]
+    # Head Q's `mate` field is only right when the files are known to be one per mate; pooled, every read
+    # would be labelled mate 1, so a Mate quality token is refused there rather than fitted on a wrong label.
+    if mates:
+        q_tables = [
+            fastq_quality.quality_table(f, m=m, flank=flank, mate=i, max_reads=args.max_reads)
+            for i, f in enumerate(args.fastq, start=1)
+        ]
+        q_table = replace(q_tables[0], counts=+sum((t.counts for t in q_tables), Counter()))
+    else:
+        if any(Component(t).name == "Mate" for t in args.quality_tokens):
+            p.error("a Mate quality token needs one FASTQ per mate, with --mate-analyze")
+        q_table = fastq_quality.quality_table(*args.fastq, m=m, flank=flank, max_reads=args.max_reads)
     provenance: dict[str, Any] = {
         "mode": "kmer",
         "skiver_build": "default",
         "sources": [str(args.analyze), *map(str, args.fastq)],
+        "mate_sources": [str(x) for x in (args.mate_analyze or ())],
         "identified_ops": ["substitution", "insertion", "deletion"],  # kvmer.csv reports all three, 1 bp only
     }
     spec = fit(
@@ -209,6 +281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         use_all=args.use_all,
         flank=flank,
         min_k=args.min_k,
+        mates=mates,
     )
     spec.save(args.output)
     print(json.dumps({"reads": profile.n_reads, "quality_alphabet": spec.quality_alphabet, **filter_stats(a)}))

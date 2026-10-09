@@ -105,3 +105,27 @@ def test_cli_matches_contract(tmp_path: Path) -> None:
     lines = outputs[0].splitlines()
     assert len(lines) == 12 and [lines[i].split()[0] for i in (0, 4, 8)] == ["@0/1", "@1/2", "@2/1"]
     assert all(re.fullmatch(r"@\S+ cigar:(\d+[MID])*", lines[i]) for i in (0, 4, 8))
+
+
+def test_strands_separate_the_strand_and_mate_covariates() -> None:
+    """Without `strands` the generator sets strand = (mate == 2), so the two are one column (plan phase 6b)."""
+    truth = recovery.example_spec()
+    temps, mates = templates(8, 3)
+    rng = np.random.default_rng(0)
+
+    def mate_strand(table: Any) -> set[tuple[str, str]]:
+        m, s = table.fields.index("mate"), table.fields.index("strand")
+        return {(str(k[m]), str(k[s])) for k in table.counts}
+
+    pooled = recovery._tuples(truth, temps, gen.generate(truth, temps, mates, rng), mates)
+    assert mate_strand(pooled) == {("1", "+"), ("2", "-")}  # collinear: Mate and Strand would be one term
+    # One orientation per fragment, the mates of a pair opposite, so all four combinations appear.
+    strands = [i % 4 // 2 ^ (m - 1) for i, m in enumerate(mates)]
+    reads = gen.generate(truth, temps, mates, rng, strands=strands)
+    assert [r.strand for r in reads] == ["-" if s else "+" for s in strands]
+    assert mate_strand(recovery._tuples(truth, temps, reads, mates)) == {
+        ("1", "+"),
+        ("1", "-"),
+        ("2", "+"),
+        ("2", "-"),
+    }
