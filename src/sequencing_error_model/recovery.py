@@ -700,9 +700,12 @@ def run_skiver(skiver: str, reads: Path, prefix: Path, k: int, v: int, c: int, e
     """`skiver analyze` from a released binary, writing `<prefix>.*.csv`."""
     cmd = [skiver, "analyze", str(reads), "-k", str(k), "-v", str(v), "-c", str(c), "-o", str(prefix), *extra]
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
     except FileNotFoundError as e:
         raise FileNotFoundError(f"no skiver binary at {skiver!r}: --skiver takes a path to a released binary") from e
+    except subprocess.CalledProcessError as e:
+        # Its exit 101 is a Rust panic, whose only explanation is the stderr capture_output swallows.
+        raise RuntimeError(f"{' '.join(cmd)} exited {e.returncode}:\n{(e.stderr or '(no stderr)').strip()}") from e
 
 
 def skiver_recovery(

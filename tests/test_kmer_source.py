@@ -157,3 +157,10 @@ def test_stub_matches_the_real_binarys_interface(tmp_path: Path) -> None:
     assert skiver_analyze.read_analyze(prefix).v == 13
     with pytest.raises(FileNotFoundError, match="no skiver binary"):
         recovery.run_skiver("/nonexistent/skiver", tmp_path / "reads.fastq", prefix, 11, 13, 8)
+    # A failing skiver (its exit 101 is a panic) has to carry its stderr out, or the sweep logs say nothing.
+    failing = tmp_path / "failing-skiver"
+    failing.write_text("#!/bin/sh\necho 'thread panicked at src/lib.rs:1' >&2\nexit 101\n")
+    failing.chmod(0o755)
+    with pytest.raises(RuntimeError, match="exited 101") as failed:
+        recovery.run_skiver(str(failing), tmp_path / "reads.fastq", prefix, 11, 13, 8)
+    assert "thread panicked" in str(failed.value)
