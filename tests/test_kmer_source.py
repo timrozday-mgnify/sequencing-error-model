@@ -9,6 +9,7 @@ import json
 import random
 import sys
 import warnings
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,6 +19,9 @@ import pytest
 from sequencing_error_model import generate as gen
 from sequencing_error_model import recovery
 from sequencing_error_model import spec as spec_io
+from sequencing_error_model.fit import error as error_fit
+from sequencing_error_model.fit import kmer as kmer_fit
+from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.sources import fastq_quality, skiver_analyze
 from sequencing_error_model.sources import kmer as kmer_source
 
@@ -87,7 +91,61 @@ def test_rejects_tokens_default_mode_cannot_identify() -> None:
     with pytest.raises(ValueError, match="starts with QualityWindow"):
         kmer_source.fit(a, profile, None, ["Context(1,1)"], QUALITY_TOKENS, {}, min_k=11)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="not identifiable"):
+        kmer_source.fit(a, profile, None, ["QualityWindow(0)", "Latent(2)"], QUALITY_TOKENS, {}, min_k=11)  # type: ignore[arg-type]
+    # Mate is identifiable, but only from per-mate skiver runs (phase 6b item 3), never from the pooled one.
+    with pytest.raises(ValueError, match="one `skiver analyze` run per mate"):
         kmer_source.fit(a, profile, None, ["QualityWindow(0)", "Mate"], QUALITY_TOKENS, {}, min_k=11)  # type: ignore[arg-type]
+
+
+def test_per_mate_runs_identify_a_mate_term(reads_fastq: Path) -> None:
+    """Phase 6b item 3: one skiver run per mate, each raked against its own margins, recovers a mate ratio.
+
+    The two mates here are the same fixture with one mate's reported rates doubled, so the fitted `Mate` term
+    has a known answer: the mates' predicted rates must differ by that factor.
+    """
+    a = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    profile = fastq_quality.profile_fastq(reads_fastq, order=1, flank=(2, 2))
+    q_table = fastq_quality.quality_table(reads_fastq, m=1, flank=(2, 2))
+    hotter = replace(a, phred=[replace(b, per_base_error_rate=2 * b.per_base_error_rate) for b in a.phred])
+    tokens = ["QualityWindow(0)", "Context(1,1)", "Mate"]
+    spec = kmer_source.fit(
+        a,
+        profile,
+        q_table,
+        tokens,
+        QUALITY_TOKENS,
+        {"mode": "kmer", "skiver_build": "default"},
+        min_k=11,
+        mates=[(a, profile), (hotter, profile)],
+    )
+    mate = next(c for c in spec.error_head if c.name == "Mate")
+    assert mate.params["weights"].shape[0] == 2
+    assert mate.params["weights"][1, 0] < mate.params["weights"][0, 0]  # mate 2 matches less often
+    assert spec.provenance["per_mate_skiver"] == [{"k": 11, "v": 13, "reads": profile.n_reads}] * 2
+    rates = _mate_rates(spec, a, profile, hotter)
+    assert rates[2] / rates[1] == pytest.approx(2, abs=0.05)
+
+
+def _mate_rates(spec: spec_io.ErrorModelSpec, a: skiver_analyze.SkiverAnalyze, profile: "fastq_quality.QualityProfile",
+                hotter: skiver_analyze.SkiverAnalyze) -> dict[int, float]:  # fmt: skip
+    """Head E's predicted error rate per mate, weighted by the same raked exposure the fit saw."""
+    exposure = next(t for t in fastq_quality.tables(profile) if t.source.endswith(":context"))
+    kvmer = next(t for t in skiver_analyze.tables(a, False) if t.source.endswith(":kvmer"))
+    context_head = kmer_fit.fit(kvmer, ["QualityWindow(0)", "Context(1,1)"], flank=(2, 2))
+    raked = kmer_fit.rake_mates(context_head, [(a.phred, exposure), (hotter.phred, exposure)], profile.alphabet)
+    weight: Counter[Key] = Counter()
+    for key, n in raked.counts.items():
+        weight[key[:3]] += n
+    keys = sorted(weight)
+    table = CountTable("mate rates", ("context", "q", "mate"), "base", False, Counter(dict.fromkeys(keys, 1)),
+                       dict(raked.meta))  # fmt: skip
+    p = error_fit.probabilities(list(spec.error_head), profile.alphabet, table)
+    w = np.array([weight[k] for k in keys], float)
+    rates = {}
+    for m in (1, 2):
+        sel = np.array([k[2] == m for k in keys])
+        rates[m] = float(w[sel] @ (1 - p[sel, 0]) / w[sel].sum())
+    return rates
 
 
 def test_cli_composes_a_spec_the_generator_draws_from(reads_fastq: Path, tmp_path: Path) -> None:

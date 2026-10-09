@@ -42,7 +42,7 @@ counts, so they are left out. Fold them in as an E-step prior if a recovery run 
 import warnings
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -376,6 +376,38 @@ def rake(
     return CountTable(f"{exposure.source}:raked", ("context", "q", "op"), "base", True, +counts, dict(exposure.meta))
 
 
+def _with_mate(table: CountTable, mate: int) -> CountTable:
+    """`table` with a `mate` field carrying `mate`, inserted before `op` so the labels stay last."""
+    i = table.fields.index("op")
+    counts: Counter[Key] = Counter({(*k[:i], mate, *k[i:]): n for k, n in table.counts.items()})
+    return replace(table, fields=(*table.fields[:i], "mate", *table.fields[i:]), counts=counts)
+
+
+def rake_mates(
+    context_head: Sequence[Component],
+    mates: Sequence[tuple[Sequence[RateBin], CountTable]],
+    alphabet: Sequence[int],
+    **kwargs: int | float,
+) -> CountTable:
+    """One raked table over all mates, each raked against *its own* skiver Q marginal and FASTQ exposure (§6b.3).
+
+    skiver pooled over the mates gives one centre-Q head, and the mates of a real run differ (R2/R1 1.39x on
+    SRR24523812, phase 6b item 3). Running skiver once per mate and raking each against that mate's own
+    `summary_phred.csv` and exposure keeps the level per mate, so a `Mate` term in `tokens` is identified.
+    Context still comes from the pooled `kvmer.csv`: twice the coverage, on the assumption that context effects
+    are shared, which `pe-overlap` and `reference` rows can test.
+    """
+    if not mates:
+        raise ValueError("rake_mates needs at least one mate's (summary_phred.csv, exposure)")
+    tables = [_with_mate(rake(context_head, phred, exposure, alphabet, **kwargs), m)  # type: ignore[arg-type]
+              for m, (phred, exposure) in enumerate(mates, start=1)]  # fmt: skip
+    counts: Counter[Key] = Counter()
+    for table in tables:
+        counts.update(table.counts)
+    source = ", ".join(t.source for t in tables)
+    return replace(tables[0], source=f"{source}:raked-per-mate", counts=+counts)
+
+
 def fit_centre_q(
     context_head: Sequence[Component],
     phred: Sequence[RateBin],
@@ -383,6 +415,7 @@ def fit_centre_q(
     tokens: Sequence[str],
     alphabet: Sequence[int],
     *,
+    mates: Sequence[tuple[Sequence[RateBin], CountTable]] = (),
     l2: float = 1e-3,
     **kwargs: float | None,
 ) -> tuple[Component, ...]:
@@ -392,13 +425,18 @@ def fit_centre_q(
     window may be asked for. `error.fit`'s `smooth` is worth a value on an unbinned alphabet, and it is what
     carries a Q bin skiver reports no rate for.
 
+    With `mates`, each mate's own (`summary_phred.csv`, exposure) is raked separately (`rake_mates`) and
+    `phred`/`exposure` are unused, which is what identifies a `Mate` term in `tokens`.
+
     `l2` is weak by default: the raked counts are expected values, not draws, so the usual shrinkage would pull
     the fit off the very margins it exists to reproduce (it showed as a few percent at the extreme Q, where the
     error mass is thinnest). It stays non-zero to pin the softmax gauge.
     """
     if list(tokens[:1]) != ["QualityWindow(0)"]:
         raise ValueError(f"default mode identifies the centre Q only, so tokens start with QualityWindow(0): {tokens}")
-    table = rake(context_head, phred, exposure, alphabet)
+    if "Mate" in [Component(t).name for t in tokens] and not mates:
+        raise ValueError("a Mate term needs per-mate skiver runs; pass `mates` (plan phase 6b item 3)")
+    table = rake_mates(context_head, mates, alphabet) if mates else rake(context_head, phred, exposure, alphabet)
     return error.fit(table, tokens, alphabet, l2=l2, **kwargs)  # type: ignore[arg-type]
 
 
