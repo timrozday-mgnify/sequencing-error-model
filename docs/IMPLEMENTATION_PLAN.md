@@ -21,7 +21,7 @@ Out of scope: signal-level simulation (squigulator, seq2squiggle), variant calli
 |---|---|---|---|---|
 | **`pe-overlap`** | Agreement of R1 and R2 where they overlap | paired FASTQ | No | Illumina (inserts short enough to overlap) |
 | **`reference`** | Alignment to a reference: an external genome, a spike-in or mock community (PhiX, lambda, ZymoBIOMICS), or a polished self-assembly of the sample | FASTQ + reference or contigs + BAM/CRAM | Yes, but the sample's own assembly counts | all |
-| **`kmer`** | skiver (k,v)-mer consensus | skiver outputs + raw FASTQ | No | all |
+| **`kmer`** | skiver (k,v)-mer consensus | skiver outputs + raw FASTQ | No, or a *lite* reference (below) | all |
 
 The `kmer` mode has two skiver builds:
 
@@ -31,6 +31,38 @@ The `kmer` mode has two skiver builds:
 | **enhanced** | `skiver dump` per-observation outputs (plus the default inputs) | modified skiver: a new, minimal fork of GZHoffie/skiver, seeded from the `timrozday-mgnify/skiver` fork (§12, decision 5) |
 
 "Default mode" and "enhanced mode", here and in the repo, mean the `kmer` mode on these two builds.
+
+**The lite-reference arm** (added 2026-10-13), orthogonal to the build axis and **kept separate so the two can
+be compared**, which is the whole point of having it. Strict reference-freeness is a desirable default, not a
+constraint: passing skiver a handful of genomes with `-r` changes three things at once, and they are not all
+costs.
+
+| | reference-free (`kmer` default) | lite-reference arm |
+|---|---|---|
+| consensus | the read-vote majority value | **the reference's value** (§2.2 of the preprint) |
+| coverage floor | `-l 10` | `-l 1` (0 in v0.3.2), so **the low-abundance tail becomes profilable** |
+| repeat keys | removed by the count-deficit filter, with its bias | removed because the *reference* shows the key at several loci |
+| outlier filter | on | **off by default** - so none of its bias applies |
+
+So the arm trades one failure mode for another: it removes the coverage floor, the multiplicity problem
+(phase 6b item 1) and the whole outlier-filter bias (phase 6b item 2, phase 8) at a stroke, and in exchange
+**strain divergence from the reference counts as sequencing error** - the preprint's Fig 3.B, where the
+estimate nearly doubles as reference ANI falls to 96%. Three consequences worth stating up front:
+
+- **"Lite" means few genomes, not a reduced gene set.** A marker-gene reference is the wrong kind: markers are
+  conserved in protein, not in nucleotide k-mers, so a marker reference at 95% nucleotide identity would make
+  ~5% of bases look like errors against a ~0.5% error rate (phase 11's follow-up has the arithmetic). The right
+  lite reference is whole genomes of the species actually present, at high ANI.
+- **A profiler can select it**, which is what makes the arm cheap: sylph names the genomes that match and
+  reports their ANI, so the reference is fetched per sample rather than maintained as a database, and the
+  ANI it reports is the guard on whether the arm is safe for that genome (phase 11).
+- **It can be mixed per key without a fork**: run both arms and merge `kvmer.csv` per key, preferring the
+  reference arm's consensus only where the profile places that genome above an ANI threshold. That is the same
+  shape as the existing `sites.*` masks, which already replace per-key verdicts.
+
+The preprint's own numbers support the arm on near-clonal data: skiver-with-reference has the lower MSE_S in
+five of seven datasets (its Table 2), and on *B. subtilis* RSII it lands closer to BEST than default mode does
+(0.1141 against 0.1503, BEST 0.1033).
 
 **One model, three kinds of evidence.** All modes reduce to the same observation schema (§7) and fit the same two heads with the same component vocabulary (§5.4). They differ only in which components they identify (§5.6, §8). That makes cross-mode comparison a validation tool:
 
@@ -436,8 +468,14 @@ either long reads or Illumina whose mates do not overlap.**
 That last row is the one that points at the answer: **what survives in default mode is the spectrum and the
 context, not the level.**
 
-**The gate.** Run the phase 7 long-tail scenario (below, also promoted to priority) with all three modes on
-**the same reads**, and compare each head E component against the clonal truth:
+**The gate.** Run the phase 7 long-tail scenario (below, also promoted to priority) on **the same reads**,
+and compare each head E component against the clonal truth, for **four** arms: `pe-overlap`, `reference`,
+`kmer` reference-free, and `kmer` with a lite reference (§1.1). The fourth arm is in the gate because it
+removes three of default mode's defects outright - the `-l` floor, the multiplicity problem and the entire
+outlier-filter bias - in exchange for one, strain divergence counting as error. If the reference-free arm
+fails and the lite-reference arm passes, the answer is not "drop `kmer`" but "`kmer` needs a handful of
+genomes", which is a different and much weaker claim than needing a full reference database. Outcomes, read
+per arm:
 
 - **(a) Keep as a first-class mode** - level within the phase 2 tolerances after `sites.keys`, and context and
   spectrum within tolerance. Default mode then stands alone.
@@ -448,6 +486,11 @@ context, not the level.**
 - **(c) Drop default mode** - no component beats `reference` + `pe-overlap` on the long-tail scenario. Then
   §1.1's third mode goes, `sources/kmer.py` and `sites.keys` stay only as a diagnostic, and enhanced mode
   (phase 12) is reconsidered on its own merits, since read ids remove most of the table above.
+- **(d) Keep only with a lite reference** - the reference-free arm fails and the lite-reference arm holds.
+  Then the `kmer` mode's niche narrows from "no reference" to "no *complete* reference database, and no
+  alignment or assembly", which is still worth having: it is the difference between needing a profiler's
+  handful of matched genomes and needing the sample's strains in a curated database. Record the ANI floor at
+  which the arm stops working, since that is the number that decides whether a profiler can supply it.
 
 **Exit of the gate**: the long-tail scenario measured for all three modes, each component labelled (a)/(b)/(c),
 and §1.1, §6.5 and §8 rewritten to match. Until then, treat default-mode numbers as provisional.
@@ -2167,79 +2210,77 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   `Tile` component fits from read names - so it is the external check on that term, where the run's InterOp
   directory survives (it usually does not, for public data).
 - Multi-source joint fit with per-source disagreement diagnostics, reusing `compare.py`.
-- **Explore: a taxonomic or functional profile as a *prior* on expected diversity and dominant-genome depth**
-  (added 2026-10-13; follow-up, deliberately **behind** §6.5.1's gate - see the caution at the end). Default
-  mode's two structural blind spots are that it does not know *which* organisms cleared `-l`, nor how much
-  within-species diversity to expect, and both are things a profiler already computes. Three distinct
-  questions, with different right tools:
-  - **Dominant-genome depth → sylph.** It estimates per-genome ANI and coverage from FracMinHash sketches,
-    which is exactly the quantity the `-l` floor and the detection-limit tables (`docs/skiver_paper_review.md`
-    §3.2) need and currently guess at. It is also the same sketch family as skiver (FracMinHash over
-    nucleotide k-mers), so a shared sketching pass is plausible - worth checking whether the hash and scaling
-    are compatible rather than assuming it. Note the preprint already runs this link the *other* way (skiver's
-    error rate as a prior for sylph's containment, its Table S4), so the two tools are complementary by
-    design and the reverse direction is the unexplored one.
-  - **Expected within-species diversity → sourmash + GTDB lineages, or a precomputed per-species statistic.**
-    This is the one with the reference-database problem: estimating a species' within-population ANI spread
-    needs *many* genomes per species, so it works for *E. coli* and fails for a GTDB singleton. Two things
-    soften it: the prior can be precomputed once per species from any genome collection and shipped as a
-    table, rather than needing the sample's own strains in the database; and DB genome counts correlate with
-    how heavily a taxon has been sequenced. That correlation helps for gut, mock and isolate data - which is
-    the near-term test set - and fails for soil and marine, where the tail is uncharacterised. So treat it as
-    a prior with a per-species confidence, never as a known quantity, and fall back to the uninformative case.
-  - **Which keys are multi-copy, mobile or accessory → the functional profiler**
+- **Explore: a profile that *sets skiver's hyperparameters and the separation priors*, rather than feeding it
+  keys** (added 2026-10-13, revised; follow-up, deliberately **behind** §6.5.1's gate). Default mode's two
+  structural blind spots are that it does not know *which* organisms cleared `-l`, nor how much within-species
+  diversity to expect. Every skiver parameter that is currently a constant, a byte-count heuristic or a free
+  parameter fitted from a 13-point window is a place where that knowledge would pin something now floating:
+
+  | parameter | set how today | what a profile would set it from |
+  |---|---|---|
+  | `-k` | constant 21 (this repo), 17 upstream | total distinct genome content and the number of near-identical relatives, which decide multiplicity (phase 6b item 1); the plan already says k = 25-31 for complex samples |
+  | `-l` | constant 10 | the dominant genomes' actual coverage, as a quantile rather than a guess - phase 6b item 5 measured that too *low* a floor biases the rate **upward** |
+  | `-c` | `ceil(bytes / 10 GiB * 1000)` | expected distinct k-mer content, which is what the subsampling rate should track, not file size |
+  | `-e` / `p0` | constant 1e-12 | how much real variation there is to find: clonal keeps it tight, a diverse population wants it looser (phase 6b item 2 measured 1e-4 as near-free, and that it is a level knob only) |
+  | `sites.keys(prior=)`, `sites.joint(prior=)` | **hardcoded 1e-3** per site | the expected minor-allele rate for the species present - the most direct mapping of all, and the one that currently assumes every sample is near-clonal |
+  | lite-reference arm (§1.1) | not selected | sylph names the matching genomes *and* their ANI, so it both supplies the reference and guards whether the arm is safe for each genome |
+
+  - **`beta` is the prize.** Phase 6b item 1 found that `beta` 0.80 at k = 11 was "mixture clustering, not
+    error clustering" (0.93 at k = 21), and phase 6b item 2 found `beta` carries 1.6x of the level. So `beta`
+    conflates two things, and a profile is exactly what separates them: with one dominant genome at 95%
+    abundance, a low `beta` is read-level error heterogeneity; with five species at similar abundance sharing
+    genes, part of it is genomic mixture. Pinning that split would be the largest single identification gain
+    available to default mode, on its most load-bearing floating parameter.
+  - **Which tool for which question.** Dominant-genome depth and per-genome ANI → **sylph** (FracMinHash over
+    nucleotide k-mers, same sketch family as skiver, so a shared sketching pass is plausible - worth checking
+    the hash and scaling rather than assuming). Expected within-species diversity → **sourmash + GTDB
+    lineages**, or a per-species statistic precomputed once from any genome collection and shipped as a table,
+    so the sample's own strains need not be in the database. Which gene families are multi-copy or mobile →
+    the **functional profiler**
     (<https://github.com/timrozday-mgnify/kmer-functional-profiler>: protein k-mers from frame-filtered
-    translated reads, FracMinHash with nested per-family thresholds, EM over MGnify Proteins clusters). This
-    is where a *functional* profile beats a taxonomic one, and it lands on phase 6b item 1's problem directly:
-    transposases, integrases, rRNA-adjacent and other high-copy families are the keys whose consensus breaks,
-    and family membership predicts that without needing taxonomy or a reference genome. Its `FastxHits` API
-    yields per-read hits with `read`, `mate` and `frame`, i.e. a **per-read** annotation obtained
-    reference-free - the kind of covariate default mode otherwise cannot have at all (§8, phase 4's `Tile`).
-    Caveats to size first: it is protein-space, so it annotates coding sequence only, and at scale 1/1000 most
-    reads will have no hit, so per-read coverage is sparse and it is an aggregate statistic before it is a
-    per-read one. Different alphabet from skiver's, so no shared sketch pass here.
-  - **Restricting skiver to single-copy marker genes: how, and why it is weaker than it first looks.** Two
-    mechanisms exist. `-r/--reference` fed a FASTA of marker sequences would select keys *and* drop keys the
-    reference shows at several loci - but it **also replaces the consensus with the reference's value** (§2.2
-    of the preprint: the key's unique reference value "is regarded as the consensus"), so it makes the mode
-    reference-based and reinstates the divergence failure the preprint's own Fig 3.B measures. The flag
-    conflates key selection with consensus assignment; decoupling them is a fork change. The reference-free
-    mechanism is instead a **post-hoc mask on `kvmer.csv`**, which carries the `key` sequence: keep the rows
-    whose key is in the marker set and refit. `sites.keys` already provides exactly that hook - it "returns
-    `a` with each key's `passes_filter` replaced by the test's verdict, so `sources.kmer.fit` takes it
-    unchanged" - *and* already solves the consequent level problem, since `summary_phred.csv` was counted over
-    skiver's own keys and needs the `level` ratio carried across. So a marker mask is one more function
-    alongside `conservative` / `joint` / `keys`, not new machinery.
-    - **Do not filter the reads instead.** Selecting reads by similarity to a family selects against
-      error-rich reads, biasing the rate **down** - the same key-conditioning bias as phase 6b item 2, and it
-      also drops coverage below `-l`.
-    - **The blocker: conserved in protein is not conserved in 17-mers.** Marker genes are conserved in amino
-      acid sequence; their nucleotide k-mers are not, because synonymous substitution is unconstrained. A
-      specific 17-mer survives at 0.84 / 0.60 / 0.42 / 0.17 for 99 / 97 / 95 / 90 % nucleotide identity, so a
-      *nucleotide* marker index only matches species already in it at roughly >= 97 % - which is most of what
-      `reference` mode needs anyway. **This version therefore does not preserve the reference-free property**,
-      and that was the only reason to want it.
-    - **What we actually wanted from markers, we already have reference-free.** The useful property is
-      "single-copy", and that is measurable from the sample itself: a key far off the modal key coverage is a
-      collapsed copy. `sites.keys`'s `copy_ratio` criterion and `multiplicity.py` already do this, and
-      measuring it on the sample beats a marker proxy, which only asserts single-copy *in the database's*
-      genomes. Conservation is what the outlier filter and `sites.keys` are for. So the marker route is
-      **downgraded**: it is not the strongest version, and it should not be costed first.
-    - **The one variant that would preserve reference-freeness** is to label keys in *protein* space, where
-      conservation does survive across species: translate each key + consensus value (k + v = 34 nt = 11
-      codons) and test family membership. Note the arithmetic is tight - 11 aa is exactly **one** protein
-      11-mer per frame, six across frames and strands - so this needs **exhaustive membership queries**, not
-      the profiler's 1/1000 FracMinHash sketching, which would sample ~0.1 % of them. Whether that operating
-      point is available is the first question to ask of the profiler, and it is the one place its protein
-      alphabet does something neither sylph nor a nucleotide index can.
-  - **Circularity, to design around.** A profile-derived diversity prior would feed variant/error separation,
-    which feeds the error model, which (per Table S4) improves the profiler's own coverage estimates. sylph's
+    translated reads, FracMinHash with nested per-family thresholds, EM over MGnify Proteins clusters),
+    because protein space is where conservation survives across species.
+  - **The database-coverage caveat, honestly.** Estimating a species' within-population diversity needs many
+    genomes of it, so this works for *E. coli* and fails for a GTDB singleton. Two things soften it: the
+    statistic is precomputed per species rather than queried per sample, and database genome counts correlate
+    with how heavily a taxon has been sequenced - which helps for gut, mock and isolate data (the near-term
+    test set) and fails for soil and marine, where the tail is uncharacterised. So every profile-derived
+    parameter carries a per-species confidence and falls back to today's constant when the prior is
+    uninformative. A hyperparameter set from a bad prior is worse than a constant, so the fallback is not
+    optional.
+  - **Not keys directly.** An earlier draft proposed restricting skiver to single-copy marker genes by
+    masking keys; that is downgraded and recorded below, because nucleotide 17-mers of marker genes are
+    species-specific and the property wanted ("single-copy") is already measurable from the sample's own key
+    coverage. Hyperparameters are the better interface: they are few, they are already there, and setting
+    them wrongly degrades gracefully where a wrong key mask does not.
+  - **Circularity, to design around.** A profile-derived prior feeds variant/error separation, which feeds the
+    error model, which (per the preprint's Table S4) improves the profiler's own coverage estimates. sylph's
     coverage estimate depends on the error rate, so this is a genuine loop, not a one-way prior. Either fix
     the order and take one pass with a conservative prior, or treat it as a fixed point and show it is stable
     from different initialisations - as `sites.joint` and `sites.keys` already have to.
-  - **Caution: this is not a reason to delay §6.5.1.** The gate decides on what exists now. If default mode is
-    narrowed or dropped, this work may reopen it later on its own evidence; it must not be used to keep the
+  - **Caution: this is not a reason to delay §6.5.1.** The gate decides on what exists now. If the `kmer` mode
+    is narrowed or dropped, this work may reopen it later on its own evidence; it must not be used to keep the
     decision open.
+  - **Downgraded: restricting skiver to single-copy marker genes.** Two mechanisms exist. `-r/--reference` fed
+    marker sequences would select keys *and* drop keys the reference shows at several loci - but it **also
+    replaces the consensus with the reference's value**, so it is the lite-reference arm (§1.1) with the worst
+    possible reference, since markers are conserved in protein and not in nucleotide k-mers: a specific 17-mer
+    survives at 0.84 / 0.60 / 0.42 / 0.17 for 99 / 97 / 95 / 90 % nucleotide identity, so a marker reference
+    at 95% would make ~5% of bases look like errors against a ~0.5% error rate. The reference-free mechanism
+    is a post-hoc mask on `kvmer.csv`, which carries the `key` sequence; `sites.keys` already provides that
+    hook ("returns `a` with each key's `passes_filter` replaced by the test's verdict") and already solves the
+    consequent level problem via its `level` ratio. But a *nucleotide* marker index only matches species
+    already in it at roughly >= 97%, which is most of what `reference` mode needs anyway, so it does not
+    preserve the reference-free property that was the only reason to want it. And the property actually wanted
+    is already measurable from the sample: a key far off the modal key coverage is a collapsed copy, which
+    `sites.keys`'s `copy_ratio` and `multiplicity.py` already do - measuring beats asserting it from a
+    database's genomes. **Do not filter the reads** either: selecting reads by similarity to a family selects
+    against error-rich reads and biases the rate down, the same key-conditioning bias as phase 6b item 2.
+    What survives is labelling keys in *protein* space: translate each key + consensus value (k + v = 34 nt =
+    11 codons) and test family membership. The arithmetic is tight - 11 aa is exactly **one** protein 11-mer
+    per frame, six across frames and strands - so it needs **exhaustive membership queries**, not the
+    profiler's 1/1000 sketching, which would sample ~0.1% of them. Whether that operating point exists is the
+    first question to ask of the profiler.
 - **Exit:**
   - each source recovers a known model on synthetic data;
   - on at least one real ONT metagenome, with phase 8 separation applied, the report quantifies agreement between `reference`, `kmer` and duplex per component.
