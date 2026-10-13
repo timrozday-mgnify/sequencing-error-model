@@ -2198,14 +2198,40 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
     Caveats to size first: it is protein-space, so it annotates coding sequence only, and at scale 1/1000 most
     reads will have no hit, so per-read coverage is sparse and it is an aggregate statistic before it is a
     per-read one. Different alphabet from skiver's, so no shared sketch pass here.
-  - **The strongest single version of the idea**, worth costing before the rest: restrict error estimation to
-    **single-copy core marker families**, where multiplicity is 1 by construction and diversity is low. Back of
-    the envelope says the coverage is adequate rather than marginal - ~120 universal bacterial markers at ~1 kb
-    is ~120 kb per genome, which at k = 17 is ~120 k keys, against the 85 k keys skiver actually used on the
-    58x ERR2935851 run. The tradeoff to measure is that conserved coding sequence has its own composition
-    (GC, codon structure, no intergenic), so this swaps multiplicity bias for **context** bias - the same
-    currency phase 8's censoring item is trying to protect. Measure the context and GC composition of the
-    marker subset against the whole genome before trusting it.
+  - **Restricting skiver to single-copy marker genes: how, and why it is weaker than it first looks.** Two
+    mechanisms exist. `-r/--reference` fed a FASTA of marker sequences would select keys *and* drop keys the
+    reference shows at several loci - but it **also replaces the consensus with the reference's value** (§2.2
+    of the preprint: the key's unique reference value "is regarded as the consensus"), so it makes the mode
+    reference-based and reinstates the divergence failure the preprint's own Fig 3.B measures. The flag
+    conflates key selection with consensus assignment; decoupling them is a fork change. The reference-free
+    mechanism is instead a **post-hoc mask on `kvmer.csv`**, which carries the `key` sequence: keep the rows
+    whose key is in the marker set and refit. `sites.keys` already provides exactly that hook - it "returns
+    `a` with each key's `passes_filter` replaced by the test's verdict, so `sources.kmer.fit` takes it
+    unchanged" - *and* already solves the consequent level problem, since `summary_phred.csv` was counted over
+    skiver's own keys and needs the `level` ratio carried across. So a marker mask is one more function
+    alongside `conservative` / `joint` / `keys`, not new machinery.
+    - **Do not filter the reads instead.** Selecting reads by similarity to a family selects against
+      error-rich reads, biasing the rate **down** - the same key-conditioning bias as phase 6b item 2, and it
+      also drops coverage below `-l`.
+    - **The blocker: conserved in protein is not conserved in 17-mers.** Marker genes are conserved in amino
+      acid sequence; their nucleotide k-mers are not, because synonymous substitution is unconstrained. A
+      specific 17-mer survives at 0.84 / 0.60 / 0.42 / 0.17 for 99 / 97 / 95 / 90 % nucleotide identity, so a
+      *nucleotide* marker index only matches species already in it at roughly >= 97 % - which is most of what
+      `reference` mode needs anyway. **This version therefore does not preserve the reference-free property**,
+      and that was the only reason to want it.
+    - **What we actually wanted from markers, we already have reference-free.** The useful property is
+      "single-copy", and that is measurable from the sample itself: a key far off the modal key coverage is a
+      collapsed copy. `sites.keys`'s `copy_ratio` criterion and `multiplicity.py` already do this, and
+      measuring it on the sample beats a marker proxy, which only asserts single-copy *in the database's*
+      genomes. Conservation is what the outlier filter and `sites.keys` are for. So the marker route is
+      **downgraded**: it is not the strongest version, and it should not be costed first.
+    - **The one variant that would preserve reference-freeness** is to label keys in *protein* space, where
+      conservation does survive across species: translate each key + consensus value (k + v = 34 nt = 11
+      codons) and test family membership. Note the arithmetic is tight - 11 aa is exactly **one** protein
+      11-mer per frame, six across frames and strands - so this needs **exhaustive membership queries**, not
+      the profiler's 1/1000 FracMinHash sketching, which would sample ~0.1 % of them. Whether that operating
+      point is available is the first question to ask of the profiler, and it is the one place its protein
+      alphabet does something neither sylph nor a nucleotide index can.
   - **Circularity, to design around.** A profile-derived diversity prior would feed variant/error separation,
     which feeds the error model, which (per Table S4) improves the profiler's own coverage estimates. sylph's
     coverage estimate depends on the error rate, so this is a genuine loop, not a one-way prior. Either fix
