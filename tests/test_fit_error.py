@@ -190,3 +190,38 @@ def test_needs_truth_labels() -> None:
     table = CountTable("test", ("context", "q"), "base", False, Counter({("A", 2): 1}))
     with pytest.raises(ValueError, match="truth-bearing"):
         error.fit(table, ["QualityWindow(0)"], ALPHABET)
+
+
+def _position_rows(lengths: Sequence[int], rate: float = 0.02) -> CountTable:
+    """Flat-rate rows over reads of the given lengths: no position effect to find."""
+    counts: Counter[Key] = Counter()
+    for length in lengths:
+        for pos in range(1, length + 1):
+            counts[("ACG", 20, pos, length + 1 - pos, "=")] += int(1000 * (1 - rate))
+            counts[("ACG", 20, pos, length + 1 - pos, "C>A")] += int(1000 * rate)
+    return CountTable("pos", ("context", "q", "pos_start", "pos_end", "op"), "base", True, counts, {"flank": [1, 1]})
+
+
+def test_one_position_axis_on_fixed_length_reads() -> None:
+    """Phase 4: `pos_start` and `pos_end` are collinear when read lengths do not vary, so the paired splines
+    are unidentified and only L2 pins them - which made a fitted curve swing over a flat truth. With one
+    length the `end` half is held at zero and the curve follows the (flat) truth; with mixed lengths both
+    halves are fitted as before."""
+    fixed = error.fit(_position_rows([60] * 4), ["QualityWindow(0)", "Position(4)"], [20])
+    position = next(c for c in fixed if c.name == "Position")
+    assert np.allclose(position.params["end"], 0.0)
+    assert not np.allclose(position.params["start"], 0.0)  # the identified half still carries the curve
+
+    probe = CountTable(
+        "probe",
+        ("context", "q", "pos_start", "pos_end", "op"),
+        "base",
+        True,
+        Counter({("ACG", 20, p, 61 - p, "="): 1 for p in (1, 15, 30, 45, 60)}),
+        {"flank": [1, 1]},
+    )
+    rates = 1 - error.probabilities(fixed, [20], probe)[:, 0]
+    assert rates.max() / rates.min() < 1.1, rates  # flat truth, flat fit
+
+    mixed = error.fit(_position_rows([40, 60, 80, 100]), ["QualityWindow(0)", "Position(4)"], [20])
+    assert not np.allclose(next(c for c in mixed if c.name == "Position").params["end"], 0.0)

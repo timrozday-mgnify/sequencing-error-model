@@ -266,3 +266,12 @@ def test_level_from_rescales_the_fitted_level_and_is_recorded(reads_fastq: Path)
         return float(w @ (1 - p[:, 0]) / w.sum())
 
     assert rate(moved) / rate(base) == pytest.approx(ratio, rel=0.02)
+
+
+def test_default_mode_refuses_a_tile_term() -> None:
+    """`kvmer.csv` has no read ids or names, so `Tile` is not identifiable in default mode and must stay
+    refused: depending on a read id is a fork-only path (CLAUDE.md, plan §8). `pe-overlap` is where it lives."""
+    a = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    with pytest.raises(ValueError, match="not identifiable in `kmer` default mode"):
+        kmer_source._split(["QualityWindow(0)", "Context(1,1)", "Tile(2)"])
+    assert a.k == 11  # the fixture this stands on

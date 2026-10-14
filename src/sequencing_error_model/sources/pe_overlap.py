@@ -27,6 +27,12 @@ Head Q is fitted from every base of every pair, placed or not, conditioned on ob
 the low-Q ones. ponytail: observed bases stand in for true ones, fine at Illumina error rates; condition on the
 overlap consensus if a platform's rate makes the difference visible.
 
+`Tile(n)`, the one *observed* read-level covariate, is read off the read name (`parse_tile`) when `collect`
+is given pairs carrying one. Illumina names carry `instrument:run:flowcell:lane:tile:x:y`, and three equal-sized
+read sets from one run differ by 2.5x in per-base rate by flowcell position alone (plan phase 4), which
+`Latent(S)` cannot model here because inferring a class needs more observations per read than an overlap gives.
+A tile needs none, so this is the one place the observed covariate beats the latent one.
+
 Only substitutions are identified: the fitted head E gets -inf indel logits and provenance records
 `identified_ops`. Errors both mates share (PCR, library, cluster) cancel and are not in the rates. The rows are
 the overlap exposure, so position effects are fitted conditional on the positions the overlap covers.
@@ -50,11 +56,15 @@ from sequencing_error_model.fit.quality import _BASE, Array
 from sequencing_error_model.generate import Read, _flank, _revcomp, gc_bin
 from sequencing_error_model.observations import CountTable, Key, subset
 from sequencing_error_model.sources import fastq_quality
-from sequencing_error_model.sources.fastq_quality import read_fastq
+from sequencing_error_model.sources.fastq_quality import read_fastq, read_fastq_named
 from sequencing_error_model.spec import Component, ErrorModelSpec
 
 _COMP = dict(zip("ACGT", "TGCA", strict=True))
 Pair = tuple[str, Sequence[int], str, Sequence[int]]  # R1 bases, R1 Q, R2 bases, R2 Q
+TiledPair = tuple[str, Sequence[int], str, Sequence[int], str]  # the same, plus the pair's tile label
+AnyPair = Pair | TiledPair
+# instrument:run:flowcell:lane:tile:x:y (7 fields) and the older instrument:lane:tile:x:y (5)
+_TILE_FIELDS = {7: 4, 5: 2}
 Dispute = tuple[Key, Key, Key, Key, tuple[Key, ...], tuple[Key, ...]]
 
 
@@ -79,12 +89,31 @@ class Evidence:
     quality: Counter[Key] = field(default_factory=Counter)
     alphabet: set[int] = field(default_factory=set)
     stats: Stats = field(default_factory=Stats)
+    # tile label -> the index the rows carry, in first-seen order; empty when the names carry no tile
+    tiles: dict[str, int] = field(default_factory=dict)
 
 
-def fields(m: int) -> tuple[str, ...]:
-    """Row fields, in `generate.observations` order."""
+def fields(m: int, tiles: bool = False) -> tuple[str, ...]:
+    """Row fields, in `generate.observations` order; `tiles` adds the read's tile before the op label."""
     window = (f"q{s}{o}" for o in range(1, m + 1) for s in "-+")
-    return ("q", *window, "context", "pos_start", "pos_end", "mate", "strand", "gc", "op")
+    tile = ("tile",) if tiles else ()
+    return ("q", *window, "context", "pos_start", "pos_end", "mate", "strand", "gc", *tile, "op")
+
+
+def parse_tile(name: str) -> str | None:
+    """The flowcell tile in an Illumina read name, as `lane_tile`, or None if the name does not carry one.
+
+    Two layouts appear in public data: `instrument:run:flowcell:lane:tile:x:y` (CASAVA 1.8 and later, seven
+    colon-separated fields) and the older `instrument:lane:tile:x:y` (five). Anything else - an SRA-renamed
+    name such as `SRR24523812.1 1/1`, for instance - carries no tile, and the caller then has no `Tile` term
+    to fit. The lane is kept in the label because tile numbers repeat across lanes.
+    """
+    head = name.split()[0].lstrip("@") if name.strip() else ""
+    parts = head.split(":")
+    at = _TILE_FIELDS.get(len(parts))
+    if at is None or not parts[at].isdigit() or not parts[at - 1].isdigit():
+        return None
+    return f"{parts[at - 1]}_{parts[at]}"
 
 
 def place(
@@ -141,7 +170,7 @@ def place(
 
 
 def collect(
-    pairs: Iterable[Pair],
+    pairs: Iterable[AnyPair],
     m: int = 1,
     flank: tuple[int, int] = (2, 2),
     min_overlap: int = 20,
@@ -156,7 +185,10 @@ def collect(
     """
     ev = Evidence(m, flank)
     # ponytail: Python loop per base; move row building to numpy if real runs are too slow.
-    for r1, q1, r2, q2 in pairs:
+    for pair in pairs:
+        r1, q1, r2, q2 = pair[:4]
+        label = pair[4] if len(pair) > 4 else None
+        tile = None if label is None else ev.tiles.setdefault(str(label), len(ev.tiles))
         ev.stats.pairs += 1
         reads, qs = (r1.upper(), r2.upper()), (list(q1), list(q2))
         ev.alphabet.update(qs[0], qs[1])
@@ -176,7 +208,9 @@ def collect(
                 est[0][i] = est[1][j] = "N"
             if b1 in _COMP and b2 in _COMP:
                 sites.append((i, j, b1, b2))
-        mates = [("".join(e), q, gc_bin("".join(e)), mate) for mate, (e, q) in enumerate(zip(est, qs, strict=True), 1)]
+        mates = [
+            ("".join(e), q, gc_bin("".join(e)), mate, tile) for mate, (e, q) in enumerate(zip(est, qs, strict=True), 1)
+        ]
         for i, j, b1, b2 in sites:
             o2 = reads[1][j]
             if b1 == b2:
@@ -196,20 +230,25 @@ def collect(
 
 
 def _row(
-    read: tuple[str, list[int], tuple[int, int], int],
+    read: tuple[str, list[int], tuple[int, int], int, int | None],
     p: int,
     centre: str,
     observed: str,
     m: int,
     flank: tuple[int, int],
 ) -> Key:
-    """One mate's row at read position `p` if its true base there is `centre`; `read` is (bases, Q, GC bin, mate)."""
-    seq, q, gc, mate = read
+    """One mate's row at read position `p` if its true base there is `centre`.
+
+    `read` is (bases, Q, GC bin, mate, tile index or None), and the tile joins the row only when there is one,
+    matching `fields(m, tiles=...)`.
+    """
+    seq, q, gc, mate, tile = read
     n, (left, right) = len(seq), flank
     ctx = "".join(seq[p + o] if 0 <= p + o < n else "." for o in range(-left, right + 1))
     window = tuple(q[p + o] if 0 <= p + o < n else None for k in range(1, m + 1) for o in (-k, k))
     op = "=" if centre == observed else f"{centre}>{observed}"
-    return (q[p], *window, ctx[:left] + centre + ctx[left + 1 :], p + 1, n - p, mate, "+-"[mate - 1], gc, op)
+    rest = (tile, op) if tile is not None else (op,)
+    return (q[p], *window, ctx[:left] + centre + ctx[left + 1 :], p + 1, n - p, mate, "+-"[mate - 1], gc, *rest)
 
 
 def _q_rows(seq: str, q: list[int], mate: int, p: int, base: str, m: int, flank: tuple[int, int]) -> tuple[Key, ...]:
@@ -232,7 +271,7 @@ def _expected(ev: Evidence, groups: Groups, first: Array) -> CountTable:
         for r, c in zip(rows[:4], (n * w, n * w, n * (1 - w), n * (1 - w)), strict=True):
             counts[r] = counts.get(r, 0.0) + float(c)
     expected = cast("Counter[Key]", Counter({k: v for k, v in counts.items() if v > 0}))
-    return CountTable("pe-overlap", fields(ev.m), "base", True, expected, {"flank": ev.flank})
+    return CountTable("pe-overlap", fields(ev.m, bool(ev.tiles)), "base", True, expected, {"flank": ev.flank})
 
 
 def _posterior(
@@ -245,8 +284,11 @@ def _posterior(
     P(Q | context) for the template base each explanation implies."""
     alphabet, meta = tuple(sorted(ev.alphabet)), {"flank": ev.flank}
     keys = Counter(dict.fromkeys((k for rows, _ in groups for k in rows[:4]), 1))
-    p = error.probabilities(error_head, alphabet, CountTable("pe-overlap", fields(ev.m), "base", True, keys, meta))
-    prob = {k: p[r, error._category(k[-1], str(k[-7])[ev.flank[0]])] for r, k in enumerate(keys)}
+    names = fields(ev.m, bool(ev.tiles))
+    rows = CountTable("pe-overlap", names, "base", True, keys, meta)
+    p = error.probabilities(error_head, alphabet, rows)
+    oi, ci = names.index("op"), names.index("context")  # by name: a Tile term adds a field before the op
+    prob = {k: p[r, error._category(k[oi], str(k[ci])[ev.flank[0]])] for r, k in enumerate(keys)}
     like = np.log([[prob[g[0]] * prob[g[1]], prob[g[2]] * prob[g[3]]] for g, _ in groups])
     if quality_head is not None:
         q_keys = Counter(dict.fromkeys((k for g, _ in groups for rows in g[4:] for k in rows), 1))
@@ -353,9 +395,24 @@ def mode(templates: list[str], reads: list[Read], mates: list[int], truth: Error
     return fit(ev, [c.token for c in truth.error_head], [c.token for c in truth.quality_head], sources=["generator"])
 
 
-def read_pairs(r1: Path, r2: Path) -> Iterator[Pair]:
-    for (s1, q1), (s2, q2) in zip(read_fastq(r1), read_fastq(r2), strict=True):
-        yield s1, q1, s2, q2
+def read_pairs(r1: Path, r2: Path, tiles: bool = False) -> Iterator[AnyPair]:
+    """Mate pairs in file order; with `tiles`, each pair also carries R1's tile label (`parse_tile`).
+
+    A name with no tile in it refuses the run rather than mixing labelled and unlabelled pairs, since a
+    `Tile(n)` term fitted on a partial labelling would absorb the unlabelled reads into one level.
+    """
+    if not tiles:
+        for (s1, q1), (s2, q2) in zip(read_fastq(r1), read_fastq(r2), strict=True):
+            yield s1, q1, s2, q2
+        return
+    for (name, s1, q1), (_, s2, q2) in zip(read_fastq_named(r1), read_fastq_named(r2), strict=True):
+        label = parse_tile(name)
+        if label is None:
+            raise ValueError(
+                f"{r1}: read name {name!r} carries no flowcell tile, so `Tile` cannot be fitted from it "
+                "(SRA-renamed names drop it; the original names have instrument:run:flowcell:lane:tile:x:y)"
+            )
+        yield s1, q1, s2, q2, label
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -368,6 +425,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--error-tokens", nargs="+", default=["QualityWindow(1)", "Context(1,1)", "Position(4)", "Mate"])
     p.add_argument("--quality-tokens", nargs="+", default=["QualityMarkov(1)", "Position(48)", "Mate", "Context(1,1)"])
     p.add_argument("--max-pairs", type=int)
+    p.add_argument(
+        "--tiles",
+        action="store_true",
+        help="read each pair's flowcell tile off the read name and fit a Tile term with one level per tile "
+        "observed (plan phase 4). Refused if the names carry no tile, or if --error-tokens already has one.",
+    )
     p.add_argument(
         "--every-n",
         type=int,
@@ -382,11 +445,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     m = max(Component(args.error_tokens[0]).args[0], Component(args.quality_tokens[0]).args[0])
-    pairs = subset(read_pairs(args.r1, args.r2), args.max_pairs, args.every_n)
+    if args.tiles and any(Component(t).name == "Tile" for t in args.error_tokens):
+        p.error("--tiles adds the Tile term itself, with one level per tile observed; drop it from --error-tokens")
+    pairs = subset(read_pairs(args.r1, args.r2, args.tiles), args.max_pairs, args.every_n)
     ev = collect(pairs, m, min_overlap=args.min_overlap)
+    error_tokens = list(args.error_tokens)
+    if args.tiles:
+        if len(ev.tiles) < 2:
+            p.error(f"--tiles found {len(ev.tiles)} tile(s) in these reads, so a Tile term is not identified")
+        error_tokens.append(f"Tile({len(ev.tiles)})")
     spec = fit(
         ev,
-        args.error_tokens,
+        error_tokens,
         args.quality_tokens,
         iterations=args.iterations,
         smooth=args.smooth,
@@ -394,6 +464,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         sources=[str(args.r1), str(args.r2)],
     )
+    if args.tiles:
+        spec.provenance["tiles"] = list(ev.tiles)
     spec.save(args.output)
     print(json.dumps(spec.provenance["stats"], indent=2))
     return 0
