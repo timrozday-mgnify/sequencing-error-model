@@ -324,23 +324,39 @@ def realign(
         w = min(max(0, a * min(n, m) - o - bound) // max(e, 1), max(n, m)) + 1
     neg = -(1 << 30)
     k = np.arange(2 * w + 1)
-    h, dl, ins = (np.full((n + 1, len(k)), neg, np.int32) for _ in range(3))
-    padded = np.r_[r, 0]
+    # One sentinel column past the band, left at `neg`, so the d+1 reads below never need a bounds check.
+    h, dl, ins = (np.full((n + 1, len(k) + 1), neg, np.int32) for _ in range(3))
+    e_k, oe_k = e * k, o + e * k  # the gap-extension ramp along the band, hoisted out of the row loop
+    # Only cells with 0 <= col <= m are ever valid, and `col` is contiguous and increasing along the band, so
+    # the valid part of a row is the slice [lo, hi). Computing just that slice is half the work of masking the
+    # whole band, which is where `reference` mode's soft-clip realignment spends its time (docs/test_cost.md).
     for i in range(n + 1):
-        col = i - w + k  # read index of each band cell
-        valid = (col >= 0) & (col <= m)
+        lo, hi = max(0, w - i), min(len(k), w - i + m + 1)
+        width = hi - lo
+        if width <= 0:  # past the band's reach: no cell of this row is valid, so it stays `neg`
+            continue
+        col_lo = i - w + lo  # == max(0, i - w)
+        first = 1 if col_lo == 0 else 0  # col 0 has no diagonal predecessor, so its diag is skipped
         if i == 0:
-            h0, d_row = np.where(col == 0, 0, neg), np.full(len(k), neg)
+            h0 = np.full(width, neg, np.int64)
+            if col_lo == 0:
+                h0[0] = 0
+            d_row = np.full(width, neg, np.int64)
         else:
-            diag = np.where(col >= 1, h[i - 1] + np.where(padded[np.clip(col - 1, 0, m)] == t[i - 1], a, -b), neg)
-            d_row = np.maximum(np.r_[h[i - 1, 1:], neg] - o - e, np.r_[dl[i - 1, 1:], neg] - e)
+            diag = np.full(width, neg, np.int64)
+            prev = r[col_lo - 1 + first : col_lo - 1 + width]  # the read base on each cell's diagonal
+            diag[first:] = h[i - 1, lo + first : hi].astype(np.int64) + np.where(prev == t[i - 1], a, -b)
+            d_row = np.maximum(h[i - 1, lo + 1 : hi + 1].astype(np.int64) - o, dl[i - 1, lo + 1 : hi + 1]) - e
             h0 = np.maximum(diag, d_row)
-            if free_template_ends:
-                h0 = np.where(col == 0, np.maximum(h0, 0), h0)
-        h0 = np.where(valid, h0, neg)
-        opened = np.maximum.accumulate(h0.astype(np.int64) + e * k)  # an insertion from any cell to the left
-        i_row = np.r_[neg, opened[:-1]] - o - e * k
-        h[i], dl[i], ins[i] = (np.where(valid, np.maximum(x, neg), neg) for x in (np.maximum(h0, i_row), d_row, i_row))
+            if free_template_ends and col_lo == 0:
+                h0[0] = max(h0[0], 0)
+        opened = np.maximum.accumulate(h0 + e_k[lo:hi])  # an insertion from any cell to the left
+        i_row = np.empty(width, np.int64)
+        i_row[0] = neg  # the cell to the left of the band is invalid
+        i_row[1:] = opened[:-1]
+        i_row -= oe_k[lo:hi]
+        for row, x in ((h, np.maximum(h0, i_row)), (dl, d_row), (ins, i_row)):
+            row[i, lo:hi] = np.maximum(x, neg)
 
     i = int(np.argmax(h[np.arange(n + 1), m - np.arange(n + 1) + w])) if free_template_ends else n
     j, end, state, ops = m, i, "H", []

@@ -43,13 +43,20 @@ import warnings
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 
 from sequencing_error_model.fit import error
 from sequencing_error_model.fit.quality import _BASE, Array, _hat
 from sequencing_error_model.observations import CountTable, Key
-from sequencing_error_model.sources.skiver_analyze import ErrorRate, RateBin, ReadPositionRow, SpectrumRow
+from sequencing_error_model.sources.skiver_analyze import (
+    ErrorRate,
+    RateBin,
+    ReadPositionRow,
+    SkiverAnalyze,
+    SpectrumRow,
+)
 from sequencing_error_model.spec import Component
 
 DUMMY_Q = 0  # the one-value alphabet standing in for the centre Q `kvmer.csv` does not report
@@ -577,3 +584,176 @@ def hazard(rate: ErrorRate) -> dict[str, Array]:
             ]
         ),
     }
+
+
+def _clog_log(t: Array, h: Array) -> tuple[float, float, float]:
+    """Skiver's discrete-Weibull hazard fit by plain OLS: returns (lambda, beta, standard error of beta).
+
+    `h(t) = 1 - exp(-lambda * beta * t^(beta-1))`, so `log(-log(1 - h))` is linear in `log t` with slope
+    `beta - 1`; the reported per-base rate is `1 - exp(-lambda)`, i.e. `h` extrapolated to t = 1. The slope's
+    standard error comes back because the extrapolation reaches ~k positions past the data: a window of 9
+    noisy points pins `beta` far too loosely to read its `h(1)` as a point estimate.
+
+    ponytail: unweighted, as `docs/skiver_illumina_sim.py` has it. Weighting by the risk set would change
+    the points' influence, and the point of this fit is to be the *unpenalised* comparison for skiver's own
+    ridge + Huber estimate, not a better estimator.
+    """
+    x, y = np.log(t), np.log(-np.log(1.0 - h))
+    slope, intercept = np.polyfit(x, y, 1)
+    resid = y - (slope * x + intercept)
+    dof = len(x) - 2
+    se = float(np.sqrt((resid @ resid) / dof / ((x - x.mean()) @ (x - x.mean())))) if dof else float("inf")
+    beta = float(slope) + 1.0
+    return float(np.exp(intercept)) / beta, beta, se
+
+
+def _h1(lambda_: float) -> float:
+    return float(1.0 - np.exp(-lambda_))
+
+
+def hazard_window(a: SkiverAnalyze) -> tuple[Array, Array]:
+    """(t, h(t)) over the window skiver fitted: `hazard_rate.csv`'s rows with a hazard.
+
+    v0.3.2 observes `h(t)` only for t in (k, k+v] and narrows that to [k+3, k+v-2] by its undocumented
+    `--ignore-smallest-t 2 --ignore-largest-t 2`, so this is ~k positions above the t = 1 the level is
+    extrapolated to (plan phase 6b item 2).
+    """
+    rows = [r for r in a.hazard if r.hazard_ratio is not None and 0.0 < r.hazard_ratio < 1.0]
+    if len(rows) < 3:
+        raise ValueError(f"the hazard window has {len(rows)} usable points, too few to refit")
+    return np.array([r.t for r in rows], dtype=float), np.array([r.hazard_ratio for r in rows], dtype=float)
+
+
+def refit_level(a: SkiverAnalyze, betas: Sequence[float] = (1.0, 0.95, 0.9, 0.85, 0.8)) -> dict[str, Any]:
+    """Skiver's own hazard window refitted without its ridge, plus `h(1)` at pinned `betas`.
+
+    Skiver takes the per-base rate from `h(1)`, which is an extrapolation ~k positions below the window it can
+    see, and `beta` alone sets how far it reaches. Its ridge + Huber fit shrinks the slope toward 0, i.e. `beta`
+    toward 1, where no lift is applied at all - worth 1.6x of level on ERR2935851, where plain OLS on skiver's
+    own 13 points gives 0.00779 against skiver's 0.00489 (plan phase 6b item 2). So `ols` is the unpenalised
+    reading of the same data, and `pinned_beta` is the sensitivity band that says how much of the level is
+    extrapolation rather than measurement.
+
+    `beta` < 1 is real: conditioning on a clean key selects cleaner reads as t grows, so the observable hazard
+    sits below the unconditioned rate and the extrapolation is what undoes it. What is new is that `beta` is
+    *estimated* from a short window, so the undo is identified only as well as that window identifies a slope -
+    which, at 9 points and 15x, is barely (`beta_se`).
+
+    Two things this cannot separate, so neither is asserted: skiver's `beta` may differ from the OLS slope of
+    `hazard_rate.csv` because of the penalty, or because it is fitted on the per-Q curves with a common `beta`
+    rather than on this pooled one. The per-Q hazards by t are not in the default output, so the band is the
+    honest answer either way.
+    """
+    t, h = hazard_window(a)
+    lambda_ols, beta_ols, beta_se = _clog_log(t, h)
+    y = np.log(-np.log(1.0 - h))
+
+    def at_beta(beta: float) -> float:
+        intercept = float(np.mean(y - (beta - 1.0) * np.log(t)))
+        return _h1(float(np.exp(intercept)) / beta)
+
+    band = sorted(at_beta(beta_ols + s * 2 * beta_se) for s in (-1, 1)) if np.isfinite(beta_se) else [0.0, 0.0]
+    return {
+        "window": [int(t[0]), int(t[-1])],
+        "points": len(t),
+        "skiver": {"per_base_rate": a.error_rate.per_base_error_rate, "beta": a.error_rate.beta},
+        "ols": {
+            "per_base_rate": _h1(lambda_ols),
+            "beta": beta_ols,
+            "beta_se": beta_se,
+            "lambda": lambda_ols,
+            "per_base_rate_2se": band,
+        },
+        "pinned_beta": {f"{beta:.2f}": at_beta(beta) for beta in betas},
+        "ratio_ols_to_skiver": _h1(lambda_ols) / a.error_rate.per_base_error_rate,
+    }
+
+
+def kvmer_level(a: SkiverAnalyze, use_all: bool = False) -> dict[str, Any]:
+    """A Weibull-free level: single-edit values over the running survival exposure in `kvmer.csv`.
+
+    `consensus_count_up_to_v{t}` is the risk set `N_{K,t}`, the observations still matching the consensus
+    through value position t, so an observation whose single edit sits at t contributed exposure at
+    1..t-1 and one failure at t. Summing both sides over keys and positions gives the mean hazard over
+    t in [1, v] with no hazard model and no extrapolation - the level this repo owns rather than inherits
+    (plan phase 6b item 2). It is *not* `h(1)`: it averages the same selection `beta` < 1 describes, so it
+    reads below the unconditioned rate by however much that selection is worth, which is a lower bound of the
+    same kind as `position_level` and agrees with skiver's own level on a flat truth.
+
+    Failures are `neighbor_count`, the single-edit mass head E is fitted on; values two or more edits away are
+    another locus or two independent errors and are excluded from both sides.
+    """
+    rows = [r for r in a.kvmer if use_all or r.passes_filter]
+    if not rows:
+        raise ValueError("no kvmer keys left to take a level from")
+    failures = exposure = 0.0
+    for r in rows:
+        at_risk = r.consensus_count + r.neighbor_count
+        # N_{K,t-1} for t = 1..v: everything is at risk before the first value position.
+        survival = (at_risk, *(min(n, at_risk) for n in r.consensus_count_up_to_v[:-1]))
+        failures += r.neighbor_count
+        exposure += sum(survival)
+    return {
+        "keys": len(rows),
+        "single_edit_values": failures,
+        "exposure": exposure,
+        "per_base_rate": failures / exposure if exposure else float("nan"),
+        "ratio_to_skiver": (failures / exposure) / a.error_rate.per_base_error_rate if exposure else float("nan"),
+    }
+
+
+def position_level(a: SkiverAnalyze) -> dict[str, Any]:
+    """The fit-free per-cycle mean from `summary_read_position.csv`: `num_error / (num_error + num_correct)`.
+
+    Counted from the read start only, since the from-end rows are the same bases indexed the other way. Each
+    base counted here survived a clean neighbouring key, so it is a lower bound on the *unconditioned* rate -
+    which is below skiver's reported `h(1)` only when `beta` < 1 lifts that rate, and on a flat truth
+    (`beta` ~ 1, no lift) the two agree instead. What it is unconditionally is the one number in the default
+    output that involves no fit at all (plan phase 6b item 2).
+    """
+    rows = [r for r in a.read_position if r.from_start]
+    errors = sum(r.num_error for r in rows)
+    total = errors + sum(r.num_correct for r in rows)
+    return {
+        "cycles": len(rows),
+        "per_base_rate": errors / total if total else float("nan"),
+        "ratio_to_skiver": (errors / total) / a.error_rate.per_base_error_rate if total else float("nan"),
+    }
+
+
+def levels(a: SkiverAnalyze, use_all: bool = False) -> dict[str, Any]:
+    """Every level default mode can state, for the spec's provenance and the cross-mode reports.
+
+    Skiver's own `per_base_error_rate` is one estimate among these, not the level: it is `h(1)` from a ridge-fit
+    `beta` on a 9-13 point window (`refit`), against the same window unpenalised, a hazard-model-free count
+    (`kvmer`) and a fit-free one (`position`). A `kmer` level is reported with this whole set and with `beta`,
+    so a cross-mode gap can be read as extrapolation error rather than mistaken for evidence (plan phase 6b
+    item 2's remediation list).
+    """
+    return {
+        "refit": refit_level(a),
+        "kvmer": kvmer_level(a, use_all),
+        "position": position_level(a),
+        "beta": {"estimate": a.error_rate.beta, "ci": list(a.error_rate.beta_ci)},
+        "key_median_coverage": a.error_rate.key_median_coverage,
+    }
+
+
+LEVEL_SOURCES = ("skiver", "ols", "kvmer", "position")
+
+
+def level_ratio(a: SkiverAnalyze, source: str, use_all: bool = False) -> float:
+    """The factor `sources.kmer.fit(level=)` needs to put the level on `source`'s estimate.
+
+    `skiver` is 1.0, i.e. today's default: `summary_phred.csv`'s per-Q rates as reported. The others rescale
+    every per-Q rate by one factor, which keeps skiver's Q *shape* (the thing `p0` and the filter leave alone,
+    plan phase 6b item 2) and replaces only its level.
+    """
+    if source not in LEVEL_SOURCES:
+        raise ValueError(f"level source must be one of {LEVEL_SOURCES}, got {source!r}")
+    if source == "skiver":
+        return 1.0
+    report = levels(a, use_all)
+    key = "refit" if source == "ols" else source
+    ratio = report[key]["ratio_ols_to_skiver" if source == "ols" else "ratio_to_skiver"]
+    return float(ratio)

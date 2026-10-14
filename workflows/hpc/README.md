@@ -2,11 +2,18 @@
 
 Runs that take more than ~10 minutes locally go here. One Nextflow workflow, two arms:
 
-- **real**: SRR24523812 (the phase 5/6 isolate), phase 6's subset (pairs 1,020,001-1,100,000). Aligns it to the
-  shovill assembly with minibwa, then fits `reference` with `Latent(0/2/3)` and `pe-overlap`, runs skiver and fits
-  `kmer` at each `--k` on the subset and on a 1,000,000-pair depth slice, and compares the three modes
-  (`compare --skiver --kmer-spec`) per k. This is plan phase 6b item 1's rerun at k >= 17. Outputs:
-  `results/specs/`, `results/kmer/<slice>_k<k>/`, `results/compare/<slice>_k<k>.json`.
+- **real**: SRR24523812 (the phase 5/6 isolate), sampled as **every 100th pair** of the run (~80,400 pairs,
+  phase 6's subset size). Aligns it to the shovill assembly with minibwa, then fits `reference` with
+  `Latent(0/2/3)` and `pe-overlap`, runs skiver and fits `kmer` at each `--k` on that sample and on a second,
+  deeper one (every 8th pair, ~1,005,000), and compares the three modes (`compare --skiver --kmer-spec`) per k.
+  This is plan phase 6b item 1's rerun at k >= 17. Outputs: `results/specs/`, `results/kmer/<slice>_k<k>/`,
+  `results/compare/<slice>_k<k>.json`.
+  - **Both samples are strided, not contiguous**, and every mode is fed from the same written-out files.
+    Phase 6 took its subset and its depth slice as two different blocks of the file, and phase 6b item 2 then
+    measured up to **2.5x of error rate** between equal-sized head and tail slices of a real Illumina run - so
+    a block makes a cross-mode or depth ratio partly a measurement of flowcell position. `--every-n` on each
+    CLI (and `observations.subset` behind it) is the same guard inside the package. The strides assume
+    8,039,657 pairs; recount with `gzip -dc r1 | wc -l` for another dataset.
 - **sweep**: one Slurm task per row of `sweeps/phase6b.csv` (`id,module,args,truth`), running
   `python -m sequencing_error_model.<module> --skiver ... <args> [--spec <truth>] --output <id>.json` into
   `results/sweep/`. `truth` names a spec from the real arm (`latent2`, `latent3`); those rows wait for it.

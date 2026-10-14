@@ -222,3 +222,47 @@ def test_stub_matches_the_real_binarys_interface(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="exited 101") as failed:
         recovery.run_skiver(str(failing), tmp_path / "reads.fastq", prefix, 11, 13, 8)
     assert "thread panicked" in str(failed.value)
+
+
+def test_level_from_rescales_the_fitted_level_and_is_recorded(reads_fastq: Path) -> None:
+    """Phase 6b item 2: the level is a choice between estimates, so the spec records which one it stands on.
+
+    Switching from skiver's reported `h(1)` to the hazard-model-free `kvmer.csv` count must move the fitted
+    rate by exactly that ratio and nothing else.
+    """
+    a = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    profile = fastq_quality.profile_fastq(reads_fastq, order=1, flank=(2, 2))
+    q_table = fastq_quality.quality_table(reads_fastq, m=1, flank=(2, 2))
+    tokens = ["QualityWindow(0)", "Context(1,1)"]
+
+    def spec_at(source: str) -> spec_io.ErrorModelSpec:
+        return kmer_source.fit(
+            a,
+            profile,
+            q_table,
+            tokens,
+            QUALITY_TOKENS,
+            {"mode": "kmer", "skiver_build": "default"},
+            min_k=11,
+            level_from=source,
+        )
+
+    base, moved = spec_at("skiver"), spec_at("kvmer")
+    ratio = kmer_fit.level_ratio(a, "kvmer")
+    assert base.provenance["level_from"] == "skiver" and base.provenance["level_scale"] == 1.0
+    assert moved.provenance["level_scale"] == pytest.approx(ratio)
+    # Every estimate is on both specs, whichever one the level stands on.
+    assert base.provenance["levels"]["refit"]["points"] == moved.provenance["levels"]["refit"]["points"]
+
+    exposure = next(t for t in fastq_quality.tables(profile) if t.source.endswith(":context"))
+    cells = exposure.marginal("context", "q")
+    keys = [k for k in sorted(cells.counts) if str(k[0])[2] in "ACGT"]
+    table = CountTable("level", ("context", "q"), "base", False, Counter(dict.fromkeys(keys, 1)),
+                       dict(exposure.meta))  # fmt: skip
+    w = np.array([cells.counts[k] for k in keys], float)
+
+    def rate(spec: spec_io.ErrorModelSpec) -> float:
+        p = error_fit.probabilities(list(spec.error_head), profile.alphabet, table)
+        return float(w @ (1 - p[:, 0]) / w.sum())
+
+    assert rate(moved) / rate(base) == pytest.approx(ratio, rel=0.02)

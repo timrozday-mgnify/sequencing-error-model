@@ -9,15 +9,17 @@ reads, not on the true template (§6.2).
 Profile each mate separately; pass all files (lanes) for one mate in a single call.
 """
 
+import argparse
 import gzip
+import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from itertools import chain, islice
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
-from sequencing_error_model.observations import CountTable, Key, count
+from sequencing_error_model.observations import CountTable, Key, count, subset
 
 PHRED_OFFSET = 33
 MAX_Q = 93
@@ -66,15 +68,26 @@ def read_fastq(path: Path) -> Iterator[tuple[str, bytes]]:
             yield seq.decode("ascii"), qual.translate(_DECODE)
 
 
+def _reads(paths: Sequence[Path], max_reads: int | None, every_n: int) -> Iterator[tuple[str, bytes]]:
+    """`read_fastq` over `paths` in order, strided within each file and capped in total."""
+    strided = chain.from_iterable(subset(read_fastq(path), every_n=every_n) for path in paths)
+    return subset(strided, max_reads)
+
+
 def profile_fastq(
-    *paths: Path, order: int = 1, flank: tuple[int, int] = (2, 2), max_reads: int | None = None
+    *paths: Path, order: int = 1, flank: tuple[int, int] = (2, 2), max_reads: int | None = None, every_n: int = 1
 ) -> QualityProfile:
-    """Count quality-process statistics over the first `max_reads` reads of `paths`, in order."""
+    """Count quality-process statistics over `max_reads` reads of `paths`, in order.
+
+    `every_n` strides within each file (`observations.subset`), so the same `every_n` over a pair of
+    mate files keeps the mates aligned. `max_reads` alone is a head slice, worth up to 2.5x of error
+    rate on real Illumina: see `subset`.
+    """
     left, right = flank
     if order < 0 or left < 0 or right < 0:
         raise ValueError(f"order and flank must be non-negative, got order={order}, flank={flank}")
     p = QualityProfile(order, flank)
-    for seq, q in islice(chain.from_iterable(map(read_fastq, paths)), max_reads):
+    for seq, q in _reads(paths, max_reads, every_n):
         p.n_reads += 1
         p.lengths[len(q)] += 1
         p.position.update(enumerate(q, 1))
@@ -104,11 +117,16 @@ def quality_rows(seq: str, q: Sequence[int], mate: int, m: int, flank: tuple[int
 
 
 def quality_table(
-    *paths: Path, m: int, flank: tuple[int, int] = (2, 2), mate: int = 1, max_reads: int | None = None
+    *paths: Path,
+    m: int,
+    flank: tuple[int, int] = (2, 2),
+    mate: int = 1,
+    max_reads: int | None = None,
+    every_n: int = 1,
 ) -> CountTable:
-    """`quality_rows` counted over the first `max_reads` reads of `paths`: the table `fit.quality.fit` takes."""
+    """`quality_rows` counted over `max_reads` reads of `paths`: the table `fit.quality.fit` takes."""
     counts: Counter[Key] = Counter()
-    for seq, q in islice(chain.from_iterable(map(read_fastq, paths)), max_reads):
+    for seq, q in _reads(paths, max_reads, every_n):
         counts.update(quality_rows(seq, list(q), mate, m, flank))
     return CountTable("fastq_quality:quality", quality_fields(m), "base", False, counts, {"flank": flank})
 
@@ -132,3 +150,47 @@ def tables(p: QualityProfile, mate: int | None = None) -> list[CountTable]:
         table("context", ("context", "q"), "base", p.context.items(), flank=p.flank),
         table("length", ("length",), "read", (((n,), c) for n, c in p.lengths.items())),
     ]
+
+
+def write_subset(path: Path, out: Path, every_n: int, offset: int = 0, limit: int | None = None) -> int:
+    """Copy every `every_n`th record of `path` to `out` (gzipped if `out` ends in `.gz`); returns the count.
+
+    Records are copied verbatim, headers included, so the output is the input's reads and nothing else.
+    Run it with the same `every_n` and `offset` on both mates to keep them aligned, then point every mode
+    at the output: `kmer`, `pe-overlap` and `reference` must consume the *same* reads, not different
+    slices of one file (plan phase 6b item 2).
+    """
+    opener = gzip.open if path.suffix == ".gz" else open
+    writer = gzip.open if out.suffix == ".gz" else open
+    kept = 0
+    with opener(path, "rb") as fh, writer(out, "wb") as oh:
+        records = iter(lambda: [fh.readline() for _ in range(4)], [b""] * 4)
+        for record in subset(records, limit, every_n, offset):
+            if not record[3]:
+                raise FastqFormatError(f"{path}: truncated record after {kept} kept")
+            oh.writelines(record)
+            kept += 1
+    return kept
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="python -m sequencing_error_model.sources.fastq_quality",
+        description="Write a strided subset of FASTQ[.gz] files: every Nth record, never a head or tail slice.",
+    )
+    p.add_argument("fastq", type=Path, nargs="+", help="FASTQ[.gz] files; mates stay aligned at the same --every-n")
+    p.add_argument("--every-n", type=int, required=True, metavar="N", help="keep every Nth record")
+    p.add_argument("--offset", type=int, default=0, help="first record to keep (for a disjoint second sample)")
+    p.add_argument("--max-reads", type=int, help="stop after this many kept records per file")
+    p.add_argument("--output", type=Path, required=True, metavar="DIR", help="directory for the subsets")
+    args = p.parse_args(argv)
+    args.output.mkdir(parents=True, exist_ok=True)
+    for path in args.fastq:
+        out = args.output / path.name
+        kept = write_subset(path, out, args.every_n, args.offset, args.max_reads)
+        print(f"{out}\t{kept}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -48,7 +48,7 @@ from scipy import special
 from sequencing_error_model.fit import error, quality
 from sequencing_error_model.fit.quality import _BASE, Array
 from sequencing_error_model.generate import Read, _flank, _revcomp, gc_bin
-from sequencing_error_model.observations import CountTable, Key
+from sequencing_error_model.observations import CountTable, Key, subset
 from sequencing_error_model.sources import fastq_quality
 from sequencing_error_model.sources.fastq_quality import read_fastq
 from sequencing_error_model.spec import Component, ErrorModelSpec
@@ -368,6 +368,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--error-tokens", nargs="+", default=["QualityWindow(1)", "Context(1,1)", "Position(4)", "Mate"])
     p.add_argument("--quality-tokens", nargs="+", default=["QualityMarkov(1)", "Position(48)", "Mate", "Context(1,1)"])
     p.add_argument("--max-pairs", type=int)
+    p.add_argument(
+        "--every-n",
+        type=int,
+        default=1,
+        metavar="N",
+        help="keep every Nth record rather than a head slice; see `observations.subset`",
+    )
     p.add_argument("--min-overlap", type=int, default=20)
     p.add_argument("--iterations", type=int, default=30, help="maximum EM iterations")
     p.add_argument("--smooth", type=float, default=30.0, help="curvature prior across Q on head E's QualityWindow")
@@ -375,7 +382,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     m = max(Component(args.error_tokens[0]).args[0], Component(args.quality_tokens[0]).args[0])
-    ev = collect(islice(read_pairs(args.r1, args.r2), args.max_pairs), m, min_overlap=args.min_overlap)
+    pairs = subset(read_pairs(args.r1, args.r2), args.max_pairs, args.every_n)
+    ev = collect(pairs, m, min_overlap=args.min_overlap)
     spec = fit(
         ev,
         args.error_tokens,

@@ -32,7 +32,6 @@ import sys
 from collections import Counter
 from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import asdict, replace
-from itertools import islice
 from pathlib import Path
 from typing import Any, cast
 
@@ -43,7 +42,7 @@ from sequencing_error_model import recovery
 from sequencing_error_model import spec as spec_io
 from sequencing_error_model.fit import error, indel
 from sequencing_error_model.generate import _flank, observations
-from sequencing_error_model.observations import CountTable, Key
+from sequencing_error_model.observations import CountTable, Key, subset
 from sequencing_error_model.sources import bam, pe_overlap, skiver_analyze
 from sequencing_error_model.sources.skiver_analyze import SkiverAnalyze
 from sequencing_error_model.spec import ErrorModelSpec
@@ -418,6 +417,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--min-overlap", type=int, default=20)
     p.add_argument("--min-mapq", type=int, default=20)
     p.add_argument("--max-pairs", type=int)
+    p.add_argument(
+        "--every-n",
+        type=int,
+        default=1,
+        metavar="N",
+        help="keep every Nth read or pair rather than a head slice; see `observations.subset`",
+    )
     p.add_argument("--max-reads", type=int)
     p.add_argument("--mask-alt-freq", type=float, help="mask sites with a non-reference allele at this frequency")
     p.add_argument("--skiver", type=Path, metavar="PREFIX", help="`skiver analyze -o` prefix on the same reads")
@@ -432,14 +438,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     flank = (max(2, *(f[0] for f in flanks)), max(2, *(f[1] for f in flanks)))
     m = max(h[0].args[0] for h in heads)
 
-    ev = pe_overlap.collect(
-        islice(pe_overlap.read_pairs(args.r1, args.r2), args.max_pairs), m, flank, min_overlap=args.min_overlap
-    )
+    pairs = subset(pe_overlap.read_pairs(args.r1, args.r2), args.max_pairs, args.every_n)
+    ev = pe_overlap.collect(pairs, m, flank, min_overlap=args.min_overlap)
     overlap = pe_overlap.table(ev, a.error_head, a.quality_head)
     masked = None
     if args.mask_alt_freq is not None:
         masked = bam.masks(bam.pileup(args.bam, args.reference, args.min_mapq), args.reference, args.mask_alt_freq)[0]
-    reads = islice(bam.records(args.bam, args.reference, args.min_mapq, masked), args.max_reads)
+    reads = subset(bam.records(args.bam, args.reference, args.min_mapq, masked), args.max_reads, args.every_n)
     reference = observations(reads, flank, m, "reference")
     if not overlap.counts or not reference.counts:
         p.error("no overlap rows" if not overlap.counts else "no usable aligned reads")

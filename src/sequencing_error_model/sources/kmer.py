@@ -156,12 +156,20 @@ def fit(
     use_all: bool = False,
     flank: tuple[int, int] | None = None,
     level: float = 1.0,
+    level_from: str = "skiver",
     min_k: int = MIN_K,
     mates: Sequence[tuple[SkiverAnalyze, QualityProfile]] = (),
 ) -> ErrorModelSpec:
     """Both heads for `kmer` default mode. `flank` widens the context window the kvmer fit carries, and `level`
     scales `summary_phred.csv`'s rates, which is how a key filter other than skiver's own reaches the level
     (`sites.keys`). `min_k` lowers the key-length refusal (`_check_k`) for genomes known to be single-locus.
+
+    `level_from` picks which estimate the level stands on, multiplying `level` by `fit.kmer.level_ratio`:
+    `skiver` (the default, `summary_phred.csv` as reported), `ols` (its hazard window refitted unpenalised),
+    `kvmer` (a hazard-model-free count) or `position` (fit-free). Skiver's own level is `h(1)` extrapolated
+    ~k positions past the window it can see, with `beta` alone setting the reach, so it is one estimate and
+    not the level; whichever is chosen, `fit.kmer.levels` goes into the spec's provenance with `beta` and a
+    beta-sensitivity band, so a cross-mode gap can be read as extrapolation error (plan phase 6b item 2).
 
     `mates` is one (`skiver analyze`, FASTQ profile) pair per mate, in mate order, from skiver runs on that mate
     alone. It is what identifies a `Mate` term in `error_tokens`: each mate's centre Q is raked against its own
@@ -177,8 +185,11 @@ def fit(
         raise ValueError("the FASTQ profile has no qualities, so there is no alphabet to fit over")
     context_head = kmer.fit(kvmer, context_tokens, flank=flank)
 
+    level_report = kmer.levels(a, use_all)
+    scale = level * kmer.level_ratio(a, level_from, use_all)
+
     def scaled(bins: Sequence[RateBin]) -> list[RateBin]:
-        return [replace(b, per_base_error_rate=b.per_base_error_rate * level) for b in bins]
+        return [replace(b, per_base_error_rate=b.per_base_error_rate * scale) for b in bins]
 
     phred = scaled(a.phred)
     per_mate = []
@@ -203,6 +214,9 @@ def fit(
             "v": a.v,
             "use_all": use_all,
             "outlier_filter": filter_stats(a),
+            "level_from": level_from,
+            "level_scale": scale,
+            "levels": level_report,
             "per_mate_skiver": [{"k": m.k, "v": m.v, "reads": p.n_reads} for m, p in mates],
             **provenance,
         },
@@ -235,12 +249,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("--flank", type=int, nargs=2, metavar=("LEFT", "RIGHT"), default=[2, 2], help="context window")
     p.add_argument("--max-reads", type=int)
+    p.add_argument(
+        "--every-n",
+        type=int,
+        default=1,
+        metavar="N",
+        help="keep every Nth read of the FASTQ pass rather than a head slice (`observations.subset`). "
+        "skiver must have seen the same reads: subsample once with "
+        "`python -m sequencing_error_model.sources.fastq_quality --every-n` and run both on the output.",
+    )
     p.add_argument("--min-k", type=int, default=MIN_K, help="refuse skiver runs with a shorter key (phase 6b)")
+    p.add_argument(
+        "--level-from",
+        choices=kmer.LEVEL_SOURCES,
+        default="skiver",
+        help="which level estimate to stand on: skiver's reported h(1) (default), its hazard window refitted "
+        "without the ridge, a hazard-model-free kvmer.csv count, or the fit-free per-cycle mean. Every "
+        "estimate goes into the spec's provenance whichever is chosen (plan phase 6b item 2).",
+    )
     args = p.parse_args(argv)
     flank = (args.flank[0], args.flank[1])
     m = Component(args.quality_tokens[0]).args[0]
     a = skiver_analyze.read_analyze(args.analyze)
-    profile = fastq_quality.profile_fastq(*args.fastq, order=m, flank=flank, max_reads=args.max_reads)
+    profile = fastq_quality.profile_fastq(
+        *args.fastq, order=m, flank=flank, max_reads=args.max_reads, every_n=args.every_n
+    )
     mates = []
     if args.mate_analyze:
         if len(args.mate_analyze) != len(args.fastq):
@@ -248,7 +281,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         mates = [
             (
                 skiver_analyze.read_analyze(prefix),
-                fastq_quality.profile_fastq(fastq, order=m, flank=flank, max_reads=args.max_reads),
+                fastq_quality.profile_fastq(
+                    fastq, order=m, flank=flank, max_reads=args.max_reads, every_n=args.every_n
+                ),
             )
             for prefix, fastq in zip(args.mate_analyze, args.fastq, strict=True)
         ]
@@ -256,14 +291,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # would be labelled mate 1, so a Mate quality token is refused there rather than fitted on a wrong label.
     if mates:
         q_tables = [
-            fastq_quality.quality_table(f, m=m, flank=flank, mate=i, max_reads=args.max_reads)
+            fastq_quality.quality_table(f, m=m, flank=flank, mate=i, max_reads=args.max_reads, every_n=args.every_n)
             for i, f in enumerate(args.fastq, start=1)
         ]
         q_table = replace(q_tables[0], counts=+sum((t.counts for t in q_tables), Counter()))
     else:
         if any(Component(t).name == "Mate" for t in args.quality_tokens):
             p.error("a Mate quality token needs one FASTQ per mate, with --mate-analyze")
-        q_table = fastq_quality.quality_table(*args.fastq, m=m, flank=flank, max_reads=args.max_reads)
+        q_table = fastq_quality.quality_table(
+            *args.fastq, m=m, flank=flank, max_reads=args.max_reads, every_n=args.every_n
+        )
     provenance: dict[str, Any] = {
         "mode": "kmer",
         "skiver_build": "default",
@@ -279,6 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.quality_tokens,
         provenance,
         use_all=args.use_all,
+        level_from=args.level_from,
         flank=flank,
         min_k=args.min_k,
         mates=mates,

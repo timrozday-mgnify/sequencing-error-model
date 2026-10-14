@@ -625,6 +625,41 @@ Each phase lands as one or more PRs with green CI. Exit criteria are testable. T
 
 **Current priority order** (set 2026-10-13), ahead of the phase numbering: (1) phase 6b item 2's level work and the `p0` / censoring items below, (2) phase 7's long-tail scenario, (3) phase 8's `sites.keys` at position granularity, (4) **§6.5.1's decision gate on whether `kmer` default mode is kept, narrowed or dropped**. Phases 9-11 wait on that gate: there is no point exporting or joint-fitting a mode that may not survive it. `reference` and `pe-overlap` are unaffected and remain the yardstick either way.
 
+**Local-only work queue** (set 2026-10-14, for stretches without HPC). What the priority order above reduces to
+when every run must finish on a laptop in minutes, in order. Items 1-2 are the gate's blockers and need no
+cluster at all.
+
+1. **Stride subsampling of reads, and one sampled FASTQ for every mode.** Every read cap in the repo is a *head*
+   slice (`islice(..., max_pairs)` in `sources.pe_overlap`, `sources.bam`, `compare`, `fastq_quality`), which
+   phase 6b item 2 measured at up to 2.5x of error rate against a tail slice of the same size. So the cap is a
+   biased subsample, not just a small one: `observations.subset` keeps every `every_n`th record instead, and
+   `--every-n` is on each CLI. Materialise the sampled pair of FASTQs **once**
+   (`python -m sequencing_error_model.sources.fastq_quality --write`) and point `kmer`, `pe-overlap` and
+   `reference` at that, so the cross-mode ratios are not measuring read selection. This is also what makes the
+   real arms local: stride down to a depth that fits, without paying selection bias for it.
+2. **Phase 6b item 2's level remediation**, all four remedies: the ridge-free / penalty-swept refit of the
+   hazard window, a level computed directly from `kvmer.csv` over the `consensus_count_up_to_v*` exposure, the
+   fit-free `summary_read_position.csv` anchor, and `beta` plus a sensitivity band on every `kmer` level. All
+   arithmetic on skiver outputs already on disk, and §6.5.1 outcome (b) turns on it.
+3. **The read-position shape gap** (phase 6b item 1), the one exit neither met nor explained: the position curve
+   against `reference` restricted to the overlap's own rows. One local k = 21 run, not the three-k sweep.
+4. **The reference-free multiplicity flag** (phase 6b item 1) and its clonal cost: `kvmer.csv` arithmetic plus
+   one small synthetic run.
+5. **`sites.keys` position censoring** (phase 8, already priority): `kvmer.csv`'s running survival counts carry
+   what it needs, and it is fixture-testable.
+6. **`Tile`** (phase 4, not started). SRR24523812 is SRA-renamed and carries no tile, but
+   `~/Downloads/ERR4334351_test_12.fastq.gz` has full MiSeq names (`M05310:18:000000000-CB339:1:1101:...`) and
+   `ERR10889147_*` has `HS24_135:4:1101:...`, so the parser must take both the 5- and 7-field forms.
+7. **Phase 4's leftovers**: the error-head `Position` spline identifiability on fixed-length reads, head Q at
+   cycles 40-41, and the fitting cost (binning, which item 1 also serves).
+8. **A `bias.py` collision scenario on a repeat-bearing genome** at k = 11/15/21, from a ~500 kb excerpt of the
+   shovill assembly rather than a random genome.
+9. **The long-tail scenario**: write it and run one pilot point locally; the grid itself stays on Slurm.
+
+Not local, and waiting on a cluster: the 155-row sweep and its `big_*` rows, the 1,000,000-pair depth slice,
+D6331, and the ERR2935851 refits - though those can be stride-sampled while streaming rather than downloading
+25 GB.
+
 ### Phase 0: repository, CI and PR policy ✓
 uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), Linting, Testing and Release workflows, PR template, and a `main` ruleset requiring PRs with passing `lint` + `test`.
 
@@ -1586,7 +1621,15 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
      *different blocks of the same file*, so that comparison conflates depth with read selection - and the
      sweep above says depth contributes ~nothing (flat to 7 % over 9x) while selection contributes up to 2.5x.
      **So "depth raises skiver's rate" is most likely a read-selection artifact**, on top of being taken at
-     k = 11. Rerun it by systematic subsampling (every Nth pair) from one block, which holds selection fixed
+     k = 11. **Confirmed on SRR24523812 itself** (2026-10-14): the same 80,000-odd pairs taken
+     uniformly (every 100th pair of the run's 8,039,657) instead of as phase 6's contiguous block give
+     skiver **0.9417 %** against the block's 0.505 % at k = 21 - **1.86x from read selection alone**, at the
+     same read count, the same k/v/c and the same key coverage (median 15 against 14.5). The FracMinHash key
+     set differs between the two, but that is worth ~0.04 of SD (item 2's seed sweep), not 1.86x. So the
+     real-data level numbers phase 6b recorded are the *clean block's*, and that includes the 1.012 ratio
+     against `reference`, which was measured on the same block and therefore shares its bias only insofar as
+     the aligner shares it - the cross-mode comparison needs rerunning on the uniform sample before that
+     agreement means anything. Rerun it by systematic subsampling (every Nth pair) from one block, which holds selection fixed
      and varies only depth. The per-mate difference (R1 0.478 % / R2 0.663 %) was measured within a single
      block, so mate is not confounded with block, but its absolute level inherits that block's bias.
 
@@ -1602,6 +1645,47 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
        cross-mode comparisons separate extrapolation error from key conditioning;
      - `--hazard-model constant` pins `beta` = 1 and is the conservative floor (0.00375 here), useful as a
        bracket only.
+     - ✓ **All four landed, and the first one does not survive contact with a real window**
+       (2026-10-14, `fit.kmer.levels` / `refit_level` / `kvmer_level` / `position_level` / `level_ratio`,
+       `sources.kmer.fit(level_from=)` and `--level-from`). Every `kmer` spec now carries all four estimates,
+       `beta` and the beta band in `provenance["levels"]`, whichever one the level stands on (default
+       `skiver`, i.e. today's behaviour unchanged). Measured on a **uniformly sampled** 80,397-pair subset of
+       SRR24523812 (every 100th pair; see the read-selection item below) at k = 21, v = 13, c = 8, where
+       skiver reports 0.9417 % and `beta` 0.944 over a 9-point window (t = 24-32):
+
+       | estimate | per-base rate | ratio to skiver |
+       |---|---|---|
+       | skiver's `h(1)` (ridge + Huber) | 0.9417 % | 1.00 |
+       | plain OLS on the same 9 points | **4.24 %** | 4.51 |
+       | `kvmer.csv` single edits over the running risk set | 0.638 % | 0.68 |
+       | `summary_read_position.csv`, fit-free | 0.748 % | 0.79 |
+
+       | `h(1)` at pinned `beta` | 1.00 | 0.95 | 0.90 | 0.85 | 0.80 |
+       |---|---|---|---|---|---|
+       | | 0.744 % | 0.924 % | 1.151 % | 1.437 % | 1.800 % |
+
+       So:
+       - **the OLS refit is not a usable point estimate at this depth.** Its slope gives `beta` 0.617 with a
+         standard error of 0.042, so skiver's 0.944 is ~8 SE away and the 2-SE band on `h(1)` is 2.8-6.4 %.
+         The review's ERR2935851 case (0.831 against 0.938, 13 points at 557x) was the mild version of this;
+         at 15x over 9 points the window simply does not identify a slope that is then extrapolated 23
+         positions. The finding stands - **the level is set by an unidentified `beta`** - but its direction
+         and size are not; `beta_se` is now reported so this cannot be read as a correction;
+       - **what is identified is the band**, and it is wide: `beta` from 1.00 to 0.80 is 2.4x of level, and
+         `beta`'s own bootstrap CI here (0.927-0.962) is already +-10 %. That band, not a point, is what every
+         cross-mode `kmer` level should be quoted with;
+       - **the two fit-free estimates agree with each other** (0.638 % and 0.748 %, a 1.17x spread) and sit
+         below skiver's `h(1)`, which is the predicted direction: both average the hazard over a window where
+         clean-key conditioning has already selected cleaner reads, and `beta` < 1's lift is what skiver adds
+         on top. They bracket `beta` ~ 1.0-0.97 if read as `h(1)`;
+       - **on a flat synthetic truth they all agree**, which is the test (`beta` 1.015 on the committed
+         fixture, OLS 1.050 +- 0.120, `kvmer` and `position` both within 15 % of skiver). A split on
+         synthetic clonal reads would mean an estimator is wrong; a split on real data is the heterogeneity.
+       - Two causes this cannot separate, so neither is asserted: skiver's `beta` may differ from the OLS
+         slope of `hazard_rate.csv` because of the ridge, or because it is fitted on the per-Q curves with a
+         common `beta` rather than on the pooled one. The per-Q hazards by t are not in the default output.
+       Next: take the level from `pe-overlap` on the same reads (the yardstick §6.5.1 outcome (b) names),
+       and quote the band beside it.
 
    - ✓ **Measured: the outlier threshold `p0` is a level knob and nothing else; ~1e-4 is close to free**
      (2026-10-13, v0.3.2 `-e` swept on 58x of ERR2935851 R1, a *clonal* isolate, so every key dropped is pure
