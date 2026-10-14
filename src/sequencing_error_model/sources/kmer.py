@@ -235,12 +235,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("--flank", type=int, nargs=2, metavar=("LEFT", "RIGHT"), default=[2, 2], help="context window")
     p.add_argument("--max-reads", type=int)
+    p.add_argument(
+        "--every-n",
+        type=int,
+        default=1,
+        metavar="N",
+        help="keep every Nth read of the FASTQ pass rather than a head slice (`observations.subset`). "
+        "skiver must have seen the same reads: subsample once with "
+        "`python -m sequencing_error_model.sources.fastq_quality --every-n` and run both on the output.",
+    )
     p.add_argument("--min-k", type=int, default=MIN_K, help="refuse skiver runs with a shorter key (phase 6b)")
     args = p.parse_args(argv)
     flank = (args.flank[0], args.flank[1])
     m = Component(args.quality_tokens[0]).args[0]
     a = skiver_analyze.read_analyze(args.analyze)
-    profile = fastq_quality.profile_fastq(*args.fastq, order=m, flank=flank, max_reads=args.max_reads)
+    profile = fastq_quality.profile_fastq(
+        *args.fastq, order=m, flank=flank, max_reads=args.max_reads, every_n=args.every_n
+    )
     mates = []
     if args.mate_analyze:
         if len(args.mate_analyze) != len(args.fastq):
@@ -248,7 +259,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         mates = [
             (
                 skiver_analyze.read_analyze(prefix),
-                fastq_quality.profile_fastq(fastq, order=m, flank=flank, max_reads=args.max_reads),
+                fastq_quality.profile_fastq(
+                    fastq, order=m, flank=flank, max_reads=args.max_reads, every_n=args.every_n
+                ),
             )
             for prefix, fastq in zip(args.mate_analyze, args.fastq, strict=True)
         ]
@@ -256,14 +269,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # would be labelled mate 1, so a Mate quality token is refused there rather than fitted on a wrong label.
     if mates:
         q_tables = [
-            fastq_quality.quality_table(f, m=m, flank=flank, mate=i, max_reads=args.max_reads)
+            fastq_quality.quality_table(f, m=m, flank=flank, mate=i, max_reads=args.max_reads, every_n=args.every_n)
             for i, f in enumerate(args.fastq, start=1)
         ]
         q_table = replace(q_tables[0], counts=+sum((t.counts for t in q_tables), Counter()))
     else:
         if any(Component(t).name == "Mate" for t in args.quality_tokens):
             p.error("a Mate quality token needs one FASTQ per mate, with --mate-analyze")
-        q_table = fastq_quality.quality_table(*args.fastq, m=m, flank=flank, max_reads=args.max_reads)
+        q_table = fastq_quality.quality_table(
+            *args.fastq, m=m, flank=flank, max_reads=args.max_reads, every_n=args.every_n
+        )
     provenance: dict[str, Any] = {
         "mode": "kmer",
         "skiver_build": "default",

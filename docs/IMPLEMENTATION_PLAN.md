@@ -625,6 +625,41 @@ Each phase lands as one or more PRs with green CI. Exit criteria are testable. T
 
 **Current priority order** (set 2026-10-13), ahead of the phase numbering: (1) phase 6b item 2's level work and the `p0` / censoring items below, (2) phase 7's long-tail scenario, (3) phase 8's `sites.keys` at position granularity, (4) **§6.5.1's decision gate on whether `kmer` default mode is kept, narrowed or dropped**. Phases 9-11 wait on that gate: there is no point exporting or joint-fitting a mode that may not survive it. `reference` and `pe-overlap` are unaffected and remain the yardstick either way.
 
+**Local-only work queue** (set 2026-10-14, for stretches without HPC). What the priority order above reduces to
+when every run must finish on a laptop in minutes, in order. Items 1-2 are the gate's blockers and need no
+cluster at all.
+
+1. **Stride subsampling of reads, and one sampled FASTQ for every mode.** Every read cap in the repo is a *head*
+   slice (`islice(..., max_pairs)` in `sources.pe_overlap`, `sources.bam`, `compare`, `fastq_quality`), which
+   phase 6b item 2 measured at up to 2.5x of error rate against a tail slice of the same size. So the cap is a
+   biased subsample, not just a small one: `observations.subset` keeps every `every_n`th record instead, and
+   `--every-n` is on each CLI. Materialise the sampled pair of FASTQs **once**
+   (`python -m sequencing_error_model.sources.fastq_quality --write`) and point `kmer`, `pe-overlap` and
+   `reference` at that, so the cross-mode ratios are not measuring read selection. This is also what makes the
+   real arms local: stride down to a depth that fits, without paying selection bias for it.
+2. **Phase 6b item 2's level remediation**, all four remedies: the ridge-free / penalty-swept refit of the
+   hazard window, a level computed directly from `kvmer.csv` over the `consensus_count_up_to_v*` exposure, the
+   fit-free `summary_read_position.csv` anchor, and `beta` plus a sensitivity band on every `kmer` level. All
+   arithmetic on skiver outputs already on disk, and §6.5.1 outcome (b) turns on it.
+3. **The read-position shape gap** (phase 6b item 1), the one exit neither met nor explained: the position curve
+   against `reference` restricted to the overlap's own rows. One local k = 21 run, not the three-k sweep.
+4. **The reference-free multiplicity flag** (phase 6b item 1) and its clonal cost: `kvmer.csv` arithmetic plus
+   one small synthetic run.
+5. **`sites.keys` position censoring** (phase 8, already priority): `kvmer.csv`'s running survival counts carry
+   what it needs, and it is fixture-testable.
+6. **`Tile`** (phase 4, not started). SRR24523812 is SRA-renamed and carries no tile, but
+   `~/Downloads/ERR4334351_test_12.fastq.gz` has full MiSeq names (`M05310:18:000000000-CB339:1:1101:...`) and
+   `ERR10889147_*` has `HS24_135:4:1101:...`, so the parser must take both the 5- and 7-field forms.
+7. **Phase 4's leftovers**: the error-head `Position` spline identifiability on fixed-length reads, head Q at
+   cycles 40-41, and the fitting cost (binning, which item 1 also serves).
+8. **A `bias.py` collision scenario on a repeat-bearing genome** at k = 11/15/21, from a ~500 kb excerpt of the
+   shovill assembly rather than a random genome.
+9. **The long-tail scenario**: write it and run one pilot point locally; the grid itself stays on Slurm.
+
+Not local, and waiting on a cluster: the 155-row sweep and its `big_*` rows, the 1,000,000-pair depth slice,
+D6331, and the ERR2935851 refits - though those can be stride-sampled while streaming rather than downloading
+25 GB.
+
 ### Phase 0: repository, CI and PR policy ✓
 uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), Linting, Testing and Release workflows, PR template, and a `main` ruleset requiring PRs with passing `lint` + `test`.
 

@@ -7,19 +7,23 @@
 //          real arm (e.g. latent2), or is empty for the built-in example spec.
 nextflow.enable.dsl = 2
 
+// Every Nth pair, never a contiguous block: at equal read counts a head slice of this run reads up to
+// 2.5x the error rate of a tail slice (plan phase 6b item 2), so a block would make every cross-mode ratio
+// below a measurement of flowcell position. The same stride on both mates keeps them aligned, and all three
+// modes are fed from this one output, so they see the same reads.
 process SUBSET {
     tag "$name"
     label 'small'
     input:
-    tuple val(name), val(start), val(pairs), path(r1), path(r2)
+    tuple val(name), val(every), path(r1), path(r2)
     output:
     tuple val(name), path("${name}_1.fastq.gz"), path("${name}_2.fastq.gz")
     script:
-    def first = (start - 1) * 4 + 1
-    def last = (start - 1 + pairs) * 4
     """
-    gzip -dc $r1 | sed -n '${first},${last}p;${last}q' | gzip -1 > ${name}_1.fastq.gz
-    gzip -dc $r2 | sed -n '${first},${last}p;${last}q' | gzip -1 > ${name}_2.fastq.gz
+    python -m sequencing_error_model.sources.fastq_quality $r1 --every-n $every --output s1
+    python -m sequencing_error_model.sources.fastq_quality $r2 --every-n $every --output s2
+    mv s1/* ${name}_1.fastq.gz
+    mv s2/* ${name}_2.fastq.gz
     """
 }
 
@@ -53,7 +57,8 @@ process FIT_REFERENCE {
     def tokens = latent ? "--latent $latent --error-tokens 'QualityWindow(1)' 'Context(1,1)' 'Position(8)' Homopolymer Mate" : ''
     """
     python -m sequencing_error_model.sources.bam $sam $assembly --unclip 2 8 12 2 \\
-        --max-reads ${params.train_pairs * 2} $tokens --output reference_latent$latent
+        --max-reads ${params.train_pairs * 2} --every-n ${params.train_every_n} \\
+        $tokens --output reference_latent$latent
     """
 }
 
@@ -66,7 +71,8 @@ process FIT_OVERLAP {
     path 'pe_overlap'
     script:
     """
-    python -m sequencing_error_model.sources.pe_overlap $r1 $r2 --max-pairs ${params.train_pairs} --output pe_overlap
+    python -m sequencing_error_model.sources.pe_overlap $r1 $r2 --max-pairs ${params.train_pairs} \\
+        --every-n ${params.train_every_n} --output pe_overlap
     """
 }
 
@@ -106,7 +112,8 @@ process COMPARE {
     """
     python -m sequencing_error_model.compare $r1 $r2 $sam $assembly --overlap-spec $overlap_spec \\
         --reference-spec $reference_spec --skiver $kmer/analyze --kmer-spec $kmer/kmer_spec \\
-        --max-pairs ${params.train_pairs} --max-reads ${params.train_pairs * 2} --output ${kname}_k${k}.json
+        --max-pairs ${params.train_pairs} --max-reads ${params.train_pairs * 2} \\
+        --every-n ${params.train_every_n} --output ${kname}_k${k}.json
     """
 }
 
@@ -135,8 +142,8 @@ workflow {
 
     if (params.real) {
         def assembly = file(params.assembly, checkIfExists: true)
-        def slices = [['subset', params.start, params.pairs]]
-        if (params.depth_pairs) slices << ['depth', params.start, params.depth_pairs]
+        def slices = [['subset', params.every_n]]
+        if (params.depth_every_n) slices << ['depth', params.depth_every_n]
         def reads = SUBSET(channel.fromList(slices).map { it + [file(params.r1), file(params.r2)] })
         def subset = reads.filter { it[0] == 'subset' }
         def aligned = ALIGN(subset, assembly)

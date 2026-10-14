@@ -2,7 +2,7 @@ from collections import Counter
 
 import pytest
 
-from sequencing_error_model.observations import CountTable
+from sequencing_error_model.observations import CountTable, subset
 
 
 def test_marginal() -> None:
@@ -34,3 +34,18 @@ def test_op_needs_truth() -> None:
 def test_invalid(fields: tuple[str, ...], counts: dict[tuple[object, ...], int], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         CountTable("x", fields, "base", True, Counter(counts))
+
+
+def test_subset_strides() -> None:
+    assert list(subset(range(10))) == list(range(10))
+    assert list(subset(range(10), every_n=3)) == [0, 3, 6, 9]
+    assert list(subset(range(10), 2, 3)) == [0, 3]
+    assert list(subset(range(10), every_n=3, offset=1)) == [1, 4, 7]
+    # Disjoint samples, so a second one can check the first.
+    assert not set(subset(range(10), every_n=3)) & set(subset(range(10), every_n=3, offset=1))
+
+
+@pytest.mark.parametrize(("every_n", "offset"), [(0, 0), (-1, 0), (1, -1)])
+def test_subset_invalid(every_n: int, offset: int) -> None:
+    with pytest.raises(ValueError, match="every_n must be"):
+        subset(range(3), every_n=every_n, offset=offset)
