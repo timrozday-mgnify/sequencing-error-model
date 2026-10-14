@@ -97,6 +97,7 @@ def generate(
     tracks: Sequence[Array] | None = None,
     classes: Array | None = None,
     strands: Sequence[int] | None = None,
+    tiles: Sequence[int] | Array | None = None,
 ) -> list[Read]:
     """One read per template; mate 2 also uses the "-" strand covariate. `tracks` replaces head Q's draw with given
     template-indexed Q tracks (values in the alphabet), e.g. an exporter's base profile. `classes` gives each
@@ -105,6 +106,11 @@ def generate(
     `strands` (0 forward, 1 reverse, per read) replaces that mate convention, which makes strand and mate the
     same covariate and so unidentifiable together: a real library draws each fragment's orientation, so mate 1
     is reverse half the time. The reads come back carrying it, which is what `_tuples` then records.
+
+    `tiles` gives each read's `Tile(n)` level, as `classes` does for `Latent(S)`. Without it a `Tile` head
+    draws from the component's own `prior` (uniform if it has none), since a tile is an observed covariate of
+    the library rather than part of the error process: the model says what each tile does, the prior says how
+    many reads come off each one.
     """
     if max_ins_run < 1:
         raise ValueError("max_ins_run must be at least 1")
@@ -113,6 +119,11 @@ def generate(
     if model.latent is not None and classes is None:
         prior = model.latent.params["prior"]
         classes = rng.choice(len(prior), size=len(templates), p=prior / prior.sum())
+    tile = next((c for c in model.error_head if c.name == "Tile"), None)
+    drawn_tiles = None if tiles is None else np.asarray(tiles, np.int64)
+    if tile is not None and drawn_tiles is None:
+        weights = np.asarray(tile.params.get("prior", np.ones(tile.args[0])), float)
+        drawn_tiles = rng.choice(len(weights), size=len(templates), p=weights / weights.sum())
     if tracks is None:
         tracks = quality.sample(model.quality_head, model.quality_alphabet, templates, mates, rng, classes)
     lengths = np.array([len(t) for t in templates], np.int64)
@@ -139,6 +150,7 @@ def generate(
         else np.repeat(np.asarray(strands, np.int64), lengths),
         "gc": np.repeat([sum(gc_bin(t)) / 2 for t in templates], lengths),
         "latent": np.repeat(np.zeros(len(templates), np.int64) if classes is None else classes, lengths),
+        "tile": np.repeat(np.zeros(len(templates), np.int64) if drawn_tiles is None else drawn_tiles, lengths),
     }
     for o in range(1, model.error_head[0].args[0] + 1):
         for j, name in ((within - o, f"q-{o}"), (within + o, f"q+{o}")):

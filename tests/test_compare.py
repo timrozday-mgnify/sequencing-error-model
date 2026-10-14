@@ -1,11 +1,13 @@
 import json
 import re
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import numpy as np
 import pysam
+import pytest
 
 from sequencing_error_model import compare, recovery
 from sequencing_error_model import generate as gen
@@ -107,7 +109,9 @@ def test_cli_reports_both_levels(tmp_path: Path) -> None:
     extra = ["--skiver", str(skiver), "--kmer-spec", str(spec_a), "--generated-reads", "100", "--read-length", "40"]
     assert compare.main([*args, "--output", str(report), "--min-exposure", "10", *extra]) == 0
     doc = json.loads(report.read_text())
-    assert set(doc["kmer"]) == {"overlap", "reference", "generated"}
+    # `reference_on_overlap_positions` is the same reference rows standardised to where the overlap looks
+    # (`on_support`), which is how much of a cross-mode gap is position exposure (plan phase 6b item 1).
+    assert set(doc["kmer"]) == {"overlap", "reference", "reference_on_overlap_positions", "generated"}
     assert doc["kmer"]["overlap"]["components"]["op"]["tv"] < 1e-12  # the stand-in spec against itself
     assert doc["kmer"]["generated"]["reference"]["reads"] == 100
     # Different reads, so only the shape of the skiver section is checked here, not agreement.
@@ -253,3 +257,36 @@ def test_components_localise_a_moved_context_effect(tmp_path: Path) -> None:
     ref.write_text(f">g\n{genome}\n")
     doc = compare.generated(truth, truth, ref, 200, 40, q_reads=400)
     assert abs(doc["scalars"]["rate_ratio"] - 1) < 1e-9 and doc["scalars"]["op_tv"] < 1e-12, doc["scalars"]
+
+
+def test_on_support_standardises_exposure_without_moving_conditional_rates() -> None:
+    """Phase 6b item 1: a cross-mode ratio partly measures *where* each mode's rows sit.
+
+    Two positions with very different error rates, and a second table whose exposure sits almost entirely at
+    the worse one. Standardising the first table to the second's positions must leave each position's own rate
+    alone and move only the pooled rate, toward the other table's exposure.
+    """
+
+    def table(source: str, rows: dict[tuple[int, str], float]) -> CountTable:
+        counts: Counter[Key] = Counter({("ACG", pos, op): n for (pos, op), n in rows.items()})
+        return CountTable(source, ("context", "pos_start", "op"), "base", True, counts, {"flank": [1, 1]})
+
+    # Position 1 at 1%, position 2 at 10%, and most of the exposure at position 1.
+    wide = table("wide", {(1, "="): 9900, (1, "A>C"): 100, (2, "="): 900, (2, "A>C"): 100})
+    # The other mode sees position 2 almost exclusively, as mate overlaps see read ends.
+    narrow = table("narrow", {(1, "="): 100, (2, "="): 1900, (2, "A>C"): 100})
+
+    def rate(t: CountTable, pos: int | None = None) -> float:
+        rows = [(k, n) for k, n in t.counts.items() if pos is None or k[1] == pos]
+        return sum(n for k, n in rows if k[2] != "=") / sum(n for _, n in rows)
+
+    moved = compare.on_support(wide, narrow, ("pos_start",))
+    assert moved.meta["standardised_to"] == "narrow"
+    for pos in (1, 2):
+        assert rate(moved, pos) == pytest.approx(rate(wide, pos))  # conditional rates untouched
+    assert rate(wide) == pytest.approx(0.0182, abs=1e-4)
+    assert rate(moved) == pytest.approx(0.0955, abs=1e-3)  # standardised to where `narrow` looks
+    assert rate(narrow) == pytest.approx(100 / 2100, abs=1e-6)
+
+    with pytest.raises(ValueError, match="no fields"):
+        compare.on_support(wide, narrow, ("gc",))

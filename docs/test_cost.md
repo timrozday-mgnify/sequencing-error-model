@@ -79,6 +79,21 @@ Scaffolding, fixtures, FASTQ I/O, subprocesses and the external aligners are all
    46 tables in one test), so intermediate tables pay O(rows) validation repeatedly. Validate once at the
    source boundary, or sample the keys, if it still shows up after 1 and 2.
 
+## Head Q on real data is in a different cost class
+
+Measured 2026-10-14 while trying to close phase 4's cycle-40/41 item: one `Position(4)` head Q fit on 6,000
+reads of the MiSeq amplicon run (~900 k rows) did not finish in **25 minutes**, against ~30 s for the whole
+`pe-overlap` recovery test. So the knot sweep that item wants is not a laptop run, and `Position(48)` - the
+CLI default - is worse again. Whatever comes of the two hot spots above, head Q's own scaling in the number
+of knots is the thing to measure before any real-data knot selection is attempted.
+
+## A real `reference` fit is in a third cost class
+
+Also 2026-10-14: `sources.bam` on 40,000 strided reads of the SRR24523812 subset (`--unclip 2 8 12 2`,
+`Latent(0)`, the phase 5 tokens) took **3 h 47 m** of wall clock. That is the same `fit.error` objective as
+everything above, on far more rows, and it is why the real-data arms live on Slurm. It also means the
+`realign` work above pays off twice: `--unclip` calls it per read.
+
 ## The slowest 20, for reference
 
 ```

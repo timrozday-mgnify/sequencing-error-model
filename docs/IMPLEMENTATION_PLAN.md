@@ -736,7 +736,21 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
 - ✓ **Exit run** on SRR5240881, 20,000 pairs (12 min, dominated by fitting): 97.7% placed, 45 indel-flagged, 13,204 disagreements in 2.44 M overlap bases.
   - On 1,000 held-out pairs, the fitted marginal substitution rate is 0.29% per mate (raw mate disagreement is 0.6% per overlap base).
   - The fitted rate mostly falls as reported Q rises: about 7% at Q14–18, 0.1–0.5% at Q27–33, 0.02% at Q34–37 and 0.001% at Q38–39. Empirical Q is below reported at low Q and above it at the top, consistent with PCR errors cancelling.
-  - **Open, error head position:** the fitted `Position(4)` curve swings from 0 to 6% per 25-bp bin and differs between mates, while the raw disagreement rate is flat at 0.45–0.62% across positions. Fixed-length amplicon reads make `pos_start` and `pos_end` collinear, so the paired splines are unidentified and only L2 pins them. Needs one position axis when read lengths don't vary, or selection to reject it.
+  - ✓ **Error head position: one axis when one read length dominates** (2026-10-14). `pos_end` is
+  `L + 1 - pos_start`, so on fixed-length reads the paired splines are collinear and only L2 pins them -
+  which is what let a fitted `Position(4)` curve swing from 0 to 6% per 25-bp bin while the raw disagreement
+  rate was flat at 0.45-0.62%. `fit.quality._one_axis` now holds the `end` half at zero in **both** heads
+  when the modal read length covers at least `ONE_AXIS_SHARE` (0.99) of rows, leaving `start` to carry the
+  whole curve; the component's shape is unchanged, so `generate` and the spec read it as before. The test is
+  a share rather than equality because a real fixed-length run is not exactly fixed: SRR5240881 is 1,641
+  reads at 151 bases and 317 at 150, collinear to within 1% of rows and just as unidentified, where an exact
+  test would never fire. Test: over a flat truth on fixed-length reads the fitted curve is flat to 10% and
+  the `end` weights are exactly zero, while mixed lengths still fit both halves.
+  - **It constrains the fit only, never evaluation.** The first version applied it in the shared design
+    matrix, which silently zeroed the `end` half of components fitted *elsewhere* - `fit.kmer.position` fits
+    skiver's two position marginals outside `error.fit`, so a default-mode head evaluated on fixed-length
+    rows lost its whole tail rise and the phase 6 composition test caught it. `_design` and `_matrix` now
+    take `fitting`, and only `fit` passes it.
   - **Open, head Q capacity:** on held-out reads the per-position Q TV median is 0.153 (max 0.60 at cycle 41) with `Position(4)`. With `Position(24)` it falls to 0.071 median, max 0.38. MiSeq's cycle-specific Q structure needs per-cycle terms or selection over n. The CLI default is now `Position(48)` (median 0.060); cycles 40–41 remain open (see the head Q table below).
 - HiSeq-like simulation for a merge-rate target: 2×125 pairs from a gut genome (MGYG000175911) with the SRR5240881 spec. Insert mean 294, sd 50 makes ~10% of pairs overlap by ≥ 20 bases. Pilot on a random genome: 9.6% placed, as predicted. On MGYG000175911 (416 contigs), 20,000 pairs gave 10.5% placed and 22 indel-flagged, matching the theoretical 10.5%, so the placement guards cost nothing on this genome.
   - Fitting `pe-overlap` on these pairs takes 9.6 min, mostly head Q on all 5 M bases. On 1,000 held-out simulated pairs against the truth:
@@ -804,14 +818,39 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
     `read_id` is a fork-only path (CLAUDE.md). There, read-level heterogeneity enters **only** as skiver's beta
     - the channel phase 6b item 2 shows is ridge-shrunk and worth 1.6x of level. Cross-mode note: a `Tile` term
     fitted in `pe-overlap` is a direct external check on that beta.
-  - Test: generate pairs with a known per-tile rate ratio and recover it; and confirm a spec without `Tile`
-    fitted on the same pairs reproduces the pooled rate (so the term is identified, not absorbing level).
+  - ✓ **Landed** (2026-10-14). `Tile(n)` is a categorical head E / head Q component (`spec.COMPONENTS`,
+    `fit.error`'s `_ARITY` / `_fields` / `_shapes` / `_design`, `tile` in `observations._FIELD`), built like
+    `Latent(S)` but indexed by an observed field. `pe_overlap.parse_tile` reads it off the read name,
+    `read_pairs(tiles=True)` yields it per pair, `collect` interns the labels in `Evidence.tiles` and the rows
+    carry the index, and `--tiles` on the CLI appends `Tile(n)` with one level per tile observed. Generation
+    draws each read's tile from the component's own `prior` (uniform without one), which `generate(tiles=)`
+    overrides; `fastq_quality.read_fastq_named` is the reader that keeps the name.
+    - Test: pairs drawn with a 3x error-odds difference between two tiles come back within 0.2 of the truth's
+      rate *on the rows the overlap saw* for each tile, with the tile ratio within 0.15 of the truth's, and a
+      head without the term reproduces the pooled rate to 2 % - so it is identified, not absorbing level.
+    - Measured on the way: `pe-overlap` **compresses** a tile ratio, by more at a higher error rate. At a 2.4x
+      true ratio the fit recovers 0.92-0.93 of the truth per tile at ~2 % per base but only 0.79 on the hot
+      tile at ~5 %, because placement drops the noisiest pairs and those are disproportionately the hot
+      tile's. So a `Tile` spread read off a high-error run is a lower bound.
+    - Still refused in default `kmer` mode, with a test to keep it that way: `kvmer.csv` has no read ids or
+      names, and depending on one is a fork-only path.
+    - Fixed on the way: `pe_overlap._posterior` indexed its rows by hardcoded negative offsets, so adding any
+      field silently broke the attribution; it now indexes by field name.
+    - Not done, and the next step: `generate.observations` emits no `tile` field, so a `Tile` spec generates
+      and round-trips but cannot be *scored* through the `reference` path or `recovery.compare` (head E
+      refuses the table for the missing field, which is at least a clear error). `sources.bam` could read the
+      name as `pe_overlap` does, wherever a BAM keeps it.
 - **Open items**, carried forward:
-  - `Tile` above (not started);
-  - error head `Position` splines are unidentified on fixed-length reads;
   - Q38–39 are still ~5.5× too high at ~10% merging;
-  - head Q misfits cycles 40–41 (TV 0.32);
-  - fitting cost (bin or subsample large runs; `Position(48)` doubles head Q time).
+  - head Q misfits cycles 40-41 (TV 0.32). **Attempted locally and abandoned on cost** (2026-10-14): the run
+    is `mock_V3-V4_V9_double_amp_1.fastq.gz`, which is this very dataset, but one `Position(4)` head Q fit on
+    6,000 of its reads (~900 k rows) did not finish in 25 minutes, so the knot sweep this item needs is not a
+    laptop run - it belongs beside the other fitting-cost work (`docs/test_cost.md`). Worth noting before it
+    is rerun: the reads are 1,641 at 151 bases and 317 at 150, so the position-axis fix above now applies to
+    this dataset's head Q too, and the cycle-41 figure predates it;
+  - fitting cost: subsampling is done (`--every-n`, which is also phase 6b item 2's read-selection fix and so
+    the unbiased way to do it); binning is not;
+  - `Tile` and the error head's position axis above are **done** (2026-10-14).
 - **Exit:**
   - ✓ on generated pairs, the substitution part of head E (context, `QualityWindow`, position, mate) and head Q are recovered within the phase 2 tolerances (`tests/test_pe_overlap.py`);
   - ✓ on one real Illumina run, a fitted spec and a report are produced (SRR5240881, above).
@@ -1411,12 +1450,24 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
      Tests: the guard refuses k = 11, warns at 15 and at a lowered `min_k`, and is silent at 21; the k = 11
      fixture tests pass `min_k=11` (`test_multiplicity` shows the fixture's genome is single-locus there).
      **This turns the synthetic loop red**, item 2 below;
-   - a **reference-free multiplicity flag** from `kvmer.csv` alone: the share of a key's observations at values
-     >= 2 edits from consensus (`total_count - consensus_count - neighbor_count`). At k = 11 it is 4.5 % on
-     single-locus keys and 72 % on 5+-locus keys; two independent errors cost the rate squared, so a frequent
-     >= 2-edit value is another locus. It is a function of other values, not of the single-edit outcome head E is
-     fitted on, so it can join `copy_ratio` in the conservative layer of `sites.keys`; its clonal cost is measured
-     as every mask's is;
+   - ✓ **a reference-free multiplicity flag, landed and free on clonal keys** (2026-10-14,
+     `sites.keys(far_fraction=)`, default 0.10, 1.0 switches it off). The share of a key's observations at
+     values >= 2 edits from consensus (`total_count - consensus_count - neighbor_count`): 4.5 % on
+     single-locus keys at k = 11 against 72 % on 5+-locus keys, because two independent errors cost the rate
+     squared. It is a function of the *other* values, not of the single-edit outcome head E is fitted on, so
+     it selects on multiplicity rather than on the rate, which is what lets it sit beside `copy_ratio` in the
+     conservative layer instead of inside the count test. Measured:
+
+     | | keys | far-fraction median / q90 / q99 / max | dropped at 0.10 | level |
+     |---|---|---|---|---|
+     | committed fixture, k = 11, random genome | 713 | 0 / 0.026 / 0.063 / **0.077** | **0 (0 %)** | 1.0021 |
+     | SRR24523812, k = 21, uniform sample | 10,657 | 0 / 0.071 / 0.308 / 0.841 | 323 (3.0 %) | 0.9929 |
+
+     The default sits above the clonal fixture's maximum and the real run's q90 and below its q99, so its
+     clonal cost is **zero keys** where every key is single-locus, and on the real isolate it costs no level
+     (0.9928 to 0.9929) while moving 54 keys out of the count test's `dropped_variant` (261 to 207) and into
+     multiplicity, which is the point of having it in the conservative layer. At 0.05 it starts eating
+     single-locus keys (23 of the fixture's 713);
    - ✓ **rerun of phase 6's real three-mode comparison at k = 17/21/31** (2026-10-08, SRR24523812, the phase 6
      subset and the 1,000,000-pair depth slice, `workflows/hpc`, 137 of 155 sweep rows plus all six real
      comparisons). **At k = 21 the `kmer` level agrees with `reference`**: the fitted spec predicts 0.86 %
@@ -1440,8 +1491,31 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
      position marginal 2.0x `reference`'s (1.20x at k = 11). That shape error is also why `kmer` agrees on
      reference rows but not on `pe-overlap` rows (2.09x `pe-overlap`, 1.52x `reference`-on-those-rows, against
      the modes' own 1.31x evidence gap): only 1,687 of 20,000 pairs overlap at a 365 bp median insert, so
-     overlap rows sit at read ends, where `kmer` over-predicts. To check: the position curve against
-     `reference` restricted to the overlap's own rows;
+     overlap rows sit at read ends, where `kmer` over-predicts.
+     - ✓ **Checked on the full uniform subset, and skiver agrees with `pe-overlap`, not with `reference`**
+       (2026-10-14, 80,397 strided pairs - 7,432 of them overlapping - against 23.9 M `reference` rows from
+       the same reads; `compare.on_support` reweights one table so its `pos_start`/`pos_end` marginal matches
+       another's, leaving every conditional rate alone and moving only the pooled one):
+
+       | skiver's own marginal, recomputed from | per-base Q | read position (start / end) |
+       |---|---|---|
+       | `pe-overlap` rows | **1.013x** | **0.959x / 0.971x** |
+       | `reference` rows | 0.797x | 0.520x / 0.521x |
+       | `reference` rows at the overlap's positions | 0.720x | 0.519x / 0.538x |
+
+       So skiver's reported Q and position marginals sit within 1-4 % of the variant-immune yardstick's, and
+       the 2x gap is against the `reference` pileup - which here is unmasked (no `--mask-alt-freq`, no contig
+       filter) and reads 1.51 % per base against the overlap's 0.87 % and skiver's 0.79 %, so most of that
+       gap is `reference`'s own inflation rather than skiver reading low. **Standardising by position does not
+       close it** (0.520 to 0.519), so the position *marginal* is not where the modes disagree.
+       What position exposure *does* explain is part of the two modes' own gap: `reference` reads **1.368x**
+       `pe-overlap` pooled and **1.674x** at the overlap's own positions, so ~20 % of it is where each mode
+       looks rather than what it sees, and every cross-mode ratio this phase quotes needs standardising
+       first. `compare`'s covariate values now sort numerically (`_order`), since `pos_start` sorted as text
+       interleaves 1, 10, 100, 11 and made these per-position arrays unreadable.
+     - Still to check: `kmer`'s own fitted `Position` component against these curves (the 3-4x-low-at-the-start
+       figure came from the fitted spec, not from skiver's marginal, and this check does not reach it), and
+       the same comparison with `reference` masked as phase 5 masks it;
    - add a `bias.py` collision scenario: a real (repeat-bearing) genome, not a random one, at k = 11/15/21.
 2. **Low level at k = 21 (0.62x).** Candidate causes, each separable:
    - ✓ **measured on synthetic reads: k alone moves the level.** Phase 6's synthetic loop (example spec, 40,000
@@ -2202,9 +2276,39 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
   - **Start it from unfiltered keys.** Per phase 6b item 2, `sites.keys` currently starts from skiver's filter
     at `p0` = 1e-12, which has already discarded the keys most likely to carry the variation it is looking
     for. Start from `--use-all`, or `-e 1e-4`, plus the multiplicity flag.
-  - Test: on the phase 7 grid, censoring recovers the clonal truth's context shape where whole-key discard
-    does not, and costs nothing on the clonal point. Report the context and GC composition of censored
-    positions against discarded keys, as `conservative` already does for sites.
+  - ✓ **Landed, and its cost is a tenth of whole-key discard's; the context *bias* it is meant to fix is not
+    demonstrable on a random-genome fixture** (2026-10-14, `sites.censor` and
+    `fit.kmer.fit(survival=, censored=)`).
+    - `skiver_analyze.tables` now emits the key's `total_count` as `kvmer_survival`'s t = 0 row, which is the
+      universe the running counts live in; `fit.kmer` takes the per-position exposure from that risk set
+      (`N_{K,t-1}`) instead of giving every observation every position, and right-censors the called ones.
+      The exposure change is **opt-in** (`survival=`), since it moves every `kmer` context fit by ~3 % of
+      match odds and that deserves its own measurement; censoring requires it.
+    - `sites.censor` calls positions with the same log Bayes factor and posterior as `joint` and `keys`,
+      alternating with head E refitted on what is left uncensored, starting from **unfiltered** keys with the
+      multiplicity flag excluding collapsed copies.
+    - **The per-op attribution is what makes it work.** A censored position's failure count is known exactly
+      from the running counts; which ops to take it from is not, since the edit-type columns are aggregated
+      over the value. Removing the *posterior's own mass* at that position leaves most of a variant in the fit
+      (a substitution's position posterior spreads over every position carrying its consensus base, so a
+      third at best), and scaling the key's ops proportionally removes the right total from the wrong ops and
+      lets the EM spread the rest. Rescaling the posterior's split **up to the observed count** is what
+      works: on 60 keys carrying a 40 % allele at one position, the three variants leave a mean absolute
+      context log-odds error against the clean fixture of 0.095 (posterior mass), 0.032 (proportional) and
+      **0.019** (rescaled), against 0.099 with no mask at all.
+    - Measured cost: censoring removes 0.65 % of exposure where discarding those keys whole removes 6.8 %, a
+      **10.4x** difference, and on the clean fixture it censors 1 position of 9,269 (0.0098 % of exposure
+      against whole-key discard's 0.109 %).
+    - **But whole-key discard still recovers the context better here** (0.008 against 0.019), because the
+      fixture is a random genome: its dropped keys are not systematically different from the rest, so there
+      is no bias to fix, and 713 keys at 44x absorb losing 60. Planting the allele in the GC-richest keys
+      does not reproduce it either, since a GC-rich *key* still contains every context. **So the claim that
+      whole-key discard biases the surviving context distribution is still untested**, and testing it needs
+      variants sitting in genuinely variable sequence, i.e. the phase 7 grid - which is the HPC run. What is
+      established locally is the mechanism, the per-op attribution it needs, and the exposure arithmetic.
+    - Still to do: the phase 7 grid test above, the context/GC composition report against discarded keys
+      (`_key_composition` reports it, nothing has read it yet), and wiring `censored=` through
+      `sources.kmer.fit`'s CLI.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.
 - **Carried from phase 7**, where a global rate could not show either: the repeat case (a 500 bp copy at 97%
   identity is 1.7% of a 30 kb genome, so it moves no marginal rate even though it is a per-site failure) and

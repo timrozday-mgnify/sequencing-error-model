@@ -73,6 +73,9 @@ class _Loci:
     centre: Array  # [n_loci, v] consensus base index
     total: Array  # [n_loci] observations that matched or carried one edit
     rows: dict[str, tuple[Array, Array]]  # op -> (locus indices, counts)
+    exposure: Array  # [n_loci, v] observations at risk at each value position
+    failed: Array  # [n_loci, v] observations whose *first* mismatch is at that position
+    censored: Array  # [n_loci, v] bool: positions right-censored, contributing neither exposure nor failures
 
 
 def _flank(tokens: Sequence[str]) -> tuple[int, int]:
@@ -85,7 +88,37 @@ def _decode(code: int, width: int) -> str:
     return "".join("ACGT."[(code // 5**i) % 5] for i in range(width - 1, -1, -1))
 
 
-def _prepare(table: CountTable, flank: tuple[int, int]) -> _Loci:
+def _risk_set(survival: CountTable, loci: Mapping[str, int], total: Array, v: int) -> Array:
+    """`N_{K,t}` [n_loci, v + 1] for t = 0..v from `skiver_analyze:kvmer_survival`: who is still matching.
+
+    `consensus_count_up_to_v{t}` is a *running* survival count, so an observation whose first mismatch is at
+    `t` is absent from every later count - skiver's scan stops there. The risk set at position `t` is therefore
+    the count through `t - 1`, and `N_{t-1} - N_t` is the number of observations that failed at `t`. That is
+    the shape right-censoring needs (plan phase 8): a censored position's failures come out of the numerator
+    while the exposure it already contributed stands.
+
+    The universe is the key's `total_count` (the table's t = 0 row), not the single-edit universe head E's
+    error rows live in, because that is what the running counts were taken over. So a value two or more edits
+    from the consensus contributes match exposure up to its own first mismatch and no modelled failure - it is
+    another locus or two independent errors, neither of which head E describes, and the multiplicity flag
+    (`sites.keys`) is what removes the keys where that mass is large.
+    """
+    if tuple(survival.fields) != ("locus", "t", "op"):
+        raise ValueError(f"{survival.source}: a risk set needs fields ('locus', 't', 'op'), got {survival.fields}")
+    counts = np.zeros((len(loci), v + 1))
+    counts[:, 0] = total  # the t = 0 rows below replace this where the table carries them
+    for (locus, pos, _), n in survival.counts.items():
+        if (i := loci.get(str(locus))) is not None:
+            counts[i, int(pos)] = n  # type: ignore[call-overload]
+    return counts
+
+
+def _prepare(
+    table: CountTable,
+    flank: tuple[int, int],
+    survival: CountTable | None = None,
+    censored: Mapping[str, Sequence[int]] | None = None,
+) -> _Loci:
     if tuple(table.fields) != ("locus", "op"):
         raise ValueError(f"{table.source}: kvmer fits need fields ('locus', 'op'), got {table.fields}")
     k, v = int(table.meta["k"]), int(table.meta["v"])
@@ -111,12 +144,36 @@ def _prepare(table: CountTable, flank: tuple[int, int]) -> _Loci:
     padded = np.concatenate([bases, np.full((len(loci), right), 4, np.int64)], axis=1)
     window = padded[:, k - left + np.arange(v)[:, None] + np.arange(width)]  # [n_loci, v, width]
     codes, ctx = np.unique(window @ 5 ** np.arange(width - 1, -1, -1), return_inverse=True)
+    total = np.array([totals[i] for i in range(len(loci))], float)
+    # Without the survival counts, every observation is exposed at every position, as it has always been here.
+    if survival is None:
+        exposure, failed = np.repeat(total[:, None], v, axis=1), np.zeros((len(loci), v))
+    else:
+        at_risk = _risk_set(survival, loci, total, v)
+        exposure, failed = at_risk[:, :v], np.maximum(-np.diff(at_risk, axis=1), 0.0)
+    mask = np.zeros((len(loci), v), bool)
+    if censored:
+        if survival is None:
+            raise ValueError("censoring positions needs the kvmer_survival table, to locate each key's failures")
+        for locus, positions in censored.items():
+            row = loci.get(str(locus))
+            if row is None:
+                continue
+            if bad := [pos for pos in positions if not 1 <= pos <= v]:
+                raise ValueError(f"censored positions {bad} are outside the value's 1..{v}")
+            # Right-censoring: no exposure at the position, and below, no failure attributed to it either.
+            # The exposure its observations contributed at earlier positions stands.
+            mask[row, [pos - 1 for pos in positions]] = True
+        exposure = np.where(mask, 0.0, exposure)
     return _Loci(
         [_decode(int(c), width) for c in codes],
         ctx.reshape(len(loci), v),
         centre,
-        np.array([totals[i] for i in range(len(loci))], float),
+        total,
         {op: (np.array([i for i, _ in r]), np.array([n for _, n in r], float)) for op, r in rows.items()},
+        exposure,
+        failed,
+        mask,
     )
 
 
@@ -150,25 +207,64 @@ def _positions(loci: _Loci, op: str, ratios: Array) -> Array:
     return r if base is None else np.where(loci.centre[loci.rows[op][0]] == base, r, 0.0)
 
 
-def _weights(loci: _Loci, ratios: Array) -> dict[str, Array]:
-    """Per-(locus, op) row, the posterior [rows, v] over the latent position."""
-    out = {}
-    for op in loci.rows:
+def _weights(loci: _Loci, ratios: Array) -> tuple[dict[str, Array], dict[str, Array]]:
+    """Per-(locus, op) row: the posterior [rows, v] over the latent position, and the share of it that is kept.
+
+    At a censored position an observation is not an error, so that position leaves the posterior's support and
+    the op's count is reduced by the mass it held there - *per op*, which is the whole point of doing this
+    inside EM: a variant produces one dominant alt base, and the posterior already knows which ops can sit at
+    the censored position. Scaling every op of the key by one proportional factor instead (the obvious
+    alternative, with no per-position alt identity in the default output) removes the right total from the
+    wrong ops and leaves the variant's own mass to be spread over the key's other positions.
+    """
+    weights, held = {}, {}
+    for op, (rows, n) in loci.rows.items():
         r = _positions(loci, op, ratios)
         total = r.sum(axis=1, keepdims=True)
         if not total.all():
             raise ValueError(f"operation {op!r} counted at a locus with no consensus base it can act on")
-        out[op] = r / total
-    return out
+        w = r / total
+        if loci.censored.any():
+            held[op] = n * np.where(loci.censored[rows], w, 0.0).sum(axis=1)
+            w = np.where(loci.censored[rows], 0.0, w)
+            left = w.sum(axis=1, keepdims=True)
+            w = np.divide(w, left, out=np.zeros_like(w), where=left > 0)
+        weights[op] = w
+    if not loci.censored.any():
+        return weights, {op: np.ones(len(rows)) for op, (rows, _) in loci.rows.items()}
+
+    # How many observations actually failed at the censored positions is *known*, from the running counts, so
+    # that is what leaves the numerator; the posterior only says which ops to take it from. Taking the
+    # posterior's own mass instead would leave most of a variant behind, since an op's position posterior
+    # spreads over every position whose consensus base it can act on (a third of them for a substitution).
+    target = np.where(loci.censored, loci.failed, 0.0).sum(axis=1)
+    mass = np.zeros(len(loci.exposure))
+    for op, (rows, _) in loci.rows.items():
+        np.add.at(mass, rows, held[op])
+    # `target` is how many failed there, `mass` the posterior's own expectation of op mass there, so the
+    # ratio rescales the posterior's split up to the observed count: capping at the posterior's mass instead
+    # would leave most of a variant in the fit, since that mass is a third of a substitution's count at best.
+    share = np.divide(target, mass, out=np.zeros_like(mass), where=mass > 0)
+    keep = {}
+    for op, (rows, n) in loci.rows.items():
+        removed = np.minimum(held[op] * share[rows], n)
+        keep[op] = np.where(n > 0, 1.0 - removed / np.maximum(n, _TINY), 1.0)
+    return weights, keep
 
 
-def _table(table: CountTable, loci: _Loci, flank: tuple[int, int], weights: dict[str, Array]) -> CountTable:
+def _table(
+    table: CountTable,
+    loci: _Loci,
+    flank: tuple[int, int],
+    weights: dict[str, Array],
+    keep: dict[str, Array] | None = None,
+) -> CountTable:
     """Head E rows over contexts: errors split by the position posterior, matches as the leftover exposure."""
     counts: Counter[Key] = Counter()
     n_contexts = len(loci.contexts)
-    match = np.repeat(loci.total[:, None], loci.ctx.shape[1], axis=1)
+    match = loci.exposure.copy()
     for op, (idx, n) in loci.rows.items():
-        w = n[:, None] * weights[op]
+        w = (n if keep is None else n * keep[op])[:, None] * weights[op]
         if _target(op)[1] is not None:  # a substitution or deletion replaces that position's match
             np.add.at(match, idx, -w)
         by_context = np.bincount(loci.ctx[idx].ravel(), w.ravel(), minlength=n_contexts)
@@ -181,9 +277,10 @@ def _table(table: CountTable, loci: _Loci, flank: tuple[int, int], weights: dict
 
 def _log_likelihood(loci: _Loci, p: Array, ratios: Array) -> float:
     """The mixture log-likelihood above, in nats."""
-    ll = float(loci.total @ np.log(np.maximum(p[loci.ctx, 0], _TINY)).sum(axis=1))
-    for op, (_, n) in loci.rows.items():
-        ll += float(n @ np.log(np.maximum(_positions(loci, op, ratios).sum(axis=1), _TINY)))
+    ll = float((loci.exposure * np.log(np.maximum(p[loci.ctx, 0], _TINY))).sum())
+    for op, (idx, n) in loci.rows.items():
+        r = np.where(loci.censored[idx], 0.0, _positions(loci, op, ratios))
+        ll += float(n @ np.log(np.maximum(r.sum(axis=1), _TINY)))
     return ll
 
 
@@ -202,6 +299,8 @@ def fit(
     tol: float = 1e-4,
     l2: float = 1.0,
     seed: int = 0,
+    survival: CountTable | None = None,
+    censored: Mapping[str, Sequence[int]] | None = None,
 ) -> tuple[Component, ...]:
     """Fit head E `tokens` from a `skiver_analyze:kvmer` table by EM over the latent edit position.
 
@@ -209,6 +308,15 @@ def fit(
     the context components `Context(L,R)` and `Homopolymer`. `flank` is the context window the rows carry
     (default: the widest `Context(L,R)`), so `Homopolymer` can be given a wider one. EM stops when the
     log-likelihood gains less than `tol` nats per observation.
+
+    `survival` is `skiver_analyze:kvmer_survival`. Given it, each position's exposure is the key's own risk set
+    `N_{K,t-1}` instead of all its observations, which is what the counts mean: an observation whose first
+    mismatch is at `t` is not observed after it. `censored` then right-censors positions (plan phase 8): a
+    censored position contributes neither exposure nor failures, while the exposure its observations
+    contributed *before* it stands. That is how a polymorphic site is removed without discarding the other
+    ~16 positions of a 34-base key, whose surviving context and GC composition is otherwise biased toward
+    conserved sequence - a bias on the very distribution this project exists to estimate, and one no external
+    source can repair.
     """
     if list(tokens[:1]) != ["QualityWindow(0)"] or not {Component(t).name for t in tokens[1:]} <= {
         "Context",
@@ -216,18 +324,19 @@ def fit(
     }:
         raise ValueError(f"kvmer fits need QualityWindow(0) then Context(L,R)/Homopolymer, got {list(tokens)}")
     window = _flank(tokens) if flank is None else flank
-    loci = _prepare(table, window)
+    loci = _prepare(table, window, survival, censored)
     contexts = _contexts(table, loci, window)
-    weights = _weights(loci, _ratios(np.ones((len(loci.contexts), len(error.CATEGORIES))) / len(error.CATEGORIES)))
+    flat = _ratios(np.ones((len(loci.contexts), len(error.CATEGORIES))) / len(error.CATEGORIES))
+    weights, keep = _weights(loci, flat)
     components: tuple[Component, ...] | None = None
     last = -np.inf
     for _ in range(iterations):
-        rows = _table(table, loci, window, weights)
+        rows = _table(table, loci, window, weights, keep)
         components = error.fit(rows, tokens, (DUMMY_Q,), l2=l2, seed=seed, init=components)
         p = error.probabilities(components, (DUMMY_Q,), contexts)
         ratios = _ratios(p)
         total = _log_likelihood(loci, p, ratios)
-        weights = _weights(loci, ratios)
+        weights, keep = _weights(loci, ratios)
         if total - last < tol * loci.total.sum():
             break
         last = total

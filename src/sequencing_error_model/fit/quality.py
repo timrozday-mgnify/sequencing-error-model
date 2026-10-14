@@ -66,11 +66,34 @@ def _shapes(c: Component, k: int) -> dict[str, tuple[int, ...]]:
     return {"weights": (left + right + 1, 5)}
 
 
+ONE_AXIS_SHARE = 0.99  # rows at the modal read length above which the two position axes count as collinear
+
+
+def _one_axis(pos_start: Array, pos_end: Array) -> bool:
+    """True when one read length dominates, so `pos_end` is `L + 1 - pos_start` for all but a few rows.
+
+    The two position splines are then collinear and only L2 pins them, which is what made a `Position(4)` head
+    swing from 0 to 6 % per 25-bp bin on fixed-length amplicon reads whose raw disagreement rate is flat at
+    0.45-0.62 % (plan phase 4). With one axis the curve is identified: the `end` half is held at zero and
+    `start` carries the whole effect, which `generate` and the spec read unchanged.
+
+    The test is a share rather than equality because real fixed-length runs are not exactly fixed: SRR5240881
+    is 1,641 reads at 151 bases and 317 at 150, which is collinear to within 1 % of rows and just as
+    unidentified, while an exact test would never fire on it. Rows are counted, not reads, so the few short
+    reads carry a few fewer rows each.
+    """
+    total = np.asarray(pos_start) + np.asarray(pos_end)
+    if len(total) == 0:
+        return False
+    counts = np.bincount(total.astype(np.int64))
+    return bool(counts.max() / counts.sum() >= ONE_AXIS_SHARE)
+
+
 def _hat(pos: Array, knots: Array) -> Array:
     return np.stack([np.interp(np.log(pos), knots, e) for e in np.eye(len(knots))], axis=1)
 
 
-def _design(c: Component, rows: _Rows, k: int) -> tuple[Array, Array]:
+def _design(c: Component, rows: _Rows, k: int, fitting: bool = False) -> tuple[Array, Array]:
     """(slot index, value) per row for one component; both [R, J]."""
     n_rows = len(rows.mate)
     if c.name == "QualityMarkov":
@@ -79,7 +102,10 @@ def _design(c: Component, rows: _Rows, k: int) -> tuple[Array, Array]:
         return idx, np.ones(idx.shape)
     if c.name == "Position":
         knots = c.params["knots"]
-        vals = np.hstack([_hat(rows.pos_start, knots), _hat(rows.pos_end, knots)])
+        start, end = _hat(rows.pos_start, knots), _hat(rows.pos_end, knots)
+        if fitting and _one_axis(rows.pos_start, rows.pos_end):  # collinear here: fit one axis only
+            end = np.zeros_like(end)
+        vals = np.hstack([start, end])
         return np.broadcast_to(np.arange(vals.shape[1]), vals.shape), vals
     if c.name == "Mate":
         return (rows.mate - 1)[:, None], np.ones((n_rows, 1))
@@ -102,11 +128,11 @@ def _csr(idxs: Sequence[Array], vals: Sequence[Array], n_rows: int, n_cols: int)
     return sparse.csr_matrix((data.ravel(), columns.ravel(), indptr), shape=(n_rows, n_cols))
 
 
-def _matrix(components: Sequence[Component], rows: _Rows, k: int) -> sparse.csr_matrix:
+def _matrix(components: Sequence[Component], rows: _Rows, k: int, fitting: bool = False) -> sparse.csr_matrix:
     """The design matrix, built straight as CSR (see `fit.error._csr`)."""
     idxs, vals_, offset = [], [], 0
     for c in components:
-        idx, vals = _design(c, rows, k)
+        idx, vals = _design(c, rows, k, fitting)
         idxs.append(offset + idx)
         vals_.append(np.broadcast_to(vals, idx.shape))
         offset += sum(prod(s) for s in _shapes(c, k).values())
@@ -204,7 +230,7 @@ def fit(
             for c in components
         ]
 
-    x = _matrix(components, rows, k)
+    x = _matrix(components, rows, k, fitting=True)
     totals = counts.sum(axis=1)
 
     def objective(flat: Array) -> tuple[float, Array]:

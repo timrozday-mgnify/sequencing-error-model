@@ -1,5 +1,6 @@
 import os
 import shutil
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,7 +9,11 @@ import pytest
 
 from sequencing_error_model import bias, recovery, sites
 from sequencing_error_model import generate as gen
+from sequencing_error_model.fit import kmer
+from sequencing_error_model.fit.quality import Array
+from sequencing_error_model.observations import CountTable
 from sequencing_error_model.sources import bam, skiver_analyze
+from sequencing_error_model.spec import Component
 
 
 def _aln(template: str, read: str, start: int = 0, reverse: bool = False) -> bam.Alignment:
@@ -211,6 +216,116 @@ def test_keys_drops_a_planted_variant_and_leaves_the_clonal_fixture_alone() -> N
     assert set(planted) <= called, sorted(set(planted) - called)
     assert report["dropped_variant"] <= 30 + 2
     assert report["level"] < 0.9  # the planted keys' excess, removed from summary_phred.csv's level
+
+
+def test_the_multiplicity_flag_is_free_on_clonal_keys_and_fires_on_far_values() -> None:
+    """Phase 6b item 1's reference-free multiplicity flag: a key whose observations often sit two or more edits
+    from its consensus is another locus, since two independent errors cost the rate squared.
+
+    The committed fixture is a random genome, so every key is single-locus at k = 11 and the flag must cost
+    nothing: its far mass tops out below the default threshold. Planting one key's mass at a far value fires it,
+    and `far_fraction=1.0` switches it off.
+    """
+    a = skiver_analyze.read_analyze(Path(__file__).parent / "fixtures" / "skiver-v0.3.2" / "analyze")
+    tokens = ["QualityWindow(0)", "Context(1,1)"]
+    _, clean = sites.keys(a, tokens)
+    assert clean["dropped_multi_locus"] == 0
+    assert clean["far_fraction_median"] == 0.0
+    assert abs(clean["level"] - 1) < 0.01  # no level cost, because no key is dropped
+
+    # A far value on one key: a third of its observations two or more edits off, which no error rate explains.
+    r = a.kvmer[0]
+    far = replace(r, total_count=r.total_count + r.consensus_count // 2)
+    planted = replace(a, kvmer=[far, *a.kvmer[1:]])
+    _, report = sites.keys(planted, tokens)
+    assert report["dropped_multi_locus"] == 1
+    # One key of 713 is a small share of a clonal run's far observations, which is the point: clonal far mass
+    # is diffuse and low per key (median 0, max 0.077 here), while a multi-locus key concentrates it.
+    assert 0 < report["far_observations_dropped"] < 0.1
+    assert sites.keys(planted, tokens, far_fraction=1.0)[1]["dropped_multi_locus"] == 0
+    # It selects on the other values, not on the single-edit outcome head E is fitted on, so the level stands.
+    assert abs(report["level"] - 1) < 0.02
+
+
+def _plant_allele(
+    a: skiver_analyze.SkiverAnalyze, keys: set[int], pos: int, frac: float = 0.4
+) -> skiver_analyze.SkiverAnalyze:
+    """Move `frac` of each chosen key's consensus observations onto one alt base at value position `pos`.
+
+    A minor allele as `kvmer.csv` records one: the op count rises, and because the running counts are a
+    *survival* series, every `consensus_count_up_to_v{t}` from `pos` on falls by the same number.
+    """
+    rows = []
+    for i, r in enumerate(a.kvmer):
+        if i not in keys:
+            rows.append(r)
+            continue
+        moved = int(frac * r.consensus_count)
+        base = r.consensus_value[pos - 1]
+        op = f"{base}>{'C' if base == 'A' else 'A'}"
+        rows.append(
+            replace(
+                r,
+                consensus_count=r.consensus_count - moved,
+                neighbor_count=r.neighbor_count + moved,
+                op_counts={**r.op_counts, op: r.op_counts[op] + moved},
+                consensus_count_up_to_v=tuple(
+                    c - moved if t >= pos else c for t, c in enumerate(r.consensus_count_up_to_v, 1)
+                ),
+            )
+        )
+    return replace(a, kvmer=rows)
+
+
+def _kvmer_tables(a: skiver_analyze.SkiverAnalyze) -> tuple[CountTable, CountTable]:
+    tables = {t.source.split(":")[1]: t for t in skiver_analyze.tables(a, use_all=True)}
+    return tables["kvmer"], tables["kvmer_survival"]
+
+
+def _context_log_odds(head: Sequence[Component]) -> Array:
+    w = next(c for c in head if c.name == "Context").params["weights"]
+    return np.asarray(w[..., 1:].sum(axis=-1) - w[..., 0])
+
+
+def test_censoring_a_variant_position_costs_a_tenth_of_discarding_the_key() -> None:
+    """Phase 8: censor the variant position, do not discard the key.
+
+    A 40% allele planted at one value position of 60 keys. Censoring must find those positions, and it must
+    cost an order of magnitude less exposure than dropping the keys whole - a key is k + v bases, so dropping
+    it for one site removes the other positions' observations too. The distortion it leaves on head E's
+    context is measured against the same fit on the clean fixture.
+    """
+    pos = 6
+    a = skiver_analyze.read_analyze(Path(__file__).parent / "fixtures" / "skiver-v0.3.2" / "analyze")
+    tokens = ["QualityWindow(0)", "Context(1,1)"]
+    planted = _plant_allele(a, set(range(60)), pos)
+
+    def head(x: skiver_analyze.SkiverAnalyze, censored: dict[str, list[int]] | None = None) -> tuple[Component, ...]:
+        kv, sv = _kvmer_tables(x)
+        return kmer.fit(kv, tokens, flank=(1, 1), survival=sv, censored=censored)
+
+    censored, report = sites.censor(planted, tokens)
+    planted_loci = {r.key + r.consensus_value for r in planted.kvmer[:60]}
+    assert {k for k, v in censored.items() if pos in v} >= planted_loci
+    # Every call is at the planted position: nothing smeared over the key's other positions.
+    assert {p for k, v in censored.items() if k in planted_loci for p in v} == {pos}
+    assert report["censored_exposure_fraction"] * 8 < report["whole_key_exposure_fraction"]
+
+    truth = _context_log_odds(head(a))
+    naive = np.abs(_context_log_odds(head(planted)) - truth).mean()
+    with_censoring = np.abs(_context_log_odds(head(planted, censored)) - truth).mean()
+    # Censoring removes most of the allele's pull on the context shape, at a tenth of the exposure.
+    assert with_censoring < naive / 3, (with_censoring, naive)
+
+
+def test_censoring_is_nearly_free_on_clonal_keys() -> None:
+    a = skiver_analyze.read_analyze(Path(__file__).parent / "fixtures" / "skiver-v0.3.2" / "analyze")
+    censored, report = sites.censor(a, ["QualityWindow(0)", "Context(1,1)"])
+    assert report["positions"] <= 3  # 713 keys x 13 positions, clonal at ~1.1% error
+    assert report["censored_exposure_fraction"] < 0.001
+    # Whole-key discard would cost an order of magnitude more for the same calls.
+    assert report["whole_key_exposure_fraction"] > 8 * report["censored_exposure_fraction"]
+    assert sum(len(v) for v in censored.values()) == report["positions"]
 
 
 def test_q_diagnostic_and_fit_follow_miscalibrated_q_through_variation(tmp_path: Path) -> None:

@@ -51,6 +51,16 @@ class QualityProfile:
 
 def read_fastq(path: Path) -> Iterator[tuple[str, bytes]]:
     """Yield (bases, Phred scores) per record; iterating the scores gives ints."""
+    for _, seq, qual in read_fastq_named(path):
+        yield seq, qual
+
+
+def read_fastq_named(path: Path) -> Iterator[tuple[str, str, bytes]]:
+    """Yield (name, bases, Phred scores) per record; the name keeps everything after `@`.
+
+    The name is what carries a read's flowcell tile (`sources.pe_overlap.parse_tile`), the one read-level
+    covariate that is observed rather than inferred.
+    """
     with path.open("rb") as fh:
         gz = fh.read(2) == b"\x1f\x8b"
     with gzip.open(path, "rb") if gz else path.open("rb") as fh:
@@ -65,7 +75,7 @@ def read_fastq(path: Path) -> Iterator[tuple[str, bytes]]:
             if qual and not PHRED_OFFSET <= min(qual) <= max(qual) <= PHRED_OFFSET + MAX_Q:
                 raise FastqFormatError(f"{path}:{line + 3}: quality outside Phred+33 0-{MAX_Q}")
             line += 3
-            yield seq.decode("ascii"), qual.translate(_DECODE)
+            yield header[1:].decode("ascii").rstrip(), seq.decode("ascii"), qual.translate(_DECODE)
 
 
 def _reads(paths: Sequence[Path], max_reads: int | None, every_n: int) -> Iterator[tuple[str, bytes]]:

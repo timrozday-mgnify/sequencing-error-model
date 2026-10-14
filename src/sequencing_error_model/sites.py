@@ -271,6 +271,7 @@ def keys(
     *,
     flank: tuple[int, int] | None = None,
     copy_ratio: float = 2.0,
+    far_fraction: float = 0.10,
     prior: float = 1e-3,
     iterations: int = 3,
     threshold: float = 0.5,
@@ -285,6 +286,15 @@ def keys(
     `copy_ratio` is a collapsed copy); skiver's own `-c` sets the depth floor. Linkage needs read ids, which only
     enhanced mode has. The loop starts from skiver's outlier filter (its rejected keys at posterior 1), never
     from Q, and `context_tokens` are `fit.kmer.fit`'s.
+
+    The conservative layer has a second, reference-free member: `far_fraction` drops a key whose observations
+    sit that often at a value **two or more edits** from the consensus
+    (`total_count - consensus_count - neighbor_count`, over `total_count`). Two independent errors cost the
+    per-base rate squared, so a frequent far value is another locus, not noise - measured at 4.5 % of
+    observations on single-locus keys against 72 % on keys at five or more loci (plan phase 6b item 1). It is a
+    function of the *other* values, not of the single-edit outcome head E is fitted on, so it selects on
+    multiplicity rather than on the rate, which is what lets it sit beside `copy_ratio` instead of inside the
+    count test. Set it to 1.0 to switch it off.
 
     Returns `a` with each key's `passes_filter` replaced by the test's verdict, so `sources.kmer.fit` takes it
     unchanged, and a report. `summary_phred.csv`, which sets default mode's level, was counted by skiver over
@@ -307,11 +317,19 @@ def keys(
     median = float(np.median(total))
     copies = (total > copy_ratio * median) | (total * copy_ratio < median)
 
+    far_obs = np.zeros(len(loci))
+    far = np.zeros(len(loci))
+    for r, i in zip(a.kvmer, row_of, strict=True):
+        far_obs[i] = r.total_count - r.consensus_count - r.neighbor_count
+        far[i] = far_obs[i] / max(r.total_count, 1)
+    multi_locus = far > far_fraction
+    conservative = copies | multi_locus
+
     gamma = skiver_drop.astype(float)
     step = 0
     while step < iterations:
         step += 1
-        keep = 1.0 - np.maximum(gamma, copies)
+        keep = 1.0 - np.maximum(gamma, conservative)
         weighted = Counter(
             {k: n * keep[index[str(k[0])]] for k, n in full.counts.items() if keep[index[str(k[0])]] > 0}
         )
@@ -327,8 +345,8 @@ def keys(
         if gap < tol:
             break
 
-    variant = (gamma >= threshold) & ~copies
-    drop = variant | copies
+    variant = (gamma >= threshold) & ~conservative
+    drop = variant | conservative
 
     def edits(which: Array) -> float:
         """The single-edit share of the observations at the keys `which`."""
@@ -341,13 +359,152 @@ def keys(
         "iterations": step,
         "dropped": int(drop.sum()),
         "dropped_multi_copy": int(copies.sum()),
+        "dropped_multi_locus": int(multi_locus.sum()),
         "dropped_variant": int(variant.sum()),
+        "far_fraction": far_fraction,
+        "far_fraction_median": float(np.median(far)),
+        # Of every observation sitting two or more edits off a consensus, the share in keys the flag dropped.
+        "far_observations_dropped": float(far_obs[multi_locus].sum() / max(far_obs.sum(), 1e-12)),
         "skiver_dropped": int(skiver_drop.sum()),
         "both_dropped": int((drop & skiver_drop).sum()),
         "level": edits(~drop) / max(edits(~skiver_drop), 1e-12),
     }
     tested = [replace(r, passes_filter=not drop[i]) for r, i in zip(a.kvmer, row_of, strict=True)]
     return replace(a, kvmer=tested), report
+
+
+def censor(
+    a: SkiverAnalyze,
+    context_tokens: Sequence[str],
+    *,
+    flank: tuple[int, int] | None = None,
+    use_all: bool = True,
+    far_fraction: float = 0.10,
+    prior: float = 1e-3,
+    iterations: int = 3,
+    threshold: float = 0.5,
+    tol: float = 1e-3,
+) -> tuple[dict[str, list[int]], dict[str, Any]]:
+    """Variant *positions* inside `kvmer.csv` keys, to right-censor rather than drop the key (plan phase 8).
+
+    `keys` and skiver's own outlier filter both work at key granularity - a key is kept whole or dropped whole -
+    so both inherit the same bias: a key is k + v bases of observation, and dropping it for one polymorphic
+    site removes the other positions' exposure too. Because polymorphic keys sit in variable sequence, the
+    survivors are biased toward **conserved** sequence, whose context and GC composition differ from the
+    genome's. That is a sampling bias on the context distribution, which is the thing this project exists to
+    estimate, and unlike the level no external source can repair it.
+
+    `consensus_count_up_to_v{t}` is a running survival count, so `N_{K,t-1} - N_{K,t}` is the number of
+    observations whose *first* mismatch is at position `t`, over a risk set of `N_{K,t-1}`. This tests that
+    count per position against head E's own predicted hazard for that key's context there, with the same
+    log Bayes factor and posterior as `joint` and `keys`, alternating with head E refitted on what is left
+    uncensored. `fit.kmer.fit(survival=, censored=)` consumes the result.
+
+    What is **not** available in the default output is the per-position alt identity: `kvmer.csv`'s edit-type
+    columns are aggregated over the whole value, so a sharp single-position deficit cannot be told from one
+    dominant alt base (a variant) against mass spread over the ~11 neighbour types (error). A sharp deficit
+    is therefore suggestive, not conclusive, and it is why `fit.kmer` splits a censored position's removal
+    across the key's ops in proportion. That concentration test is the one place a fork addition would pay
+    for itself on substitutions (phase 12).
+
+    Starts from **unfiltered** keys (`use_all`), since skiver's own `p0` = 1e-12 has already discarded the
+    keys most likely to carry the variation this is looking for (plan phase 6b item 2), with the
+    reference-free multiplicity flag (`far_fraction`, as in `keys`) excluding the collapsed copies instead.
+    """
+    full = next(t for t in skiver_analyze.tables(a, use_all=use_all) if t.source.endswith(":kvmer"))
+    survival = next(t for t in skiver_analyze.tables(a, use_all=use_all) if t.source.endswith(":kvmer_survival"))
+    window = kmer._flank(context_tokens) if flank is None else flank
+    loci = kmer._prepare(full, window, survival)
+    order = list(dict.fromkeys(str(locus) for locus, _ in full.counts))
+    v = loci.ctx.shape[1]
+
+    risk = loci.exposure  # N_{K,t-1}
+    failed = np.maximum(
+        -np.diff(np.concatenate([risk, risk[:, -1:] - _last_failures(a, order, use_all)], axis=1), axis=1), 0.0
+    )
+    index = {locus: i for i, locus in enumerate(order)}
+    multi = np.zeros(len(order), bool)
+    for r in a.kvmer:
+        row = index.get(r.key + r.consensus_value)
+        if row is not None:
+            far = (r.total_count - r.consensus_count - r.neighbor_count) / max(r.total_count, 1)
+            multi[row] = far > far_fraction
+
+    gamma = np.zeros((len(order), v))
+    step = 0
+    while step < iterations:
+        step += 1
+        censored = {
+            order[i]: [int(t) + 1 for t in np.flatnonzero(gamma[i] >= threshold)]
+            for i in np.flatnonzero((gamma >= threshold).any(axis=1))
+        }
+        head = kmer.fit(full, context_tokens, flank=window, survival=survival, censored=censored)
+        p = error.probabilities(head, (kmer.DUMMY_Q,), kmer._contexts(full, loci, window))
+        hazard = np.clip(1.0 - p[loci.ctx, 0], 1e-9, 0.5)
+        d = np.maximum(risk, 1.0)
+        p1 = np.clip(failed / d, hazard, 1 - 1e-9)
+        log_bf = failed * np.log(p1 / hazard) + (d - failed) * (np.log1p(-p1) - np.log1p(-hazard))
+        moved = special.expit(np.log(prior / (1 - prior)) + log_bf)
+        moved[multi] = 0.0  # a collapsed copy is the conservative layer's business, not a position's
+        gap = float(np.abs(moved - gamma).max())
+        gamma = moved
+        if gap < tol:
+            break
+
+    called = gamma >= threshold
+    out = {order[i]: [int(t) + 1 for t in np.flatnonzero(called[i])] for i in np.flatnonzero(called.any(axis=1))}
+    report = {
+        "keys": len(order),
+        "use_all": use_all,
+        "iterations": step,
+        "positions": int(called.sum()),
+        "position_exposure": float(risk.sum()),
+        "censored_exposure_fraction": float(risk[called].sum() / max(risk.sum(), 1e-12)),
+        "keys_touched": int(called.any(axis=1).sum()),
+        "dropped_multi_locus": int(multi.sum()),
+        # What whole-key discard would have cost instead: every position of every key with a called one.
+        "whole_key_exposure_fraction": float(risk[called.any(axis=1)].sum() / max(risk.sum(), 1e-12)),
+        "composition": _key_composition(loci, order, called, window),
+    }
+    return out, report
+
+
+def _last_failures(a: SkiverAnalyze, order: Sequence[str], use_all: bool) -> Array:
+    """Observations failing at the final value position, which no later running count reveals."""
+    index = {locus: i for i, locus in enumerate(order)}
+    out = np.zeros((len(order), 1))
+    for r in a.kvmer:
+        if (use_all or r.passes_filter) and (i := index.get(r.key + r.consensus_value)) is not None:
+            out[i, 0] = max(r.consensus_count_up_to_v[-1] - r.consensus_count, 0)
+    return out
+
+
+def _key_composition(loci: "kmer._Loci", order: Sequence[str], called: Array, flank: tuple[int, int]) -> dict[str, Any]:
+    """Context and GC composition of censored positions against the keys whole-key discard would remove.
+
+    The point of censoring is that these two differ: if the censored positions' contexts look like the genome's
+    while the discarded keys' do not, whole-key discard was biasing head E's context distribution and censoring
+    is not (plan phase 8, which asks for exactly this comparison, as `conservative` already reports for sites).
+    """
+    gc = np.array([(s.count("G") + s.count("C")) / len(s) for s in order])
+    keys_touched = called.any(axis=1)
+
+    def shares(sel: Array) -> dict[str, float]:
+        if not sel.any():
+            return {}
+        counts = np.bincount(loci.ctx[sel].ravel(), minlength=len(loci.contexts)).astype(float)
+        total = counts.sum()
+        return {loci.contexts[i]: float(counts[i] / total) for i in np.argsort(-counts)[:8]}
+
+    everything = np.ones_like(called, bool)
+    return {
+        "flank": list(flank),
+        "top_contexts_all": shares(everything),
+        "top_contexts_censored": shares(called),
+        "top_contexts_whole_keys": shares(np.repeat(keys_touched[:, None], called.shape[1], axis=1)),
+        "gc_mean_all": float(gc.mean()),
+        "gc_mean_touched_keys": float(gc[keys_touched].mean()) if keys_touched.any() else float("nan"),
+    }
 
 
 def q_diagnostic(alignments: Iterable[Alignment], masks: dict[str, Array] | None) -> dict[str, dict[int, Any]]:

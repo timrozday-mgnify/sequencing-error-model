@@ -323,5 +323,7 @@ def tables(a: SkiverAnalyze, use_all: bool = False) -> list[CountTable]:
         table("spectrum_by_t", ("context", "t", "op"), "error", (((context(r.op, r.prev_base, r.next_base), t - k, r.op), n) for r in a.spectrum_by_t for t, n in r.freq_at_t.items()), flank=(1, 1)),
         # "=" counts values matching the consensus throughout; single-edit op counts have a latent t
         table("kvmer", ("locus", "op"), "value", (((r.key + r.consensus_value, op), n) for r in passing for op, n in (("=", r.consensus_count), *r.op_counts.items()))),
-        table("kvmer_survival", ("locus", "t", "op"), "value", (((r.key + r.consensus_value, t, "="), n) for r in passing for t, n in enumerate(r.consensus_count_up_to_v, 1))),
+        # t = 0 is `total_count`: everything at risk before the first value position, which is the universe
+        # the running counts live in (they include values two or more edits from the consensus).
+        table("kvmer_survival", ("locus", "t", "op"), "value", (((r.key + r.consensus_value, t, "="), n) for r in passing for t, n in enumerate((r.total_count, *r.consensus_count_up_to_v)))),
     ]  # fmt: skip

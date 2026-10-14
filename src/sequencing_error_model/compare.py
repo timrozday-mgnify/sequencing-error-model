@@ -72,6 +72,37 @@ def _exposure(table: CountTable, by: Sequence[str], indels: bool = False) -> dic
     return out
 
 
+def on_support(table: CountTable, like: CountTable, by: Sequence[str] = ("pos_start", "pos_end")) -> CountTable:
+    """`table` with every row reweighted so its `by` marginal matches `like`'s, and rows outside `like` dropped.
+
+    It answers "what would this comparison read if these rows sat where the other mode's rows sit". That is the
+    question phase 6b item 1 leaves open: only 1,687 of 20,000 pairs overlap at a 365 bp median insert, so
+    `pe-overlap` rows sit at the read ends, exactly where `kmer`'s position shape is wrong (3-4x low at the
+    start, 1.5-2x high at the end) - which would explain why `kmer` agrees with `reference` on reference rows
+    (1.52x) but not on overlap rows (2.09x) without any of its other components being at fault.
+
+    Standardisation, not selection: a kept row's count is scaled by `like`'s share of its `by` value over
+    `table`'s own, so the result has `table`'s rates conditional on `by` and `like`'s exposure over `by`. Rates
+    *within* a `by` value are therefore untouched, and only the pooled rate moves.
+    """
+    if missing := sorted((set(by) - set(table.fields)) | (set(by) - set(like.fields))):
+        raise ValueError(f"{table.source} and {like.source}: no fields {missing}")
+    idx, like_idx = [table.fields.index(f) for f in by], [like.fields.index(f) for f in by]
+    here: Counter[Key] = Counter()
+    for k, n in table.counts.items():
+        here[tuple(k[i] for i in idx)] += n
+    there: Counter[Key] = Counter()
+    for k, n in like.counts.items():
+        there[tuple(k[i] for i in like_idx)] += n
+    if not (shared := here.keys() & there.keys()):
+        raise ValueError(f"{table.source} and {like.source} share no values of {list(by)}")
+    hn, tn = sum(here[v] for v in shared), sum(there[v] for v in shared)
+    scale = {v: (there[v] / tn) / (here[v] / hn) for v in shared}
+    kept = _counts((k, n * scale[v]) for k, n in table.counts.items() if (v := tuple(k[i] for i in idx)) in scale)
+    meta = {**table.meta, "standardised_to": like.source, "standardised_by": list(by)}
+    return replace(table, source=f"{table.source}:on({like.source})", counts=kept, meta=meta)
+
+
 def evidence(
     a: CountTable,
     b: CountTable,
@@ -81,7 +112,7 @@ def evidence(
 ) -> dict[str, Any]:
     """Substitution rates of two tables on the covariate values both observe, standardised to pooled exposure."""
     ea, eb = _exposure(a, by, indels), _exposure(b, by, indels)
-    shared = sorted((k for k in ea.keys() & eb.keys() if min(ea[k][0], eb[k][0]) >= min_exposure), key=str)
+    shared = sorted((k for k in ea.keys() & eb.keys() if min(ea[k][0], eb[k][0]) >= min_exposure), key=_order)
     if not shared:
         raise ValueError(f"{a.source} and {b.source} share no values of {list(by)} with {min_exposure} rows each")
     w = np.array([ea[k][0] + eb[k][0] for k in shared])
@@ -278,8 +309,24 @@ def models(a: ErrorModelSpec, b: ErrorModelSpec, table: CountTable, by: str = "q
     }
 
 
+def _order(key: Key) -> tuple[Any, ...]:
+    """Sort key for covariate values: numbers in numeric order, everything else after them, as text.
+
+    `pos_start` runs 1..150, and sorting those as strings interleaves 1, 10, 100, 11 - which made the
+    per-position arrays in these reports unreadable and easy to misplot (plan phase 6b item 1).
+    """
+    out: list[tuple[int, float, str]] = []
+    for part in key:
+        text = str(part)
+        try:
+            out.append((0, float(text), ""))
+        except ValueError:
+            out.append((1, 0.0, text))
+    return tuple(out)
+
+
 def _values(key: "np.ndarray[Any, Any]") -> list[str]:
-    return sorted(set(key.tolist()), key=lambda v: (len(v), v))
+    return sorted(set(key.tolist()), key=lambda v: _order((v,)))
 
 
 def _rates(p: "list[np.ndarray[Any, Any]]", n: "np.ndarray[Any, Any]", sel: "np.ndarray[Any, Any]") -> list[float]:
@@ -463,7 +510,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "components": components(k, other, t, min_exposure=args.min_exposure),
                 "models": models(k, other, t),
             }
-            for name, other, t in (("overlap", a, overlap), ("reference", b, reference))
+            for name, other, t in (
+                ("overlap", a, overlap),
+                ("reference", b, reference),
+                # The same reference rows, standardised to where the overlap rows sit: phase 6b item 1's
+                # open check on whether `kmer`'s position shape accounts for the two modes disagreeing.
+                ("reference_on_overlap_positions", b, on_support(reference, overlap)),
+            )
         }
         if args.generated_reads:
             report["kmer"]["generated"] = {
