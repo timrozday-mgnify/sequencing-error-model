@@ -425,3 +425,71 @@ def test_predicted_shares_reproduce_the_single_edit_counts_under_the_true_head()
     insertion = np.array([op.startswith("->") for op in ops])
     for which in (~insertion, insertion):  # substitutions and deletions, then insertions
         assert abs(expected[:, which].sum() / observed[:, which].sum() - 1) < 0.08
+
+
+def test_pinned_beta_reproduces_skivers_own_level() -> None:
+    """The parameterisation check: `h(1)` at skiver's own `beta`, from its own window, is its reported rate.
+
+    If this drifts, `refit_level` is reading `hazard_rate.csv` under a different Weibull convention than
+    skiver writes it, and every level ratio below it is meaningless.
+    """
+    analyze = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    report = kmer.refit_level(analyze, betas=(analyze.error_rate.beta,))
+    at_skivers_beta = next(iter(report["pinned_beta"].values()))
+    assert at_skivers_beta == pytest.approx(analyze.error_rate.per_base_error_rate, rel=0.25)
+    # The band is monotone in beta: a lower beta extrapolates further, so it lifts the level.
+    band = kmer.refit_level(analyze, betas=(1.0, 0.9, 0.8))["pinned_beta"]
+    assert list(band.values()) == sorted(band.values())
+    assert band["1.00"] < band["0.80"] / 1.5  # beta is worth multiples of level, not percents
+
+
+def test_the_estimates_agree_on_a_flat_synthetic_truth() -> None:
+    """The fixture's reads have a homogeneous rate, so `beta` is ~1, no lift is applied, and all four
+    estimates should land together. Where they split is real data, where `beta` < 1 and the level is
+    extrapolation (plan phase 6b item 2) - so a split *here* means an estimator is wrong, not that the
+    data is heterogeneous."""
+    analyze = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    report = kmer.levels(analyze)
+    skiver = analyze.error_rate.per_base_error_rate
+    assert report["beta"]["estimate"] == pytest.approx(1.0, abs=0.05)
+    for name in ("kvmer", "position"):
+        assert report[name]["ratio_to_skiver"] == pytest.approx(1.0, rel=0.15), name
+    # The unpenalised slope agrees with skiver's ridge-fit one well inside its own standard error here.
+    ols = report["refit"]["ols"]
+    assert abs(ols["beta"] - analyze.error_rate.beta) < 2 * ols["beta_se"]
+    assert report["position"]["ratio_to_skiver"] == pytest.approx(report["position"]["per_base_rate"] / skiver)
+    # The fit-free count is exactly summary_read_position.csv's own arithmetic, from the start rows only.
+    rows = [r for r in analyze.read_position if r.from_start]
+    errors = sum(r.num_error for r in rows)
+    assert report["position"]["per_base_rate"] == pytest.approx(errors / (errors + sum(r.num_correct for r in rows)))
+    assert report["beta"]["estimate"] == analyze.error_rate.beta
+
+
+def test_kvmer_level_counts_single_edits_over_the_running_risk_set() -> None:
+    analyze = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    passing = [r for r in analyze.kvmer if r.passes_filter]
+    report = kmer.kvmer_level(analyze)
+    assert report["keys"] == len(passing)
+    assert report["single_edit_values"] == sum(r.neighbor_count for r in passing)
+    # Exposure is bounded by the v positions of every at-risk observation, and exceeds the first position's.
+    at_risk = sum(r.consensus_count + r.neighbor_count for r in passing)
+    assert at_risk < report["exposure"] <= at_risk * analyze.v
+    assert kmer.kvmer_level(analyze, use_all=True)["keys"] == len(analyze.kvmer)
+
+
+@pytest.mark.parametrize("source", kmer.LEVEL_SOURCES)
+def test_level_ratio_rescales_one_level_and_keeps_the_q_shape(source: str) -> None:
+    analyze = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    ratio = kmer.level_ratio(analyze, source)
+    assert ratio > 0
+    assert (ratio == 1.0) == (source == "skiver")
+    scaled = [b.per_base_error_rate * ratio for b in analyze.phred if b.num_correct + b.num_error > 0]
+    unscaled = [b.per_base_error_rate for b in analyze.phred if b.num_correct + b.num_error > 0]
+    # One factor on every bin: the ratios between Q bins, which is skiver's shape, are untouched.
+    np.testing.assert_allclose(np.diff(np.log(scaled)), np.diff(np.log(unscaled)))
+
+
+def test_level_ratio_rejects_an_unknown_source() -> None:
+    analyze = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    with pytest.raises(ValueError, match="level source must be one of"):
+        kmer.level_ratio(analyze, "weibull")
