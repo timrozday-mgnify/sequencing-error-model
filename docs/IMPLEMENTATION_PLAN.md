@@ -21,7 +21,7 @@ Out of scope: signal-level simulation (squigulator, seq2squiggle), variant calli
 |---|---|---|---|---|
 | **`pe-overlap`** | Agreement of R1 and R2 where they overlap | paired FASTQ | No | Illumina (inserts short enough to overlap) |
 | **`reference`** | Alignment to a reference: an external genome, a spike-in or mock community (PhiX, lambda, ZymoBIOMICS), or a polished self-assembly of the sample | FASTQ + reference or contigs + BAM/CRAM | Yes, but the sample's own assembly counts | all |
-| **`kmer`** | skiver (k,v)-mer consensus | skiver outputs + raw FASTQ | No | all |
+| **`kmer`** | skiver (k,v)-mer consensus | skiver outputs + raw FASTQ | No, or a *lite* reference (below) | all |
 
 The `kmer` mode has two skiver builds:
 
@@ -31,6 +31,38 @@ The `kmer` mode has two skiver builds:
 | **enhanced** | `skiver dump` per-observation outputs (plus the default inputs) | modified skiver: a new, minimal fork of GZHoffie/skiver, seeded from the `timrozday-mgnify/skiver` fork (§12, decision 5) |
 
 "Default mode" and "enhanced mode", here and in the repo, mean the `kmer` mode on these two builds.
+
+**The lite-reference arm** (added 2026-10-13), orthogonal to the build axis and **kept separate so the two can
+be compared**, which is the whole point of having it. Strict reference-freeness is a desirable default, not a
+constraint: passing skiver a handful of genomes with `-r` changes three things at once, and they are not all
+costs.
+
+| | reference-free (`kmer` default) | lite-reference arm |
+|---|---|---|
+| consensus | the read-vote majority value | **the reference's value** (§2.2 of the preprint) |
+| coverage floor | `-l 10` | `-l 1` (0 in v0.3.2), so **the low-abundance tail becomes profilable** |
+| repeat keys | removed by the count-deficit filter, with its bias | removed because the *reference* shows the key at several loci |
+| outlier filter | on | **off by default** - so none of its bias applies |
+
+So the arm trades one failure mode for another: it removes the coverage floor, the multiplicity problem
+(phase 6b item 1) and the whole outlier-filter bias (phase 6b item 2, phase 8) at a stroke, and in exchange
+**strain divergence from the reference counts as sequencing error** - the preprint's Fig 3.B, where the
+estimate nearly doubles as reference ANI falls to 96%. Three consequences worth stating up front:
+
+- **"Lite" means few genomes, not a reduced gene set.** A marker-gene reference is the wrong kind: markers are
+  conserved in protein, not in nucleotide k-mers, so a marker reference at 95% nucleotide identity would make
+  ~5% of bases look like errors against a ~0.5% error rate (phase 11's follow-up has the arithmetic). The right
+  lite reference is whole genomes of the species actually present, at high ANI.
+- **A profiler can select it**, which is what makes the arm cheap: sylph names the genomes that match and
+  reports their ANI, so the reference is fetched per sample rather than maintained as a database, and the
+  ANI it reports is the guard on whether the arm is safe for that genome (phase 11).
+- **It can be mixed per key without a fork**: run both arms and merge `kvmer.csv` per key, preferring the
+  reference arm's consensus only where the profile places that genome above an ANI threshold. That is the same
+  shape as the existing `sites.*` masks, which already replace per-key verdicts.
+
+The preprint's own numbers support the arm on near-clonal data: skiver-with-reference has the lower MSE_S in
+five of seven datasets (its Table 2), and on *B. subtilis* RSII it lands closer to BEST than default mode does
+(0.1141 against 0.1503, BEST 0.1033).
 
 **One model, three kinds of evidence.** All modes reduce to the same observation schema (§7) and fit the same two heads with the same component vocabulary (§5.4). They differ only in which components they identify (§5.6, §8). That makes cross-mode comparison a validation tool:
 
@@ -409,6 +441,64 @@ Feasible, in stages:
 - **`kmer` default mode** yields a context-aware error head with a centre-quality term, plus a realistic quality process. Generation outputs full FASTQ (bases + qualities) for the native generator. Credible Illumina exports and a context-preserving Badread export follow.
 - **The full base × quality-window model** from reference-free k-mer evidence needs per-observation quality windows, i.e. enhanced skiver. For Illumina, `pe-overlap` already supplies them reference-free; `reference` and duplex supply them for all platforms. Long-read realism (homopolymers, indel lengths, read-level regimes) needs the same.
 
+#### 6.5.1 Decision gate: is `kmer` default mode worth keeping? (open, **top priority**)
+
+Set 2026-10-13. Everything measured since phase 6b reopened has narrowed what default mode can be trusted
+for, and the question is now a keep/narrow/drop decision rather than a remediation backlog. **Nothing in
+phases 9-11 should start before this gate closes.**
+
+**What default mode uniquely buys**: an error and quality model with no reference, no alignment and no
+assembly, cheaply. That is worth a lot for long reads and for single-end or non-overlapping paired Illumina.
+It is worth much less for *this* project's Illumina-first case, because `pe-overlap` is **also**
+reference-free, is variant-immune by construction (both mates must agree), and gives exact positions and
+full quality windows, which default mode cannot (§6.2, §8). So the honest niche is: **no reference, and
+either long reads or Illumina whose mates do not overlap.**
+
+**What is known to be wrong with it**, all measured:
+
+| finding | size | where |
+|---|---|---|
+| level set by `beta`, which ridge shrinks toward 1 | 1.6x | phase 6b item 2 |
+| level moves with the outlier threshold `p0` | 22% over 1e-12 to 1e-2 | phase 6b item 2 |
+| whole-key discard biases surviving context toward conserved sequence | not yet sized | phase 8 |
+| no read ids, so no `Latent(S)`, no `Tile`, no per-read anything | heterogeneity only via `beta` | §8, phase 4 |
+| blind to minor alleles below ~10% allele fraction at realistic coverage | structural | `docs/skiver_paper_review.md` §3.2 |
+| **spectrum and op composition are invariant to all of the above** | 3 digits | phase 6b item 2 |
+
+That last row is the one that points at the answer: **what survives in default mode is the spectrum and the
+context, not the level.**
+
+**The gate.** Run the phase 7 long-tail scenario (below, also promoted to priority) on **the same reads**,
+and compare each head E component against the clonal truth, for **four** arms: `pe-overlap`, `reference`,
+`kmer` reference-free, and `kmer` with a lite reference (§1.1). The fourth arm is in the gate because it
+removes three of default mode's defects outright - the `-l` floor, the multiplicity problem and the entire
+outlier-filter bias - in exchange for one, strain divergence counting as error. If the reference-free arm
+fails and the lite-reference arm passes, the answer is not "drop `kmer`" but "`kmer` needs a handful of
+genomes", which is a different and much weaker claim than needing a full reference database. Outcomes, read
+per arm:
+
+- **(a) Keep as a first-class mode** - level within the phase 2 tolerances after `sites.keys`, and context and
+  spectrum within tolerance. Default mode then stands alone.
+- **(b) Narrow to a spectrum-and-context source** - level fails but spectrum, op composition and context hold.
+  Default mode then supplies those and takes its level from `pe-overlap` or `reference`;
+  `sources.kmer.fit(level=...)` and `sites.keys`'s `level` ratio are already the hook. **This is where the
+  present evidence points.**
+- **(c) Drop default mode** - no component beats `reference` + `pe-overlap` on the long-tail scenario. Then
+  §1.1's third mode goes, `sources/kmer.py` and `sites.keys` stay only as a diagnostic, and enhanced mode
+  (phase 12) is reconsidered on its own merits, since read ids remove most of the table above.
+- **(d) Keep only with a lite reference** - the reference-free arm fails and the lite-reference arm holds.
+  Then the `kmer` mode's niche narrows from "no reference" to "no *complete* reference database, and no
+  alignment or assembly", which is still worth having: it is the difference between needing a profiler's
+  handful of matched genomes and needing the sample's strains in a curated database. Record the ANI floor at
+  which the arm stops working, since that is the number that decides whether a profiler can supply it.
+
+**Exit of the gate**: the long-tail scenario measured for all three modes, each component labelled (a)/(b)/(c),
+and §1.1, §6.5 and §8 rewritten to match. Until then, treat default-mode numbers as provisional.
+
+Phase 11 carries one follow-up that could later reopen a narrowed or dropped verdict - a taxonomic or
+functional profile supplying the dominant-genome depth and expected-diversity priors default mode cannot see.
+It is explicitly **not** an input to this gate: decide on what exists now.
+
 ### 6.6 Biological variation vs sequencing error
 
 In a metagenome, a read can differ from its "truth" because of an error, or because the molecule really differs from that truth: a co-existing strain, a minor within-population allele, a divergent repeat copy or paralog, or an unpolished consensus. Counted as errors, these inflate head E, and not evenly. Variation concentrates in particular genes, contexts (transitions, third codon positions) and coverage levels, so it biases context and op composition as well as the rate.
@@ -523,6 +613,7 @@ Principles:
 | GC | ✓ | ✓ | ✓ | ✓ | ✓ | native |
 | Clustering β | within overlap | ✓ | ✓ | ✓ | approx. | PBSIM3 (2-state approximation), native |
 | `Latent(S)` shared by E and Q | – (short span) | ✓ | – | ✓ (needs Q in `windows.bin`) | ✓ | PBSIM3 QSHMM/ERRHMM, native |
+| `Tile` (read-level heterogeneity, *observed*: lane/tile parsed from the read name) | ✓ (label needs no span) | ✓ (redundant with `Latent(S)`) | – (no read ids) | ✓ | ✓ (needs a tile prior) | native only |
 | Homopolymer / indel length | – | ✓ | coarse | ✓ (needs new fork outputs) | ✓ | Badread (via k-mers), native |
 | Fragment overdispersion, R1/R2 | R1/R2 ✓ | ✓ | – | ✓ | training only / R1–R2 profiles | ART/ISS/NEAT R2 profiles |
 
@@ -531,6 +622,8 @@ Principles:
 ## 9. Phases
 
 Each phase lands as one or more PRs with green CI. Exit criteria are testable. The order follows §1.1: the model and generator (phases 2–3), then `pe-overlap` and `reference` (4–5), then `kmer`, checked against both (6). Phases 3–6 establish each mode on clonal simulations and near-clonal real data (isolates, spike-ins, amplicon mocks). Biological variation is then simulated (7) and separated from error (8) before any exit depends on a real metagenome (§6.6).
+
+**Current priority order** (set 2026-10-13), ahead of the phase numbering: (1) phase 6b item 2's level work and the `p0` / censoring items below, (2) phase 7's long-tail scenario, (3) phase 8's `sites.keys` at position granularity, (4) **§6.5.1's decision gate on whether `kmer` default mode is kept, narrowed or dropped**. Phases 9-11 wait on that gate: there is no point exporting or joint-fitting a mode that may not survive it. `reference` and `pe-overlap` are unaffected and remain the yardstick either way.
 
 ### Phase 0: repository, CI and PR policy ✓
 uv/ruff/mypy/pytest, pre-commit (revs standardised with the MIMICC/ENA repos), Linting, Testing and Release workflows, PR template, and a `main` ruleset requiring PRs with passing `lint` + `test`.
@@ -654,7 +747,32 @@ Landed before the evidence modes were added. The FASTQ statistics and the schema
   A second lag and linear knot spacing don't help; more log-spaced knots do. **Open:** cycles 40–41 still reach TV 0.32 at 48 knots, a narrow cycle-specific dip that a spline can't follow. It needs a per-cycle term or knots chosen by selection.
 - ✓ **Q smoothing of head E** (`fit.error.fit(smooth=, window_l2=)`, tables above) is the `pe-overlap` default.
 - Reported, not blocking: run ErrorProfiler on the same data and compare its substitution × Q tables.
+- **`Tile`: read-level heterogeneity as an observed covariate** (added 2026-10-13, from the skiver review's
+  block measurement; `docs/skiver_paper_review.md` C7a). On ERR2935851, three *equal-sized* read sets from the
+  same run give per-base rates of 0.008081 (first 2.57 M reads), 0.005100 (every 9th read) and 0.003208 (last
+  2.57 M reads) - **2.5x from flowcell position alone**, with skiver's beta moving inversely (0.918 / 0.934 /
+  0.954). That is between-read heterogeneity, which `Latent(S)` already models as an unobserved mixture - but
+  §8 marks `Latent(S)` unavailable here, because inferring a class needs more observations per read than an
+  overlap provides. **An observed label needs none**, and Illumina read names already carry it:
+  `HWI-C00124:212:C9T75ANXX:4:1101:3159:2229` is `instrument:run:flowcell:lane:tile:x:y`. So `Tile` is the one
+  place an observed covariate beats the latent one, and `pe-overlap` is the mode that gains.
+  - Shape: a per-read observed covariate binned like `GC`, which is the template end to end - `gc` in
+    `observations._FIELD`, `GC` in `spec.COMPONENTS` (heads `EQ`), `_ARITY` / `extra` / the knot-interpolation
+    branch in `fit/error.py`, and a knot vector in the spec. Categorical or binned, **not** an assumed monotone
+    drift: file order only approximates tile order, and three points do not establish a ramp.
+  - Generation needs a prior over tiles, structurally identical to `Latent`'s class prior. Export is native-only
+    (no wrapper takes a per-read class except PBSIM3's HMMs, which `Latent(S)` already serves).
+  - What it does **not** buy: a better marginal rate. The 2.5x above is a *sampling* artifact, cured by
+    sampling reads uniformly (phase 6b item 2), not by a model term. `Tile` buys reproducing the real spread in
+    generated reads, identifiability of beta by making part of it observed, and heterogeneity in `pe-overlap`.
+  - Unavailable in default `kmer` mode and must stay so: `kvmer.csv` has no read ids, and depending on
+    `read_id` is a fork-only path (CLAUDE.md). There, read-level heterogeneity enters **only** as skiver's beta
+    - the channel phase 6b item 2 shows is ridge-shrunk and worth 1.6x of level. Cross-mode note: a `Tile` term
+    fitted in `pe-overlap` is a direct external check on that beta.
+  - Test: generate pairs with a known per-tile rate ratio and recover it; and confirm a spec without `Tile`
+    fitted on the same pairs reproduces the pooled rate (so the term is identified, not absorbing level).
 - **Open items**, carried forward:
+  - `Tile` above (not started);
   - error head `Position` splines are unidentified on fixed-length reads;
   - Q38–39 are still ~5.5× too high at ~10% merging;
   - head Q misfits cycles 40–41 (TV 0.32);
@@ -1390,9 +1508,144 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
      single-edit values per observation against 4.4 % passing. Join failing keys to the `reference` pileup:
      minor allele, assembly error, or error hotspot. If hotspots, the filter is biasing context, and `sites.keys`
      (started from skiver's filter today) should start from `--use-all` plus the multiplicity flag instead;
-   - *skiver's Weibull level.* Marginal matching takes the level from `summary_phred.csv`'s per-Q Weibull rate.
-     Compute a level directly from `kvmer.csv` (single-edit counts over the `consensus_count_up_to_v*` exposure,
-     on the keys we keep) and compare; if they disagree, own the level rather than inherit it.
+   - ✓ **Measured: the low level is ridge shrinkage of beta discarding the frailty lift. This is the next
+     factor to account for** (2026-10-13, v0.3.2 on ERR2935851, the preprint's Illumina dataset; see
+     `docs/skiver_paper_review.md` C7a and `docs/skiver_illumina_sim.py`). Marginal matching takes the level
+     from `summary_phred.csv`'s per-Q Weibull rate, i.e. from `h(1) = 1 - exp(-lambda)`. But `h(t)` is
+     observable only on `t` in `(k, k+v]`, which v0.3.2 narrows to `[k+3, k+v-2]` by its undocumented
+     `--ignore-smallest-t 2 --ignore-largest-t 2` (13 points at k = v = 17), so `h(1)` is an extrapolation
+     ~19 positions below the window's lower edge whose value is set almost entirely by `beta`. On the full
+     R1 (23.16 M reads, 557x; skiver reports `beta` 0.938, `lambda` 0.004865, window t = 20-32, hazard
+     0.003979 down to 0.003620), refitting that window with `beta` pinned:
+
+     | beta | reported per-base rate |
+     |---|---|
+     | 1.000 | 0.00375 |
+     | **0.938** (skiver's ridge + Huber fit) | **0.00489** |
+     | 0.900 | 0.00576 |
+     | 0.850 | 0.00717 |
+     | **0.831** (plain OLS on the same 13 points) | **0.00779** |
+     | 0.800 | 0.00896 |
+     | 0.700 | 0.01413 |
+
+     **Plain OLS on skiver's own window gives 0.00779 against skiver's 0.00489 - a ratio of 0.63.** That is
+     this item's 0.62x, from the same mechanism, measured on a different organism: ridge shrinks the slope
+     toward 0, i.e. `beta` toward 1, and `beta` = 1 applies no lift at all. The agreement of 0.63 with 0.62
+     may be luck (different dataset, different k), but the mechanism and the magnitude both match, so this is
+     now the leading candidate for the low level - ahead of key conditioning, and testable against it because
+     the two have different signatures: shrinkage depends on the window's noise and the penalty, key
+     conditioning depends on P(error-free key) and therefore on k and the error rate.
+
+     **Why `beta` controls the level.** `h(t)` is the chance base `t` is wrong *given the previous `t-1` were
+     right*. With a homogeneous error rate that would not depend on `t` and `beta` would be 1. It depends on
+     `t` because reads differ: conditioning on a long clean run progressively selects the *cleaner* reads, so
+     the surviving population gets cleaner as `t` grows and the hazard falls. `beta` < 1 is that selection.
+     So the hazard skiver can see, at t = 20-32, is measured on a population already enriched for clean reads
+     and sits **below** the unconditioned per-base rate we want; `h(1)` is that unconditioned rate, and the
+     extrapolation to `t` = 1 is precisely the step meant to undo the enrichment. `beta` is the only thing
+     setting how big the undo is. Every `beta` this repo has measured sits in the range the table is steep in
+     (0.80 at k = 11 against 0.93 at k = 21 on SRR24523812; 0.85 at `-l 3`/10x against 1.00 at 100x; 0.92/0.91
+     per mate), and a 0.85-to-0.94 shift alone is 1.5x of level.
+
+     Two things to keep apart, confounded in every measurement in this item: (i) real read-level heterogeneity
+     genuinely implies `beta` < 1 and genuinely needs the lift - signal, and the `Latent` truths test it;
+     (ii) `beta` is *estimated* from a short shallow window under an unreported penalty, so the lift is wrong
+     by ~1.6x in a predictable direction - identifiability, and it is new.
+   - ✓ **Measured: on real Illumina, depth does not move skiver's rate; read *selection* moves it 2.5x**
+     (2026-10-13, same dataset, k = v = 17). Depth sweep by systematic subsampling (every Nth read):
+
+     | subsample | depth | key median cov | per-base rate | beta |
+     |---|---|---|---|---|
+     | every 9th | 62x | 38 | 0.005100 | 0.934 |
+     | every 4th | 139x | 86 | 0.005189 | 0.929 |
+     | every 2nd | 279x | 172 | 0.005104 | 0.931 |
+     | all | 557x | 343 | 0.004854 | 0.938 |
+
+     Flat to ~7 % over 9x of depth, so phase 6's "depth raises skiver's rate" does not reproduce on real
+     Illumina at k = 17 (it was measured at k = 11, where multiplicity drives it - item 1). But at
+     *identical* read counts (2,573,803 reads, ~62x, key coverage 36-40), which reads you take matters
+     enormously:
+
+     | selection | per-base rate | beta |
+     |---|---|---|
+     | first 2.57 M reads (contiguous head) | **0.008081** | 0.918 |
+     | every 9th read across the run | 0.005100 | 0.934 |
+     | last 2.57 M reads (contiguous tail) | **0.003208** | 0.954 |
+
+     2.5x from flowcell position alone, with `beta` moving inversely (the dirtier block has the lower `beta`),
+     which is the frailty mechanism above showing up within one run. **Consequence for this repo: never
+     slice a FASTQ contiguously.** Any depth sweep, test fixture or cross-mode comparison built with
+     `head`/`tail` carries up to 2.5x of selection bias, and `kmer` / `pe-overlap` / `reference` must consume
+     the *same* reads, not different slices of the same file - otherwise the cross-mode ratios this phase's
+     exit turns on are measuring read selection.
+
+     **Affected measurements, checked.** The synthetic loops (`recovery`, `bias`) generate reads from a spec
+     and are unaffected. The real-data runs are not: SRR24523812 is read as the contiguous "phase 5 subset,
+     pairs 1,020,001-1,100,000", and phase 6's depth question was asked by fitting a second spec from a
+     separate contiguous "1,000,000-pair slice (47x median key coverage against 14.5x)". Those two slices are
+     *different blocks of the same file*, so that comparison conflates depth with read selection - and the
+     sweep above says depth contributes ~nothing (flat to 7 % over 9x) while selection contributes up to 2.5x.
+     **So "depth raises skiver's rate" is most likely a read-selection artifact**, on top of being taken at
+     k = 11. Rerun it by systematic subsampling (every Nth pair) from one block, which holds selection fixed
+     and varies only depth. The per-mate difference (R1 0.478 % / R2 0.663 %) was measured within a single
+     block, so mate is not confounded with block, but its absolute level inherits that block's bias.
+
+     Remediation for the level, in order:
+     - refit the window without the ridge shrinkage (or with the penalty swept) and compare; the OLS row above
+       is the size of the effect;
+     - compute a level directly from `kvmer.csv` (single-edit counts over the `consensus_count_up_to_v*`
+       exposure, on the keys we keep), which is Weibull-free, and own the level rather than inherit it;
+     - sanity-anchor against the fit-free per-cycle mean in `summary_read_position.csv`
+       (`num_error / (num_error + num_correct)`); it is a lower bound, being conditioned on a clean
+       neighbouring key;
+     - record `beta` and a beta-sensitivity band with every `kmer` level rather than a point estimate, so the
+       cross-mode comparisons separate extrapolation error from key conditioning;
+     - `--hazard-model constant` pins `beta` = 1 and is the conservative floor (0.00375 here), useful as a
+       bracket only.
+
+   - ✓ **Measured: the outlier threshold `p0` is a level knob and nothing else; ~1e-4 is close to free**
+     (2026-10-13, v0.3.2 `-e` swept on 58x of ERR2935851 R1, a *clonal* isolate, so every key dropped is pure
+     loss with no variation to find):
+
+     | `p0` | per-base rate | beta | keys kept | filter passes |
+     |---|---|---|---|---|
+     | 1e-12 (default) | 0.006984 | 0.920 | 98.91 % | 3 |
+     | 1e-8 | 0.006969 | 0.916 | 97.24 % | 4 |
+     | **1e-4** | **0.006737** | 0.908 | 90.19 % | 7 |
+     | 1e-2 | 0.005452 | 0.919 | 72.25 % | 4 |
+     | 1e-1 | 0.005553 | 0.884 | 51.39 % | 9 |
+
+     So `p0` = 1e-4 costs **3.5 % of level** on clonal data and buys a **3.5x better detection limit** for a
+     minor value (f = 0.1 needs key coverage 36 instead of 125 at h = 0.005; `docs/skiver_paper_review.md`
+     §3.2). Past that it collapses: 1e-2 loses 28 % of keys and 22 % of level on data with nothing to filter.
+     Two properties matter:
+     - **the cost is superlinear, because the filter iterates** (3 passes at 1e-12, 7 at 1e-4): dropping keys
+       moves `h(t)`, which moves who is dropped next, so a single-pass calculation under-predicts it badly
+       (0.1 % predicted against 3.5 % measured). Any `p0` choice has to be measured, not derived;
+     - **the spectrum is invariant.** At 1e-12, 1e-4 and 1e-2 - the last with 43 % of events gone -
+       substitution / insertion / deletion stays 99.3 / 0.2 / 0.5 % and Ti/Tv (per-type) stays 0.71. `p0`
+       moves the level and leaves the composition alone, which is the strongest single argument for §6.5.1
+       outcome (b): take the level elsewhere and the whole `p0` question stops mattering.
+
+     Also checked: skiver's binomial null is **not** badly misspecified, contrary to first guess. Among passing
+     keys the per-position failure count's dispersion against Binomial(`N_{K,t-1}`, 1 - `h(t)`) is 0.98x at
+     key coverage 10-20, 1.10x at 30-45 (the median), 1.18x at 45-65 and 1.75x only above 200 - where
+     collapsed repeats are the likely cause. So the 1.1 % of keys dropped at 1e-12 is real signal (repeats,
+     polymorphism, consensus failure), not false positives, and a looser `p0` is not fighting overdispersion.
+     Caveat: measured on keys the filter kept, so mildly circular; the 1e-12 filter is conservative enough
+     that the selection effect on the variance is small.
+
+     **Consequence for `sites.keys`** (phase 8): it currently starts from skiver's own filter at the default
+     `p0`, which has already discarded the keys most likely to carry the variation it is looking for. Start it
+     from `--use-all`, or from `-e 1e-4`, plus the multiplicity flag - the open item already noted above.
+
+     **On the preprint's numbers.** Its benchmarks are v0.2.2, and upstream's changelog shows **no change to
+     the hazard fit or the per-base rate** between v0.2.2 and the pinned v0.3.2: v0.2.1 added the
+     `--ignore-*-t` trim, v0.2.2 changed *Q-score* calibration to clog-log with a common beta, v0.3.0 added
+     output files, v0.3.1 added FASTA input, v0.3.2 is a pure performance release. v0.3.2 on the full R1
+     gives 0.004854 against the preprint's 0.0040 (21 % apart, plausibly R1-only and auto-`c`), so the
+     preprint's Illumina result reproduces and **this bias was never accounted for upstream**. Its
+     per-platform numbers are usable as a rough cross-check, not as a baseline.
 3. ✓ **Paired reads: per-mate runs land the clonal point** (2026-10-09). `sources.kmer.fit` takes `mates`, one
    `skiver analyze` run and FASTQ profile per mate, and rakes each mate's centre Q against *its own*
    `summary_phred.csv` and exposure (`fit.kmer.rake_mates`), which is what identifies `Mate`; context stays with
@@ -1467,9 +1720,24 @@ need not match the truth's. Test: a flat fit to a `Latent(2)` truth's reads comp
   where inserts overlap (variant-immune, the yardstick); linkage needs read ids, i.e. enhanced mode (phase 12).
 - **Exposure is the abundant taxa's.** The model describes the dominant genomes' reads; context and GC terms may
   carry their composition. Report the coverage-weighted GC and key-coverage spectrum the fit stood on.
-- **A long-tail scenario in `bias.py`**: many haplotypes at a log-normal abundance with a 1/f tail of
+- **A long-tail scenario in `bias.py`** - **priority: this is §6.5.1's gate input, and nothing in phases 9-11
+  should start before it is measured.** Many haplotypes at a log-normal abundance with a 1/f tail of
   near-identical relatives, several distinct real genomes sharing some genes, recombination on (phase 7 deferred
   it), paired 2x150. Measured for every mode, with and without each remediation above.
+  - It is the only thing that can settle the question `docs/skiver_paper_review.md` was written to ask, and that
+    the preprint does not answer: its *only* controlled multi-strain test is two *E. coli* strains at 98 % ANI
+    and a fixed 64x total (Fig 3.E), and a 10-species mock community does not test the filter at all because
+    different species do not share 17-mers. Neither resembles a long tail.
+  - **Sweep the minor haplotypes' absolute coverage independently of total**, which Fig 3.E conflates: at fixed
+    total, the minor strain's own coverage falls to zero at the extremes, so "the filter removed it" cannot be
+    told from "it fell below `-l`". Those are different failures with different fixes.
+  - Grid it over allele fraction, since that is where the structural limit sits: the deficit test is blind below
+    ~10 % allele fraction at realistic key coverage (`docs/skiver_paper_review.md` §3.2), so the minor-allele
+    frequency spectrum, not ANI, is the axis that decides default mode's fate. Include fractions either side of
+    the limit at each `p0` from phase 6b item 2.
+  - Paired 2x150 with overlapping inserts, so `pe-overlap` runs on the *same* reads and is the variant-immune
+    yardstick for the other two. Per phase 4, feed all three modes identical reads - never different slices of
+    one file, which is worth up to 2.5x on its own.
 
 **Exit** (status after the 2026-10-08 HPC run):
 - the phase 7 paired clonal point reads within the phase 2 tolerances with per-mate runs - **met on the
@@ -1820,6 +2088,39 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
       +0.4%, which is why "skiver's own filter is already enough at 100x" (above) holds only for the
       marginal. Reversed, nothing cancels: +15% at 100x. The key test takes 1,897 keys and moves it to +12%.
       So the default-mode floor above stands at 100x as well, per Q.
+- **`sites.keys` at position granularity: censor the variant position, do not discard the key** (added
+  2026-10-13, **priority** per §6.5.1). `sites.keys` and skiver's own filter both work at *key* granularity -
+  a key is kept whole or dropped whole - so both inherit the same bias: a key is ~34 bases of observation, and
+  dropping it for one polymorphic site removes the other 16 positions' exposure too. Because polymorphic keys
+  sit in variable sequence, the survivors are biased toward **conserved** sequence, whose context and GC
+  composition differ from the genome's. That is a sampling bias on the context distribution, which is the
+  thing this project exists to estimate - and unlike the level, no external source can repair it.
+  - **It has to be censoring, not deletion.** `N_{K,t}` is a *running* survival count: an observation that
+    mismatches at `t` leaves the risk set for every `t' > t`. So a variant position cannot be excised and its
+    neighbours spliced together - the later counts are conditioned on having survived it. The correct
+    treatment is **right-censoring**: observations that mismatch at the variant position `t*` leave the risk
+    set at `t*` *without counting as failures*, contributing exposure up to `t* - 1`. Equation 1's
+    ratio-of-running-counts already has the right shape to take it - censored observations come out of the
+    denominator at `t > t*` instead of being counted as failures at `t*`. This is also what `reference` mode
+    already does (`bam.masks` masks *sites*, not reads), so it makes the two modes consistent.
+  - **The data is in the default output.** `kvmer.csv` carries `consensus_count_up_to_v1..v17`, i.e. the
+    per-key running survival counts, so the position where a key's deficit appears is directly localisable -
+    no fork needed.
+  - **What is missing is the per-position alt identity.** `kvmer.csv`'s edit-type columns (`AC`, `AG`, ...,
+    `A_`) are aggregated over the whole value, not per position. So the sharpest discriminator - is the
+    non-consensus mass at `t*` concentrated on **one** base (a variant) or spread across the ~11 neighbour
+    types (sequencing error)? - cannot be computed per position from default output. A sharp single-position
+    deficit plus one dominant key-level edit type is suggestive, not conclusive. Worth sizing: that
+    concentration test is ~3x more sensitive in allele fraction than the deficit test on Illumina (the null
+    for a *specific* alt base is ~h/3 rather than h), and more on nanopore where the mass spreads wider. If
+    the gain is large it is an argument for a fork addition (phase 12), the one place enhanced mode would pay
+    for itself on *substitutions* rather than on quality windows.
+  - **Start it from unfiltered keys.** Per phase 6b item 2, `sites.keys` currently starts from skiver's filter
+    at `p0` = 1e-12, which has already discarded the keys most likely to carry the variation it is looking
+    for. Start from `--use-all`, or `-e 1e-4`, plus the multiplicity flag.
+  - Test: on the phase 7 grid, censoring recovers the clonal truth's context shape where whole-key discard
+    does not, and costs nothing on the clonal point. Report the context and GC composition of censored
+    positions against discarded keys, as `conservative` already does for sites.
 - **Cross-mode check:** where inserts overlap, `pe-overlap` on the same reads bounds the residual variation in the other modes.
 - **Carried from phase 7**, where a global rate could not show either: the repeat case (a 500 bp copy at 97%
   identity is 1.7% of a 30 kb genome, so it moves no marginal rate even though it is a per-site failure) and
@@ -1904,8 +2205,82 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
 ### Phase 11: further evidence sources and joint fitting
 - `sources/ont_duplex.py` (dorado duplex pairs, simplex Q tracks).
 - UMI/duplex consensus (fgbio) where libraries have UMIs.
-- `sources/importers.py` for GATK BQSR recalibration tables, DADA2 `learnErrors` matrices and InterOp error metrics.
+- `sources/importers.py` for GATK BQSR recalibration tables, DADA2 `learnErrors` matrices and InterOp error
+  metrics. InterOp carries Illumina's own per-tile, per-cycle error metrics, i.e. the same signal phase 4's
+  `Tile` component fits from read names - so it is the external check on that term, where the run's InterOp
+  directory survives (it usually does not, for public data).
 - Multi-source joint fit with per-source disagreement diagnostics, reusing `compare.py`.
+- **Explore: a profile that *sets skiver's hyperparameters and the separation priors*, rather than feeding it
+  keys** (added 2026-10-13, revised; follow-up, deliberately **behind** §6.5.1's gate). Default mode's two
+  structural blind spots are that it does not know *which* organisms cleared `-l`, nor how much within-species
+  diversity to expect. Every skiver parameter that is currently a constant, a byte-count heuristic or a free
+  parameter fitted from a 13-point window is a place where that knowledge would pin something now floating:
+
+  | parameter | set how today | what a profile would set it from |
+  |---|---|---|
+  | `-k` | constant 21 (this repo), 17 upstream | total distinct genome content and the number of near-identical relatives, which decide multiplicity (phase 6b item 1); the plan already says k = 25-31 for complex samples |
+  | `-l` | constant 10 | the dominant genomes' actual coverage, as a quantile rather than a guess - phase 6b item 5 measured that too *low* a floor biases the rate **upward** |
+  | `-c` | `ceil(bytes / 10 GiB * 1000)` | expected distinct k-mer content, which is what the subsampling rate should track, not file size |
+  | `-e` / `p0` | constant 1e-12 | how much real variation there is to find: clonal keeps it tight, a diverse population wants it looser (phase 6b item 2 measured 1e-4 as near-free, and that it is a level knob only) |
+  | `sites.keys(prior=)`, `sites.joint(prior=)` | **hardcoded 1e-3** per site | the expected minor-allele rate for the species present - the most direct mapping of all, and the one that currently assumes every sample is near-clonal |
+  | lite-reference arm (§1.1) | not selected | sylph names the matching genomes *and* their ANI, so it both supplies the reference and guards whether the arm is safe for each genome |
+
+  - **`beta` is the prize.** Phase 6b item 1 found that `beta` 0.80 at k = 11 was "mixture clustering, not
+    error clustering" (0.93 at k = 21), and phase 6b item 2 found `beta` carries 1.6x of the level. So `beta`
+    conflates two things, and a profile is exactly what separates them: with one dominant genome at 95%
+    abundance, a low `beta` is read-level error heterogeneity; with five species at similar abundance sharing
+    genes, part of it is genomic mixture. Pinning that split would be the largest single identification gain
+    available to default mode, on its most load-bearing floating parameter.
+  - **Which tool for which question.** Dominant-genome depth and per-genome ANI → **sylph** (FracMinHash over
+    nucleotide k-mers, same sketch family as skiver, so a shared sketching pass is plausible - worth checking
+    the hash and scaling rather than assuming). Expected within-species diversity → **sourmash + GTDB
+    lineages**, or a per-species statistic precomputed once from any genome collection and shipped as a table,
+    so the sample's own strains need not be in the database. Which gene families are multi-copy or mobile →
+    the **functional profiler**
+    (<https://github.com/timrozday-mgnify/kmer-functional-profiler>: protein k-mers from frame-filtered
+    translated reads, FracMinHash with nested per-family thresholds, EM over MGnify Proteins clusters),
+    because protein space is where conservation survives across species.
+  - **The database-coverage caveat, honestly.** Estimating a species' within-population diversity needs many
+    genomes of it, so this works for *E. coli* and fails for a GTDB singleton. Two things soften it: the
+    statistic is precomputed per species rather than queried per sample, and database genome counts correlate
+    with how heavily a taxon has been sequenced - which helps for gut, mock and isolate data (the near-term
+    test set) and fails for soil and marine, where the tail is uncharacterised. So every profile-derived
+    parameter carries a per-species confidence and falls back to today's constant when the prior is
+    uninformative. A hyperparameter set from a bad prior is worse than a constant, so the fallback is not
+    optional.
+  - **Not keys directly.** An earlier draft proposed restricting skiver to single-copy marker genes by
+    masking keys; that is downgraded and recorded below, because nucleotide 17-mers of marker genes are
+    species-specific and the property wanted ("single-copy") is already measurable from the sample's own key
+    coverage. Hyperparameters are the better interface: they are few, they are already there, and setting
+    them wrongly degrades gracefully where a wrong key mask does not.
+  - **Circularity, to design around.** A profile-derived prior feeds variant/error separation, which feeds the
+    error model, which (per the preprint's Table S4) improves the profiler's own coverage estimates. sylph's
+    coverage estimate depends on the error rate, so this is a genuine loop, not a one-way prior. Either fix
+    the order and take one pass with a conservative prior, or treat it as a fixed point and show it is stable
+    from different initialisations - as `sites.joint` and `sites.keys` already have to.
+  - **Caution: this is not a reason to delay §6.5.1.** The gate decides on what exists now. If the `kmer` mode
+    is narrowed or dropped, this work may reopen it later on its own evidence; it must not be used to keep the
+    decision open.
+  - **Downgraded: restricting skiver to single-copy marker genes.** Two mechanisms exist. `-r/--reference` fed
+    marker sequences would select keys *and* drop keys the reference shows at several loci - but it **also
+    replaces the consensus with the reference's value**, so it is the lite-reference arm (§1.1) with the worst
+    possible reference, since markers are conserved in protein and not in nucleotide k-mers: a specific 17-mer
+    survives at 0.84 / 0.60 / 0.42 / 0.17 for 99 / 97 / 95 / 90 % nucleotide identity, so a marker reference
+    at 95% would make ~5% of bases look like errors against a ~0.5% error rate. The reference-free mechanism
+    is a post-hoc mask on `kvmer.csv`, which carries the `key` sequence; `sites.keys` already provides that
+    hook ("returns `a` with each key's `passes_filter` replaced by the test's verdict") and already solves the
+    consequent level problem via its `level` ratio. But a *nucleotide* marker index only matches species
+    already in it at roughly >= 97%, which is most of what `reference` mode needs anyway, so it does not
+    preserve the reference-free property that was the only reason to want it. And the property actually wanted
+    is already measurable from the sample: a key far off the modal key coverage is a collapsed copy, which
+    `sites.keys`'s `copy_ratio` and `multiplicity.py` already do - measuring beats asserting it from a
+    database's genomes. **Do not filter the reads** either: selecting reads by similarity to a family selects
+    against error-rich reads and biases the rate down, the same key-conditioning bias as phase 6b item 2.
+    What survives is labelling keys in *protein* space: translate each key + consensus value (k + v = 34 nt =
+    11 codons) and test family membership. The arithmetic is tight - 11 aa is exactly **one** protein 11-mer
+    per frame, six across frames and strands - so it needs **exhaustive membership queries**, not the
+    profiler's 1/1000 sketching, which would sample ~0.1% of them. Whether that operating point exists is the
+    first question to ask of the profiler.
 - **Exit:**
   - each source recovers a known model on synthetic data;
   - on at least one real ONT metagenome, with phase 8 separation applied, the report quantifies agreement between `reference`, `kmer` and duplex per component.
@@ -2008,6 +2383,8 @@ The standard matches `EBI-Metagenomics/mimicc-ena-submission-assistant`: uv + Py
 - LongISLND: https://doi.org/10.1093/bioinformatics/btw602
 - GemSIM: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3305602/
 - Skiver v2 preprint: https://www.biorxiv.org/content/10.64898/2026.02.12.705514v2
+  (converted: `docs/skiver_paper.md`; review and critique, including the beta-sensitivity
+  measurement phase 6b item 2 turns on: `docs/skiver_paper_review.md`)
 - inStrain SNV calling and null model: https://instrain.readthedocs.io/en/latest/user_manual.html
 - LoFreq: https://pmc.ncbi.nlm.nih.gov/articles/PMC3526318/
 - DADA2 `learnErrors` (self-consistent error learning): https://github.com/benjjneb/dada2/blob/master/man/learnErrors.Rd
