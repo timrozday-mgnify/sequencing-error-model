@@ -10,6 +10,10 @@ Each table row is one draw at a template base: the `context` centre is its true 
 `op` is "=", "X>Y" with X the centre, "->Y" or "X>-". An insertion is followed by another draw at the same
 base (as the generator does, up to its `max_ins_run`), so a base with an insertion contributes two rows.
 
+A source that can only label some substitutions says which per row in the optional field `ops` (the observed
+bases it can label, e.g. "AG"). The row's likelihood is then conditional on "=" or one of those; insertions,
+deletions and the other substitutions are masked. `sources.pfam` sees a substitution only if it makes a stop codon.
+
 Components and params (A = alphabet size, trailing axis K):
 
 - `QualityWindow(m)` (required, first): `bias` [K], `window` [2m+1, A+1, K] over offsets -m..m; row A is
@@ -102,6 +106,10 @@ def _data(fields: Sequence[str], keys: Sequence[Key], alphabet: Sequence[int], m
             d[f] = np.array([s == "-" for s in col], np.int64)
         elif f == "gc":
             d[f] = np.array([(lo + hi) / 2 for lo, hi in col], float)
+        elif f == "ops":
+            if bad := {b for ops in set(col) for b in ops} - set("ACGT"):
+                raise ValueError(f"`ops` lists observed bases A, C, G and T, got {sorted(bad)}")
+            d[f] = np.array([[b in ops for b in "ACGT"] for ops in col], bool).reshape(n, 4)
         else:
             d[f] = np.asarray(col)
     d["centre"] = d["context"][:, d["flank"][0]]
@@ -254,6 +262,9 @@ def _logits(components: Sequence[Component], d: dict[str, Any]) -> Array:
 def _mask(d: dict[str, Any]) -> Array:
     mask = np.zeros((len(d["centre"]), _K), bool)
     mask[np.arange(len(mask)), 1 + d["centre"]] = True
+    if "ops" in d:
+        mask[:, 1:5] |= ~d["ops"]
+        mask[:, 5:] = True
     return mask
 
 
@@ -278,6 +289,8 @@ def _labelled(
     d = _data(fields, list(keys), alphabet, table.meta)
     counts = np.zeros((len(keys), _K))
     np.add.at(counts, (r_idx, cat), n)
+    if "ops" in d and (counts * _mask(d)).any():
+        raise ValueError(f"{table.source}: an op is outside its row's `ops`")
     return counts, d
 
 
