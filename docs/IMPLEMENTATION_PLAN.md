@@ -2469,6 +2469,11 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
     per frame, six across frames and strands - so it needs **exhaustive membership queries**, not the
     profiler's 1/1000 sketching, which would sample ~0.1% of them. Whether that operating point exists is the
     first question to ask of the profiler.
+- **Explore: a `pfam` evidence mode** (minimal reference, added 2026-11-24; its P1 built early as a user exception to the gate, the rest
+  behind it): in-frame stops inside Pfam domains and mate overlap as substitution-error labels, from reads placed by kfpfam, in
+  `sources/pfam.py`. On one real library 0.97 ± 0.03 of 0.01 added errors per base come back end to end (ten of twelve ops; the
+  other two need overlapping mates). It needs no coverage or assembly. **Not yet tested against truth.** Plan, results and HPC preparation:
+  [pfam_mode_plan.md](pfam_mode_plan.md).
 - **Exit:**
   - each source recovers a known model on synthetic data;
   - on at least one real ONT metagenome, with phase 8 separation applied, the report quantifies agreement between `reference`, `kmer` and duplex per component.

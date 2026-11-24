@@ -1,5 +1,6 @@
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -225,3 +226,46 @@ def test_one_position_axis_on_fixed_length_reads() -> None:
 
     mixed = error.fit(_position_rows([40, 60, 80, 100]), ["QualityWindow(0)", "Position(4)"], [20])
     assert not np.allclose(next(c for c in mixed if c.name == "Position").params["end"], 0.0)
+
+
+def test_ops_field_restricts_the_outcomes_a_row_can_show() -> None:
+    """A row that can only show A>G conditions on = or A>G: its share of A>C is neither evidence nor a zero count."""
+    full = CountTable(
+        "t",
+        ("q", "context", "op"),
+        "base",
+        True,
+        Counter({(2, "A", "="): 900, (2, "A", "A>G"): 60, (2, "A", "A>C"): 40}),
+    )
+    some = CountTable(
+        "t",
+        ("q", "context", "ops", "op"),
+        "base",
+        True,
+        Counter({(2, "A", "G", "="): 900, (2, "A", "G", "A>G"): 60}),
+    )
+    tokens = ["QualityWindow(0)"]
+    f = error.fit(full, tokens, (2,), l2=1e-6)
+    s = error.fit(some, tokens, (2,), l2=1e-6)
+    grid = CountTable("g", ("q", "context", "ops"), "base", False, Counter({(2, "A", "G"): 1}))
+    assert error.probabilities(s, (2,), grid)[0, 3] == pytest.approx(60 / 960, rel=1e-3)
+    # the full table's A>G odds against "=" are the same
+    p = error.probabilities(f, (2,), replace(full, fields=("q", "context"), counts=Counter({(2, "A"): 1})))[0]
+    assert p[3] / p[0] == pytest.approx(60 / 900, rel=1e-3)
+
+
+def test_ops_rows_reject_an_op_they_cannot_show() -> None:
+    bad = CountTable("t", ("q", "context", "ops", "op"), "base", True, Counter({(2, "A", "G", "A>C"): 1}))
+    with pytest.raises(ValueError, match="outside its row"):
+        error.fit(bad, ["QualityWindow(0)"], (2,))
+
+
+def test_full_op_set_equals_masking_only_indels() -> None:
+    """All four bases in `ops` gives a table without indels the fit it has with indel logits masked out."""
+    plain: Counter[Key] = Counter({(2, "A", "ACGT", "="): 990, (2, "A", "ACGT", "A>G"): 10, (2, "C", "ACGT", "="): 500})
+    t = CountTable("t", ("q", "context", "ops", "op"), "base", True, plain)
+    fitted = error.fit(t, ["QualityWindow(0)"], (2,))
+    p = error.probabilities(
+        fitted, (2,), replace(t, fields=("q", "context", "ops"), counts=Counter({(2, "A", "ACGT"): 1}))
+    )
+    assert p[0, 5:].sum() == 0 and p[0, 1] == 0 and p.sum() == pytest.approx(1)

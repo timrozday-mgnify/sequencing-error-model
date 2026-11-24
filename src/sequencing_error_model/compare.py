@@ -103,6 +103,32 @@ def on_support(table: CountTable, like: CountTable, by: Sequence[str] = ("pos_st
     return replace(table, source=f"{table.source}:on({like.source})", counts=kept, meta=meta)
 
 
+def op_rates(table: CountTable) -> dict[str, dict[str, float]]:
+    """Errors, exposure and rate per substitution, counting a base as exposed only to the ops its row can show.
+
+    Tables with an `ops` field (`sources.pfam`) label a subset of substitutions per row, so a rate per base is not
+    comparable with another source's; a rate per op is, on the bases each source exposes to it.
+    """
+    if missing := sorted({"op", "context"} - set(table.fields)):
+        raise ValueError(f"{table.source}: no fields {missing}")
+    oi, ci, left = table.fields.index("op"), table.fields.index("context"), tuple(table.meta.get("flank", (0, 0)))[0]
+    at = table.fields.index("ops") if "ops" in table.fields else None
+    errors: Counter[str] = Counter()
+    chance: Counter[str] = Counter()
+    for key, n in table.counts.items():
+        op, centre = str(key[oi]), str(key[ci])[left]
+        if "-" in op:
+            continue
+        for b in "ACGT" if at is None else str(key[at]):
+            if b != centre:
+                chance[f"{centre}>{b}"] += n
+        if op != "=":
+            errors[op] += n
+    return {
+        op: {"errors": errors[op], "exposure": x, "rate": errors[op] / x} for op, x in sorted(chance.items()) if x > 0
+    }
+
+
 def evidence(
     a: CountTable,
     b: CountTable,
