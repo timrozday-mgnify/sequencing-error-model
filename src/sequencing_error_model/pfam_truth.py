@@ -81,6 +81,14 @@ def exposed_reads(
     return out
 
 
+def sites(r: pysam.AlignedSegment, n: int) -> Array:
+    """The reference site under each of the read's `n` bases, in read order (-1: none)."""
+    at = np.array(r.get_aligned_pairs(matches_only=True), np.int64).reshape(-1, 2)
+    out = np.full(n, -1, np.int64)
+    out[n - 1 - at[:, 0] if r.is_reverse else at[:, 0]] = at[:, 1]
+    return out
+
+
 def placements(sam: Path, wanted: Mapping[int, tuple[str, bytes, list[Codon]]], min_mapq: int) -> dict[int, Placement]:
     """Primary alignments of the wanted reads; the query names are pair numbers (`pfam reads`)."""
     out: dict[int, Placement] = {}
@@ -96,10 +104,7 @@ def placements(sam: Path, wanted: Mapping[int, tuple[str, bytes, list[Codon]]], 
             n = len(wanted[rid][0])
             if r.mapping_quality < min_mapq or r.infer_read_length() != n:
                 continue
-            at = np.array(r.get_aligned_pairs(matches_only=True), np.int64).reshape(-1, 2)
-            sites = np.full(n, -1, np.int64)
-            sites[n - 1 - at[:, 0] if r.is_reverse else at[:, 0]] = at[:, 1]
-            out[rid] = Placement(contig, bool(r.is_reverse), sites)
+            out[rid] = Placement(contig, bool(r.is_reverse), sites(r, n))
     return out
 
 
@@ -394,8 +399,15 @@ def recovered(report: Mapping[str, Any], dose: float, spec: str, base: str = "bo
     return float(np.mean(each))
 
 
-def verdict(reports: Mapping[str, Mapping[str, Any]], doses: Sequence[float] = (0.002, 0.01)) -> dict[str, Any]:
-    """Go when `RUNS_NEEDED` libraries pass. A library without power counts as neither pass nor fail."""
+def verdict(
+    reports: Mapping[str, Mapping[str, Any]],
+    doses: Sequence[float] = (0.002, 0.01),
+    loci: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Go when `RUNS_NEEDED` libraries pass. A library without power counts as neither pass nor fail.
+
+    `loci` (`pfam_locus` reports by library and dose) are shown, never judged.
+    """
     runs: dict[str, Any] = {}
     for name, r in reports.items():
         found = checks(r)
@@ -420,13 +432,18 @@ def verdict(reports: Mapping[str, Mapping[str, Any]], doses: Sequence[float] = (
     # no-go only when enough libraries failed that the rest could not make it up
     short = len(runs) >= RUNS_NEEDED and len(runs) - (tested - n) < RUNS_NEEDED
     go = "go" if n >= RUNS_NEEDED else "no-go" if short else "undecided"
-    return {"verdict": go, "passed": n, "tested": tested, "libraries": len(runs), "runs": runs}
+    return {"verdict": go, "passed": n, "tested": tested, "libraries": len(runs), "runs": runs, "loci": loci or {}}
 
 
 def _pair(cells: Mapping[str, Mapping[str, Any]], op: str, spec: str) -> dict[str, float]:
     use = [cells[f"op:{x}"] for x in (TEN if op == "total" else (op,)) if f"op:{x}" in cells]
     predicted, observed = sum(c["predicted"].get(spec, 0.0) for c in use), sum(c["observed"] for c in use)
     return {"ratio": predicted / observed if observed else math.nan, "observed": observed}
+
+
+def locus(report: Mapping[str, Any], flank: int = 12, others: int = 2) -> Mapping[str, Any]:
+    """One setting of a `pfam_locus` report."""
+    return next(r for r in report["loci"] if r["flank"] == flank and r["others"] == others)
 
 
 def markdown(v: Mapping[str, Any]) -> str:
@@ -453,6 +470,31 @@ def markdown(v: Mapping[str, Any]) -> str:
             for s, a in r["anchors"].items():
                 yield f"| {name} | {s} | {a['total']['ratio']:.2f} | {a['A>G']['ratio']:.2f} | {a['T>C']['ratio']:.2f} |"
 
+        if v.get("loci"):
+            yield "\n## Locus consensus (reported, not judged; flank 12, two others)\n"
+            yield (
+                "| library | labels | errors / biology / other | true per base | mixture ± sd | naive | nonsense "
+                "| omega: recurring / true | additions |"
+            )
+            yield "|---|---|---|---|---|---|---|---|---|"
+            for name, by_dose in v["loci"].items():
+                found = {d: locus(r) for d, r in by_dose.items()}
+                r, rate = found["0"], found["0"]["per_base"]
+                t = r.get("truth", {})
+                split = (
+                    " / ".join(str(int(np.sum(t["labels"][k]))) for k in ("error", "biology", "other")) if t else "-"
+                )
+                added = ", ".join(
+                    f"{d}: {(x['per_base']['mixture'] - rate['mixture']) / float(d):.2f}"
+                    for d, x in found.items()
+                    if d != "0"
+                )
+                yield (
+                    f"| {name} | {int(np.sum(r['labels']))} | {split} | {t.get('per_base', math.nan):.2e} | "
+                    f"{rate['mixture']:.2e} ± {rate['mixture_sd']:.0e} | {rate['naive']:.2e} | {rate['nonsense']:.2e} | "
+                    f"{r['omega']:.3f} / {t.get('omega', math.nan):.3f} | {added} |"
+                )
+
     return "\n".join(lines()) + "\n"
 
 
@@ -476,10 +518,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     a.add_argument("--output", type=Path, required=True, metavar="JSON")
     b = sub.add_parser("verdict", help="the go / no-go over the libraries' score reports")
     b.add_argument("reports", type=Path, nargs="+", help="score reports, named after their library")
+    b.add_argument("--loci", type=Path, nargs="*", default=[], help="pfam_locus reports, LIBRARY.DOSE.json; not judged")
     b.add_argument("--output", type=Path, required=True, metavar="PREFIX", help="PREFIX.json and PREFIX.md")
     args = p.parse_args(argv)
     if args.command == "verdict":
-        v = verdict({x.stem: json.loads(x.read_text()) for x in args.reports})
+        loci: dict[str, dict[str, Any]] = defaultdict(dict)
+        for x in sorted(args.loci):
+            library, _, dose = x.name.removesuffix(".json").partition(".")
+            loci[library][dose] = json.loads(x.read_text())
+        v = verdict({x.stem: json.loads(x.read_text()) for x in args.reports}, loci=loci)
         args.output.with_suffix(".json").write_text(json.dumps(v, indent=2))
         args.output.with_suffix(".md").write_text(markdown(v))
         print(markdown(v))

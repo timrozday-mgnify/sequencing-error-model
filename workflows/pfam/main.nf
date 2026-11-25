@@ -103,16 +103,35 @@ process SCORE {
     """
 }
 
+// Reported beside the verdict, never judged (plan section 12): the truth, where there is a SAM, is for the undosed reads.
+process LOCUS {
+    tag "$run $dose"
+    label 'locus'
+    publishDir { "${params.outdir}/locus" }, mode: 'copy'
+    input:
+    tuple val(run), val(dose), path(r1), path(r2), path(pairs), path(truth)
+    path prep
+    output:
+    path "${run}.${dose}.json"
+    script:
+    def known = truth ? "--sam ${truth[0]} --reference ${truth[1]}" : ''
+    """
+    python -m sequencing_error_model.pfam_locus $r1 $r2 --pairs $pairs --prep $prep $known \\
+        --t1 ${params.t1} --t2 ${params.t2} --output ${run}.${dose}.json
+    """
+}
+
 process VERDICT {
     label 'small'
     publishDir params.outdir, mode: 'copy'
     input:
     path reports
+    path loci
     output:
     path 'verdict.*'
     script:
     """
-    python -m sequencing_error_model.pfam_truth verdict $reports --output verdict
+    python -m sequencing_error_model.pfam_truth verdict $reports --loci $loci --output verdict
     """
 }
 
@@ -150,5 +169,9 @@ workflow {
     def sam = ALIGN(reads.filter { it[1] == '0' }.combine(genomes, by: 0))
     SCORE(undosed.map { run, _d, r1, r2, p -> [run, r1, r2, p] }
         .join(sam).join(genomes).join(specs.groupTuple(size: fits.size(), remainder: true)), prep)
-    VERDICT(SCORE.out.collect())
+    def with_truth = undosed.combine(sam.join(genomes), by: 0)
+        .map { run, dose, r1, r2, p, s, g -> [run, dose, r1, r2, p, [s, g]] }
+    def without = ready.filter { it[1] != '0' }.map { it + [[]] }
+    LOCUS(with_truth.mix(without), prep)
+    VERDICT(SCORE.out.collect(), LOCUS.out.collect())
 }

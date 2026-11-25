@@ -181,7 +181,18 @@ def test_checks_and_verdict(scored: Scored) -> None:
     path = tmp / "lib.json"
     path.write_text(json.dumps(report))
     assert pfam_truth.main(["verdict", str(path), "--output", str(tmp / "v")]) == 0
-    assert "lib" in (tmp / "v.md").read_text()
+    assert "lib" in (tmp / "v.md").read_text() and "Locus" not in (tmp / "v.md").read_text()
+    # the locus reports are shown and change nothing
+    one = {"flank": 12, "others": 2, "labels": [[1, 2, 3]], "omega": 0.1}
+    for dose, rate in (("0", 1e-3), ("0.01", 1.1e-2)):
+        per_base = {"mixture": rate, "mixture_sd": 1e-4, "naive": 2e-3, "nonsense": 1e-3}
+        (tmp / f"lib.{dose}.json").write_text(json.dumps({"loci": [one | {"per_base": per_base}]}))
+    with_loci = ["--loci", str(tmp / "lib.0.json"), str(tmp / "lib.0.01.json")]
+    assert pfam_truth.main(["verdict", str(path), *with_loci, "--output", str(tmp / "w")]) == 0
+    text = (tmp / "w.md").read_text()
+    assert "| lib | 6 | - | nan | 1.00e-03" in text and "0.01: 1.00" in text
+    plain, shown = (json.loads((tmp / f"{x}.json").read_text()) for x in "vw")
+    assert plain["runs"] == shown["runs"] and plain["verdict"] == shown["verdict"]
 
 
 def test_codons_off_the_alignment_are_not_labelled() -> None:

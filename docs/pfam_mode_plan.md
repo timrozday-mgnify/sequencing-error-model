@@ -274,7 +274,7 @@ each anchor alone undosed; the undosed reads aligned to the genomes. `pfam_truth
 - labels **every base of every exposed codon**, not only the stop-adjacent ones a fit saw, and compares each fit's predicted errors with the observed ones per
   op, Q, mate and read position.
 
-**Go rule** (`pfam_truth.verdict`; proposals until agreed, §10.2). A library passes if, for the fit with both anchors:
+**Go rule** (`pfam_truth.verdict`; **agreed 2026-11-25, before any P2 run**, so not to be changed after seeing its results). A library passes if, for the fit with both anchors:
 - the ten ops' total is within 15 % of the genomes', and its floor's 95 % bound is ≤ 2 × 10⁻⁴ per base (`genome` + `variant` stops the fit kept);
 - no single op, Q group, mate or position quarter is `outside` 25 %, that is off by more than 25 % + 2 sd.
 
@@ -348,7 +348,7 @@ without containers. It reuses `sem-tools.sif` (phase 6b), and the kfpfam image, 
 ## 10. Open questions
 
 1. **The hmmalign parquet:** where is it, and does it have GA-only or all hits, nucleotides or residues?
-2. **Go / no-go rule** in P2 (§7): the 15 %, 25 %, 2 × 10⁻⁴ and five-of-seven are proposals, as is the power rule. They should be agreed before the run, not after.
+2. ~~Go / no-go rule in P2~~: agreed as proposed on 2026-11-25 (§7).
 3. **The gate.** The main plan says nothing in phases 9–11 starts before §6.5.1 closes. The user made an exception for P1. P2 needs its own;
    the argument is that it does not touch `kmer` mode and can share an HPC window with the gate run.
 
@@ -364,3 +364,61 @@ python recruit/pairs.py data/pfam/Pfam-A.h3m data/prep/models.tsv out.faa out.fi
 python docs/pfam_proto.py exposure R1 R2 data/prep out.pairs.tsv out.coords.tsv out.npy --n 400000 --dose 0.002 --t1 30 --hit 0
 python docs/pfam_proto.py fit data/prep out.npy baseline.npy
 ```
+
+## 12. Explored: a consensus of the stack, and MGnify members (2026-11-25)
+
+Two questions: can the dominant allele(s) of the stacked reads be a second basis for the error model, and would assigning the reads to MGnify
+proteins (kmer-functional-profiler's `pfam-anchor`) make the stacks clean enough for that? Code: [pfam_locus.py](../src/sequencing_error_model/pfam_locus.py) (the locus rows; the column and MGnify rows were a prototype, not kept). Nothing here
+is in the `pfam` fit. Every grouping is judged the same way: each exposed codon (T1 35) against the **unanimous codon of ≥ 2 other fragments** of its group, disagreements split by effect. Pure error gives
+equal rates per opportunity for synonymous, missense and nonsense; biology gives synonymous ≫ missense ≫ nonsense.
+
+| Grouping | Mock¹: labels that are errors | Real²: syn / mis / non × 10⁻⁴ | Codons usable (real) |
+|---|---|---|---|
+| Pfam column, dominant ≥ 50 % | 0.5 % | 1,850 / 170 / 1.5 | 63 % |
+| Pfam column, dominant ≥ 99 %, ≥ 20 deep | 16 % | 483 / 13 / 0 | < 1 % |
+| Pfam column, top alleles (any seen twice) | 4 % | not split | 78 % |
+| same 4 residues each side (protein) | 50 % | 165 / 7.4 / 2.1 | 52 % |
+| same 10 residues each side (protein) | 84 % | 73 / 4.0 / 2.3 | 27 % |
+| **locus: same 12 bases each side** | **98 %** | 13.8 / 3.0 / 1.6 | 53 % |
+| locus: same 18 bases each side | 99 % | 8.3 / 2.9 / 1.7 | 46 % |
+
+¹ The three-genome rehearsal of §7 P2 (no strain variation). ² ERR10889147, 535,458 reads; nonsense counts are 7–13, so ± 30 %.
+
+**1. A consensus per column does not work, and more alleles or depth do not save it.** A column holds many genomes, and a rare allele one change from a common one is nearly always another genome. At 10⁻² added error, 29–51 % of
+top-allele labels were errors; at the mock's 5 × 10⁻⁴, 4 %.
+
+**2. A consensus per locus does, as a mixture and not as hard labels.** It is the stacking idea at the resolution where a molecule's neighbours are the same gene in the same strain.
+- What leaks in on real reads is strain variation, and it is mostly synonymous: 12 bases each side leave about 38 % of the labels errors, but about 70 % of the missense and nonsense ones.
+- **The codon effect separates the two.** Model per substitution: rate = E + b × (1, ω, 0) for synonymous, missense, nonsense. ω is the sample's own missense-to-synonymous ratio among **alleles that recur** (≥ 3 fragments), which are biology. No
+  Q, no reference, and all twelve substitutions are identified, since `A>G` and `T>C` have synonymous and missense forms.
+
+| | Stop anchor | Locus mixture | Truth |
+|---|---|---|---|
+| mock, per base × 10⁻⁴ (149 stops; 2,264 labels) | ± 8 % | 5.02 ± 0.13 (12 bases), 4.87 (18), 5.18 (9) | 5.03, 4.87, 5.28 |
+| mock, per substitution | 0.8–1.5 of truth (with overlaps) | 0.84–1.05 of truth | |
+| ERR10889147, undosed × 10⁻⁴ | 3.8 crude; 2.4 if unsupported stops are biology | 2.15 ± 0.5 (12), 2.06 (18), 1.82 (9) | unknown |
+| +0.01 recovered | 0.97 (§7 P1) | 0.98 (9 and 12), 0.99 (18) | 1 |
+
+- **Yield:** about 15 times the errors (2,170 against 149 in the mock, about 420 against 30 in ERR10889147), from the same reads.
+- On ERR10889147 the total is not more precise than the stops' (± 24 % with ω from 30 recurring alleles): the biology has to be subtracted. The gain is the spectrum, `A>G` / `T>C`, and in deeper or less diverse samples the rate.
+- The naive count falls from 5.6 to 3.8 × 10⁻⁴ between 12 and 18 bases; the mixture does not move. That stability, and agreement with the stops, are the checks a real library allows.
+- A cheap use needs none of the mixture: the reads that **contradict a stop give its source codon**, where the stack gives a prior (119 of 140 stops in the mock, 23 of 48 in ERR10889147).
+
+**3. MGnify members would not make the stack cleaner, and could help elsewhere.**
+- *As a grouping they are too coarse.* A unit is a protein at 90 % identity, and the error model is nucleotide: species sharing a protein differ at every synonymous site. The protein rows above are the best case (identical residues) and leave synonymous rates 5–12 times the locus'. Grouping the reads' own
+  bases does better with no database. Assignment is also ambiguous: a median of 8 tied units per codon, 244 at the 90th percentile (real reads, the local slice of 40 complete families).
+- *As an outside consensus where no second read exists, nearly but not enough.* 80 % of exposed codons have a member that matches every other residue of the read, and of those 2,889 of 2,894 match it at the codon too. Five
+  mismatches, 1.7 × 10⁻³ per codon (0.6–4 × 10⁻³), against about 0.5 × 10⁻³ expected of errors. So most are novel biology, there is no synonymous class, and no way to estimate ω, hence nothing to subtract with. 212 reads only.
+- *Where they can help:* the **source residue of a stop** (a member's residue at that column, right to 99.8 % when any tie counts, 98.6 % by majority), for the stops without a second read; and those stops' gene ends and chance placements, **not** strain pseudogenes, which have intact relatives in MGnify.
+  Only 40 families could be tested here. Worth a test only if P2 shows per-substitution error from the stack prior to matter.
+
+**Limits of what was measured.** Real strain variation has no truth here: the mock has none, and the dose only shows that errors are recovered in its presence. ω comes from recurring alleles, and singleton variants are younger and less purged, so the true ω is higher and **E is biased up**; P2's D6331 (five *E. coli* strains) tests that.
+Requiring clean flanks drops reads where errors cluster: −2 % at 12 bases and −5 % at 18 on simulated heads, about even across Q; real reads may be worse. An error hotspot that recurs counts as biology, a PCR error as an error. It needs ≥ 3 fragments at a locus. It is `kmer` mode's idea (a key
+and the consensus of what follows) with two things `kmer` lacks: flanks on both sides and a reading frame, hence the effect classes. The same split could be tried on skiver's output where a frame is known.
+
+**Recommendation.**
+1. **Add a `locus` anchor (Tier 1c)**: rows for every base of a codon with ≥ 2 agreeing fragments, weighted by the mixture's P(error | substitution, effect), in the same fit as the stops and the overlap. Nonsense rows overlap the stop anchor's and are counted once.
+2. **Before P2 runs on HPC**, add its scoring only: the two tables above (counts and opportunities by substitution and effect, and recurring alleles) and the share of labels that the genomes call errors. They are a few hundred numbers per library, and D6331 and D6310 are where its one unproven part, ω, has truth. **Reported, not judged**: the agreed go rule (§7) stays as it is. **Done 2026-11-25:** [pfam_locus.py](../src/sequencing_error_model/pfam_locus.py) and a `LOCUS` step in the workflow, shown in `verdict.md`. On ERR10889147 the module reproduces the table above (2.15, 2.06, 1.82 × 10⁻⁴ undosed) and recovers +0.002 at 1.00 and +0.01 at 0.97–0.98.
+3. Do now, whatever else: use contradicting reads for a stop's source codon.
+4. Not the column consensus. Not MGnify grouping; revisit members for source residues after P2.
+
