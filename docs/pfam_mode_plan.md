@@ -432,7 +432,9 @@ and the consensus of what follows) with two things `kmer` lacks: flanks on both 
    The prior's errors mostly cancel across ops. Coverage: 60 % of error stops at +0.01 and 87 % undosed (mock, 5x); 31 % and 43 % in ERR10889147,
    where the locus agrees with the prior's best for 15 of 16 and 445 of 483. **So:** a cheap hard assignment where a locus exists, worth taking
    when the fit is next touched, not a reason to; its value is where the prior is weakest (58 % right on the mock's stops with no locus) and in
-   samples with more strain variation per column, which the mock lacks.
+   samples with more strain variation per column, which the mock lacks. **In the fit since 2026-11-25** (`Stop.source`, set by `drop_replicated`; `codon_weight`
+   puts `LOCUS_RIGHT` = 0.99 on it, the rest by the stack). Mock refit: 119 of 140 kept stops sourced undosed, 1,856 of 2,345 at +0.01; against the
+   genomes, the mean |log ratio| over the twelve ops 0.139 → 0.138 and +0.01 recovered 0.986 → 0.985, as the prototype predicted.
 4. Not the column consensus. Not MGnify grouping; revisit members for source residues after P2.
 
 ## 13. Proposed: indels, and the codons no anchor labels (2026-11-25)

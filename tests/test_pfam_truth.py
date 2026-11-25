@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,8 @@ def scored(tmp_path_factory: pytest.TempPathFactory) -> Scored:
     ev = pfam.collect(pairs, hits, world.profiles, t1=30, quality_every=10)
     found = pfam.drop_replicated(ev, pairs, hits)
     assert found["stops"] == ev.stats.stops and found["replicated"] + len(ev.stops) == ev.stats.stops
+    sourced = [s for s in ev.stops if s.source]
+    assert len(sourced) == found["sourced"] > 0 and all(s.source in s.sources for s in sourced)
     spec, _ = pfam.fit(ev, world.profiles, ERROR_TOKENS, QUALITY_TOKENS)
     report = pfam_truth.score(
         pairs,
@@ -138,6 +141,19 @@ def test_replicates_count_fragments_between_the_same_flanks() -> None:
     hit = pfam.Hit(7, False, 0, 0, ((9, "M"),))
     hits = {2 * i + m: [hit] for i in range(4) for m in (0, 1)}
     assert pfam.replicates([locus, (7, "TAA", None)], pairs, hits) == [(2, 1), (0, 0)]
+    # the other fragment's codon is kept: it names the stop's source
+    assert pfam.at_loci([locus, (7, "TAA", None)], pairs, hits) == [(2, Counter({"CAA": 1})), (0, Counter())]
+
+
+def test_a_locus_source_takes_the_stops_weight() -> None:
+    class Flat:
+        def weight(self, column: object, codon: str) -> float:
+            return 2.0
+
+    stop = pfam.Stop(7, (7, 3), "TAA", ("CAA", "AAA", "GAA"), (), (), (), 40, None)
+    assert np.allclose(pfam.codon_weight(stop, Flat()), 2.0)  # type: ignore[arg-type]
+    w = pfam.codon_weight(replace(stop, source="AAA"), Flat())  # type: ignore[arg-type]
+    assert w[1] == pfam.LOCUS_RIGHT and np.isclose(w.sum(), 1.0) and w[0] == w[2] > 0
 
 
 def test_observed_errors_match_the_true_head_per_cell(scored: Scored) -> None:

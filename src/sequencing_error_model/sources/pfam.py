@@ -24,6 +24,9 @@ too low counts chance homology. `add_errors` plus a rerun of the search is the e
 
 **The stack.** The codon a stop (or a disputed base) came from has a prior: the sample's own codons at that column
 plus `lam` codons' worth of the HMM's emissions, `lam` chosen by leave-one-out likelihood of the sense codons.
+Where other fragments of a stop's locus agree on a sense codon one substitution away, that codon takes `LOCUS_RIGHT`
+of the stop instead (`Stop.source`, set by `drop_replicated`): on a mock it was right for 99.3-100 % of stops, the
+stack's best for 88-89 %.
 
 **Stops that are biology** (pseudogenes, recoding, a gene's own end) recur in every read of their locus; an error does
 not. `replicates` counts the other fragments that show the same codon, or another, between the same flanking bases,
@@ -162,6 +165,7 @@ class Stop:
     quality: tuple[tuple[tuple[Key, ...], tuple[Key, ...]], ...]  # head Q rows with the source, and as observed
     anchor: int  # whole bits
     flanks: tuple[str, str] | None  # `FLANK` bases before and after, coding strand; None at a read end
+    source: str | None = None  # the sense codon the locus' other fragments agree on (`drop_replicated`)
 
 
 @dataclass
@@ -440,27 +444,39 @@ def replicates(
 
     Only reads with a hit to the locus' family are searched, which is what makes this cheap. Mates count once.
     """
+    return [(same, other.total()) for same, other in at_loci(loci, pairs, hits)]
+
+
+def at_loci(
+    loci: Sequence[Locus], pairs: Iterable[ReadPair], hits: Mapping[int, Sequence[Hit]]
+) -> list[tuple[int, Counter[str]]]:
+    """As `replicates`, with the other fragments' codons: one each, or `?` where its mates show two."""
     by_model: dict[int, list[int]] = defaultdict(list)
     for k, (model, _, around) in enumerate(loci):
         if around:
             by_model[model].append(k)
-    out = [[0, 0] for _ in loci]
+    out: list[tuple[int, Counter[str]]] = [(0, Counter()) for _ in loci]
     for number, (s1, _, s2, _) in enumerate(pairs):
-        seen: dict[int, bool] = {}
+        seen: dict[int, set[str]] = defaultdict(set)
         for mate, s in enumerate((s1, s2)):
             wanted = [k for f in {h.model for h in hits.get(2 * number + mate, ())} for k in by_model.get(f, ())]
             if not wanted:
                 continue
             strands = (s.upper(), _revcomp(s.upper()))
             for k in wanted:
-                _, codon, around = loci[k]
+                around = loci[k][2]
                 assert around is not None
                 for st in strands:
-                    if at := _find(st, *around):
-                        seen[k] = seen.get(k, False) or any(st[c : c + 3] == codon for c in at)
-        for k, same in seen.items():
-            out[k][0 if same else 1] += 1
-    return [(a, b) for a, b in out]
+                    seen[k].update(st[c : c + 3] for c in _find(st, *around))
+        for k, codons in seen.items():
+            if not codons:
+                continue
+            same, other = out[k]
+            if loci[k][1] in codons:
+                out[k] = (same + 1, other)
+            else:
+                other[next(iter(codons)) if len(codons) == 1 else "?"] += 1
+    return out
 
 
 def recurs(same: int, other: int) -> bool:
@@ -473,16 +489,20 @@ def recurs(same: int, other: int) -> bool:
 
 def drop_replicated(ev: Evidence, pairs: Iterable[ReadPair], hits: Mapping[int, Sequence[Hit]]) -> dict[str, int]:
     """Remove the stops that recur at their locus (biology) from `ev`, and say what was found."""
-    n = replicates([(s.model, s.observed, s.flanks) for s in ev.stops], pairs, hits)
-    found = {"stops": len(n), "replicated": 0, "contradicted": 0, "alone": 0}
+    n = at_loci([(s.model, s.observed, s.flanks) for s in ev.stops], pairs, hits)
+    found = {"stops": len(n), "replicated": 0, "contradicted": 0, "alone": 0, "sourced": 0}
     kept = []
     for s, (same, other) in zip(ev.stops, n, strict=True):
-        if recurs(same, other):
+        if recurs(same, other.total()):
             found["replicated"] += 1
             ev.by_anchor[s.model, s.anchor][0] -= 1
             ev.codons[s.model] -= 1
             continue
         found["contradicted" if other else "alone"] += 1
+        # the other fragments agree on a codon one substitution away: that was the source (plan section 12, item 3)
+        if len(other) == 1 and (codon := next(iter(other))) in s.sources:
+            s = replace(s, source=codon)
+            found["sourced"] += 1
         kept.append(s)
     ev.stops = kept
     ev.replication = found
@@ -814,11 +834,26 @@ class _Weights:
     placed: dict[int, float]  # P(a family's overlaps are placed right), from its disagreements
 
 
+LOCUS_RIGHT = 0.99  # a locus' agreeing fragments named the source right for 99.3-100 % of a mock's stops
+
+
+def codon_weight(stop: Stop, prior: Prior) -> Array:
+    """Prior over a stop's sources: the stack's, or `LOCUS_RIGHT` on the codon its locus agrees on."""
+    w = np.array([prior.weight(stop.column, c) for c in stop.sources])
+    if stop.source is None or len(w) == 1:
+        return w
+    k = stop.sources.index(stop.source)
+    w[k] = 0.0
+    w *= (1 - LOCUS_RIGHT) / w.sum()  # the rest by the stack, should the locus be wrong
+    w[k] = LOCUS_RIGHT
+    return w
+
+
 class _Expectation:
     """E step: attribute stops to source codons and disputes to a mate, under head E, head Q and the stack."""
 
     def __init__(self, ev: Evidence, prior: Prior, quality_head: Sequence[Component]) -> None:
-        self.ev, self.codon_weight = ev, [np.array([prior.weight(s.column, c) for c in s.sources]) for s in ev.stops]
+        self.ev, self.codon_weight = ev, [codon_weight(s, prior) for s in ev.stops]
         keys = [k for s in ev.stops for pair in s.quality for rows in pair for k in rows]
         keys += [k for d, *_ in ev.disputed for rows in d[4:] for k in rows]
         score = _quality_scores(ev, keys, quality_head)
