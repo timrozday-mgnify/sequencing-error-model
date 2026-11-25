@@ -425,7 +425,14 @@ and the consensus of what follows) with two things `kmer` lacks: flanks on both 
 **Recommendation.**
 1. **Add a `locus` anchor (Tier 1c)**: rows for every base of a codon with ≥ 2 agreeing fragments, weighted by the mixture's P(error | substitution, effect), in the same fit as the stops and the overlap. Nonsense rows overlap the stop anchor's and are counted once.
 2. **Before P2 runs on HPC**, add its scoring only: the two tables above (counts and opportunities by substitution and effect, and recurring alleles) and the share of labels that the genomes call errors. They are a few hundred numbers per library, and D6331 and D6310 are where its one unproven part, ω, has truth. **Reported, not judged**: the agreed go rule (§7) stays as it is. **Done 2026-11-25:** [pfam_locus.py](../src/sequencing_error_model/pfam_locus.py) and a `LOCUS` step in the workflow, shown in `verdict.md`. On ERR10889147 the module reproduces the table above (2.15, 2.06, 1.82 × 10⁻⁴ undosed) and recovers +0.002 at 1.00 and +0.01 at 0.97–0.98.
-3. Do now, whatever else: use contradicting reads for a stop's source codon.
+3. Do now, whatever else: use contradicting reads for a stop's source codon. **Prototyped 2026-11-25** ([pfam_source_proto.py](pfam_source_proto.py)): the reads of
+   a stop's locus that agree on a sense codon name its source right 99.3-100 % of the time (mock, against the genome), where the stack prior's best
+   is right 88-89 %. But the spectrum hardly needs it: with equal rates per op, the stack prior puts 0.9 % of stops on the wrong op at +0.01
+   (2,648 error stops) and 5.0 % undosed (149), the locus where it exists 0.5 % and 2.6 %, both under the counting error of an op at P2's depth.
+   The prior's errors mostly cancel across ops. Coverage: 60 % of error stops at +0.01 and 87 % undosed (mock, 5x); 31 % and 43 % in ERR10889147,
+   where the locus agrees with the prior's best for 15 of 16 and 445 of 483. **So:** a cheap hard assignment where a locus exists, worth taking
+   when the fit is next touched, not a reason to; its value is where the prior is weakest (58 % right on the mock's stops with no locus) and in
+   samples with more strain variation per column, which the mock lacks.
 4. Not the column consensus. Not MGnify grouping; revisit members for source residues after P2.
 
 ## 13. Proposed: indels, and the codons no anchor labels (2026-11-25)
