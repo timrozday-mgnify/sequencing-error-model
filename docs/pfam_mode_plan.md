@@ -166,7 +166,7 @@ Tiers, each kept only if it beats the one before on held-out data and on mocks.
 - **Tier 2: whole-codon mixture (P4, only if needed).** The model of §2 with π_fk a Dirichlet around the stack,
   fitted by EM over all codons with a point mass at "invariant". It adds `A>G` / `T>C`, and more events. It is expected to fail for Illumina by 3.6 and
   to be useful for ONT.
-- **Tier 3: covariate contrast (P4).** A logit with a fixed effect per column. It adds the shape of `A>G` / `T>C` over Q and
+- **Tier 3: covariate contrast (P4; §13.2).** A logit with a fixed effect per column. It adds the shape of `A>G` / `T>C` over Q and
   cycle, with the level left `identified = false` (§5.6's convention for flagged components).
 - **Not planned:** plain NMF, a VAE or a Bayesian hierarchical sampler. They re-create the identifiability problem of
   §2 and add nothing the EM lacks.
@@ -190,7 +190,7 @@ floor inferred from reported Q.
 | `A>G`, `T>C` | where mates overlap (Tier 1b); otherwise no (Tier 2 or 3) |
 | centre Q, Q window, position, mate, tile | yes, given enough stops |
 | `Context(L,R)`, homopolymer, clustering | no |
-| indels | long reads only |
+| indels | long reads; short reads by locus if §13.1 pays |
 | head Q | from the FASTQ, as in `kmer` |
 
 ## 6. Yield: what reads buy
@@ -268,7 +268,7 @@ fit to the bit) and `compare.op_rates`. 16 tests in `tests/test_pfam.py`, 3 in `
 about 100 bp, where yield is uncertain) and SRR24523812, the isolate with all three modes fitted (phases 5–6), each as 3.6–4.8 M pairs by stride.
 
 **What runs** ([workflows/pfam](../workflows/pfam/README.md)): undosed, +0.002 and +0.01 copies, searched against Pfam 39.0; a fit of both anchors at each dose and of
-each anchor alone undosed; the undosed reads aligned to the genomes. `pfam_truth score` then, per library:
+each anchor alone undosed; the undosed reads aligned to the genomes (hit tables and alignments kept in `results/keep/` on HPC, §13). `pfam_truth score` then, per library:
 - classifies every counted stop by the genome under it: `error` (a sense codon there), `genome` (a stop there: pseudogene, gene end, misplaced read),
   `variant` (a site where these reads carry another base at ≥ 20 %), `indel` or `unaligned`;
 - labels **every base of every exposed codon**, not only the stop-adjacent ones a fit saw, and compares each fit's predicted errors with the observed ones per
@@ -413,6 +413,12 @@ top-allele labels were errors; at the mock's 5 × 10⁻⁴, 4 %.
   Only 40 families could be tested here. Worth a test only if P2 shows per-substitution error from the stack prior to matter.
 
 **Limits of what was measured.** Real strain variation has no truth here: the mock has none, and the dose only shows that errors are recovered in its presence. ω comes from recurring alleles, and singleton variants are younger and less purged, so the true ω is higher and **E is biased up**; P2's D6331 (five *E. coli* strains) tests that.
+That ω depends on divergence is known from genomes: within-species pN/pS is near 1 between very close strains and falls to about 0.1 with
+divergence (Rocha et al. 2006, bacterial genome pairs; Garud et al. 2019, gut strains; both cited from memory, to be checked in P5). It can be
+measured three ways: (1) P2's truth, already reported (`truth.omega`, the biology labels, beside the recurring-allele ω), with power in D6331;
+(2) a per-family table from public genomes, pN/pS on the same Pfam domains between conspecific pairs at the locus' divergence (identical 12-base
+flanks, a few differences per kb), built once from MGnify's species catalogues or GTDB; (3) a sample's own assembly where it has one (variants
+≥ 20 %, as P2's `variant` class). **Order:** (1) measures the bias; build (2) only if the bias is large, to replace or correct the sample's ω.
 Requiring clean flanks drops reads where errors cluster: −2 % at 12 bases and −5 % at 18 on simulated heads, about even across Q; real reads may be worse. An error hotspot that recurs counts as biology, a PCR error as an error. It needs ≥ 3 fragments at a locus. It is `kmer` mode's idea (a key
 and the consensus of what follows) with two things `kmer` lacks: flanks on both sides and a reading frame, hence the effect classes. The same split could be tried on skiver's output where a frame is known.
 
@@ -421,4 +427,34 @@ and the consensus of what follows) with two things `kmer` lacks: flanks on both 
 2. **Before P2 runs on HPC**, add its scoring only: the two tables above (counts and opportunities by substitution and effect, and recurring alleles) and the share of labels that the genomes call errors. They are a few hundred numbers per library, and D6331 and D6310 are where its one unproven part, ω, has truth. **Reported, not judged**: the agreed go rule (§7) stays as it is. **Done 2026-11-25:** [pfam_locus.py](../src/sequencing_error_model/pfam_locus.py) and a `LOCUS` step in the workflow, shown in `verdict.md`. On ERR10889147 the module reproduces the table above (2.15, 2.06, 1.82 × 10⁻⁴ undosed) and recovers +0.002 at 1.00 and +0.01 at 0.97–0.98.
 3. Do now, whatever else: use contradicting reads for a stop's source codon.
 4. Not the column consensus. Not MGnify grouping; revisit members for source residues after P2.
+
+## 13. Proposed: indels, and the codons no anchor labels (2026-11-25)
+
+Two ideas from the user's questions, not yet tested. Both run on the hit tables and reads that P2 already makes, so neither needs a new search.
+
+**13.1 Indels by locus (short reads).** Today the mode is substitution only. Gaps in a hit are whole codons, which are biology, and a 1–2 base
+sequencing indel breaks the frame. The planned anchor is the frameshift pair: two hits of one family in one read, in different frames, at adjacent
+columns. That gives about a dozen per million 125 bp reads (§3.7), so it pays only on long reads with a frameshift-aware aligner (P4).
+The locus gives a second route. A read whose left 12-base flank matches a locus, and whose right flank matches the others at an offset of ±1 or ±2
+bases, has an indel between them. Strain indels in coding sequence are mostly multiples of 3, so the frame splits error from biology, as the codon
+effect does for substitutions. Indel rate and length mod 3 come out per locus; homopolymer length can be read from the flanks.
+- Test: P2's mocks, against indels in the aligned reads. Yield is the open question: Illumina indels are about 10⁻⁵ to 10⁻⁶, so it may only show a
+  rate, not covariates.
+- Mate overlap could also show an indel as a change in offset along the overlap. Check whether `pe_overlap.place` allows one before using it.
+
+**13.2 The codons no anchor labels: anchors set the level, the rest the shape.** Every exposed codon is already used: as a row that showed no
+error (the denominator, and the Q / position / mate covariates), as the stack prior for a stop's source codon, and in the overlap and the locus.
+What is not used is a plain disagreement with the column consensus, which biology swamps at Illumina rates (§3.6). Three ways to use more:
+1. **Within-column contrast (Tier 3).** At one column, biology does not depend on cycle, Q or mate; error does. A logit with a fixed effect per column
+   gives the shape of every op over those covariates, `A>G` / `T>C` included, from millions of codons. In the joint fit the level comes from
+   the anchors: stops for ten ops, overlap and locus for `A>G` / `T>C`. Q stays a covariate, never a label.
+2. **The locus mixture as Tier 1c in the same fit** (§12, recommendation 1). It is checked by the stops it overlaps: the two agree on the mock
+   (5.02 against 5.03 × 10⁻⁴).
+3. **Contradicting reads give a stop's source codon** (§12, recommendation 3): 119 of 140 stops in the mock, 23 of 48 in ERR10889147.
+
+Context is a fourth use: stops see only stop-adjacent contexts, and the contrast and the locus see all, so together they test whether the stops'
+rate is genome-wide (§5).
+
+**Where they land.** P3: 13.1 and 13.2 (1) prototyped on P2's kept hit tables, scored against P2's truth. P4: 13.2 (1) as Tier 3 in the fit, if
+it beats the anchors alone on held-out data.
 

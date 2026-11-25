@@ -87,14 +87,16 @@ From the laptop: 1.2 core-ms per read for the search, ORFs included. Seven libra
 README measured 13 times its laptop figure on the HPC's x86 nodes** before its kernels were rewritten, so expect 100-900 core-hours of `SEARCH`. A fit took 1.8 GB and 3 minutes at 0.3 M
 reads of a simulated mock (half of its reads place, against 15 % in ERR10889147), so about 35 GB and 90 minutes for 9 M: 64 GB is asked for. Scoring holds every exposed codon: 128 GB is asked
 for, unmeasured at that size. A task killed for memory retries with more.
-Work directories hold the SAM (about 5 GB a library) and the hit tables (1-2 GB): budget about 150 GB, removable after the run.
+Work directories hold the SAM (about 5 GB a library) and the hit tables (1-2 GB): budget about 150 GB, removable after the run. Copies of
+both go to `results/keep/` (8-11 GB a library, about 70 GB in all): **keep it on HPC**. Later analyses (plan sections 12-13) start from it
+instead of searching again, which is most of the run's cost.
 
 ## Bring back
 
-Megabytes: `results/verdict.*`, `results/score/*.json` and `results/fits/` (specs and their reports). Nothing else.
+Megabytes: `results/verdict.*`, `results/score/*.json`, `results/locus/*.json` and `results/fits/` (specs and their reports). Not `results/keep/`.
 
 ```bash
-rsync -av $HPC:$RUNS/p2/results/ results-pfam-p2/
+rsync -av --exclude keep/ $HPC:$RUNS/p2/results/ results-pfam-p2/
 ```
 
 ## On a laptop

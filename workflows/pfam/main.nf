@@ -39,6 +39,8 @@ process ORFS {
 process SEARCH {
     tag "$run $dose"
     label 'search'
+    // Kept on HPC for later analyses (plan sections 12-13), not brought back. ponytail: uncompressed; gzip if space binds
+    publishDir { "${params.outdir}/keep/$run/$dose" }, mode: 'copy'
     input:
     tuple val(run), val(dose), path(orfs)
     path prep
@@ -76,6 +78,7 @@ process FIT {
 process ALIGN {
     tag "$run"
     label 'align'
+    publishDir { "${params.outdir}/keep/$run" }, mode: 'copy'
     input:
     tuple val(run), val(dose), path(r1), path(r2), path(genomes)
     output:
