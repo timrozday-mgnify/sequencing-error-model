@@ -445,9 +445,23 @@ effect does for substitutions. Indel rate and length mod 3 come out per locus; h
 **13.2 The codons no anchor labels: anchors set the level, the rest the shape.** Every exposed codon is already used: as a row that showed no
 error (the denominator, and the Q / position / mate covariates), as the stack prior for a stop's source codon, and in the overlap and the locus.
 What is not used is a plain disagreement with the column consensus, which biology swamps at Illumina rates (§3.6). Three ways to use more:
-1. **Within-column contrast (Tier 3).** At one column, biology does not depend on cycle, Q or mate; error does. A logit with a fixed effect per column
-   gives the shape of every op over those covariates, `A>G` / `T>C` included, from millions of codons. In the joint fit the level comes from
-   the anchors: stops for ten ops, overlap and locus for `A>G` / `T>C`. Q stays a covariate, never a label.
+1. **Within-locus contrast (Tier 3; prototyped 2026-11-25, [pfam_contrast_proto.py](pfam_contrast_proto.py)).** Biology at a site does not depend
+   on the cycle, Q or mate it was read at; error does. So `mismatch with the group's consensus = b(group) + e(covariates)`, a fixed effect per group,
+   fitted by alternating means. e is identified up to a constant: **the contrast gives the shape, the anchors the level** (stops for ten ops,
+   overlap and locus for `A>G` / `T>C`). Q stays a covariate, never a label.
+   - **Per column it fails.** 36 % of bases differ from their column's consensus (many genomes per column), and that variance swamps the error:
+     on the mock the cycle curve was ± 1 × 10⁻³ against a signal of 7 × 10⁻⁴, and on ERR10889147 the dose came back at +2 × 10⁻² in one Q bin.
+   - **Per locus it works** (column, codon base, strand and 12 bases each side; ≥ 3 reads). Mock (150,000 pairs, three genomes, truth from the
+     alignment), level from the truth: Q curve from 6.5 × 10⁻² (Q 15–19) to 3.90 × 10⁻⁴ (Q ≥ 38) against 6.6 × 10⁻² and 3.85 × 10⁻⁴; cycle from
+     8.9 to 2.3 × 10⁻⁴ against 8.8 to 1.9; **all twelve ops, `A>G` / `T>C` included**, within their sd in three Q bins (`A>G` 3.6 × 10⁻², 2.4 × 10⁻³,
+     2.1 × 10⁻⁴ against 3.7 × 10⁻², 2.4 × 10⁻³, 2.0 × 10⁻⁴). The locus keeps 41 % of exposed bases, the same share in every Q bin, and their error
+     is that of all exposed bases (5.1 against 5.3 × 10⁻⁴).
+   - **ERR10889147** (535,458 reads, 1.4 M bases in 332,874 loci): +0.01 comes back flat over Q within ± 1.5 × 10⁻³, the most in the sparse
+     low-Q bins. R1 and R2 agree to 3 × 10⁻⁶ ± 2 × 10⁻⁵; the stops' R1 2.8 / R2 4.6 × 10⁻⁴ (52 stops) is within their counting error. With the
+     stops' 3.7 × 10⁻⁴ as level, the Q curve runs 9.6 × 10⁻³ (Q < 15), 2.1 × 10⁻³ (20–24), 4.3 × 10⁻⁴ (30–34), 2.3 × 10⁻⁴ (≥ 38).
+   - **Not shown:** that the fixed effect removes real strain variation (the mock has none: there, the plain locus mismatch did as well), that
+     errors clustered in real reads do not bias it through the clean flanks (simulated errors may cluster less), and mate on the mock (98 % of
+     its loci hold one mate only, as simulated). D6331 in P2's `keep/` tests the first two.
 2. **The locus mixture as Tier 1c in the same fit** (§12, recommendation 1). It is checked by the stops it overlaps: the two agree on the mock
    (5.02 against 5.03 × 10⁻⁴).
 3. **Contradicting reads give a stop's source codon** (§12, recommendation 3): 119 of 140 stops in the mock, 23 of 48 in ERR10889147.
@@ -455,5 +469,5 @@ What is not used is a plain disagreement with the column consensus, which biolog
 Context is a fourth use: stops see only stop-adjacent contexts, and the contrast and the locus see all, so together they test whether the stops'
 rate is genome-wide (§5).
 
-**Where they land.** P3: 13.1 and 13.2 (1) prototyped on P2's kept hit tables, scored against P2's truth. P4: 13.2 (1) as Tier 3 in the fit, if
+**Where they land.** P3: 13.1, and 13.2 (1) scored on P2's kept hit tables against P2's truth (D6331 for strain variation). P4: 13.2 (1) as Tier 3 in the fit, if
 it beats the anchors alone on held-out data.
