@@ -457,4 +457,3 @@ rate is genome-wide (§5).
 
 **Where they land.** P3: 13.1 and 13.2 (1) prototyped on P2's kept hit tables, scored against P2's truth. P4: 13.2 (1) as Tier 3 in the fit, if
 it beats the anchors alone on held-out data.
-
