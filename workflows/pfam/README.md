@@ -38,11 +38,13 @@ BASE=/hps/nobackup/<group>/<user>
 RUNS=$BASE/sequencing-error-model_runs/sem-pfam
 ```
 
-1. Update the checkout on HPC (the image holds no repo code; it is bound from here):
+1. Update the checkout on HPC (the image holds no repo code; it is bound from here). Until PR #57 is merged the kit is on `pfam-p2`; after, use `main`:
 
    ```bash
-   ssh $HPC "git -C $BASE/sequencing-error-model pull"
+   ssh $HPC "git -C $BASE/sequencing-error-model fetch && git -C $BASE/sequencing-error-model checkout pfam-p2 && git -C $BASE/sequencing-error-model pull"
    ```
+
+   `sem-tools.sif` needs no rebuild: `uv.lock` has not changed since phase 6b.
 
 2. Make the run directory and the site config, then edit the config's `CHANGE` paths, queue and account:
 
@@ -66,7 +68,9 @@ RUNS=$BASE/sequencing-error-model_runs/sem-pfam
    cd $RUNS/p2 && sbatch $BASE/sequencing-error-model/workflows/pfam/run.sh --only ERR2984773 --max_pairs 20000 --outdir trial
    ```
 
-   Check in `trial/score/ERR2984773.json`: `stats.reads_aligned` close to `stats.reads_exposed`, and `stops.unaligned` small.
+   Check in `trial/score/ERR2984773.json`: `stats.reads_aligned` close to `stats.reads_exposed`, and `stops.unaligned` small. Also that
+   `trial/locus/` has `ERR2984773.0.json` and `ERR2984773.0.01.json`, and `trial/keep/ERR2984773/` has `aligned.sam` and a `pairs.tsv` per dose.
+   Then remove it: `rm -rf trial`.
 
 4. **The run:**
 
