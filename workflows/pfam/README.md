@@ -38,10 +38,10 @@ BASE=/hps/nobackup/<group>/<user>
 RUNS=$BASE/sequencing-error-model_runs/sem-pfam
 ```
 
-1. Update the checkout on HPC (the image holds no repo code; it is bound from here). Until PR #57 is merged the kit is on `pfam-p2`; after, use `main`:
+1. Update the checkout on HPC (the image holds no repo code; it is bound from here). Until PR #58 is merged the kit is on `pfam-locus-source` (`main` lacks the kept reads); after, use `main`:
 
    ```bash
-   ssh $HPC "git -C $BASE/sequencing-error-model fetch && git -C $BASE/sequencing-error-model checkout pfam-p2 && git -C $BASE/sequencing-error-model pull"
+   ssh $HPC "git -C $BASE/sequencing-error-model fetch && git -C $BASE/sequencing-error-model checkout pfam-locus-source && git -C $BASE/sequencing-error-model pull"
    ```
 
    `sem-tools.sif` needs no rebuild: `uv.lock` has not changed since phase 6b.
