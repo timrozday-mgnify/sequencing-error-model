@@ -2472,7 +2472,8 @@ Test infrastructure only (§1 scope): it exists so separation methods have per-b
 - **Explore: a `pfam` evidence mode** (minimal reference, added 2026-11-24; its P1 built early as a user exception to the gate, the rest
   behind it): in-frame stops inside Pfam domains and mate overlap as substitution-error labels, from reads placed by kfpfam, in
   `sources/pfam.py`. On one real library 0.97 ± 0.03 of 0.01 added errors per base come back end to end (ten of twelve ops; the
-  other two need overlapping mates). It needs no coverage or assembly. **Not yet tested against truth.** Plan, results and HPC preparation:
+  other two need overlapping mates). It needs no assembly, and coverage only to remove biological stops. **Not yet tested against truth:** the HPC kit for that
+  (`workflows/pfam`, seven libraries, go / no-go) is ready and was rehearsed on simulated Zymo reads. Plan, results and HPC preparation:
   [pfam_mode_plan.md](pfam_mode_plan.md).
 - **Exit:**
   - each source recovers a known model on synthetic data;

@@ -1,6 +1,6 @@
 # Plan: a `pfam` evidence mode (minimal reference)
 
-Status: **explored 2026-11-24; P0 and P1 done (results in §7, P1), P2 onwards not started.** P0 is [pfam_proto.py](pfam_proto.py);
+Status: **explored 2026-11-24; P0 and P1 done (results in §7, P1); P2 is ready to run on HPC (2026-11-25), and not run.** P0 is [pfam_proto.py](pfam_proto.py);
 P1 is [sources/pfam.py](../src/sequencing_error_model/sources/pfam.py), started before the gate closed as a user exception.
 It sits behind the §6.5.1 decision gate of [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) like the rest of
 phase 11, and is not an input to it. §3's numbers are P0's; where P1 corrects one, §7 says so.
@@ -262,15 +262,50 @@ fit to the bit) and `compare.op_rates`. 16 tests in `tests/test_pfam.py`, 3 in `
 
 **Not done:** the RawR / hmmalign parquet adapter (question 1 below; `pairs.tsv` only), panel file, the `Tile` term, indels.
 
-### P2: mock communities and an isolate, with truth (HPC, §8) - **go / no-go**
-- Six ZymoBIOMICS runs already have kfpfam results (`nar-review-response/hpc/B11_pfam_arms/runs.tsv`: ERR2984773, SRR12324253, SRR12829160, ERR2935805,
-  SRR23926920, SRR32629731; two are about 100 bp, where yield is uncertain), plus SRR24523812, the isolate with all three modes fitted (phases 5–6).
-- `reference` mode on the same reads labels **each exposed codon's truth**. So each counted stop is classified: sequencing error, a stop
-  in the genome (the real floor), or misplaced read (the real false-homology rate).
-- **Anchor test:** with both anchors in one fit against each alone, on the runs whose inserts overlap. Keep the overlap anchor only if it
-  measures the floor (stops in both mates) or the two missing ops better than the mocks' truth allows by chance.
-- **Go** if, on at least five of seven runs: total rate within 15 % of `reference` on the same codons; each identified op within 25 %;
-  Q and mate curves inside `reference`'s intervals; floor ≤ 2 × 10⁻⁴ per base.
+### P2: mock communities and an isolate, with truth (HPC) - **go / no-go**; prepared, not run
+
+**Libraries** (`workflows/pfam/runs.csv`): six ZymoBIOMICS runs (ERR2984773, SRR12324253, SRR12829160, ERR2935805, SRR23926920, SRR32629731; two are
+about 100 bp, where yield is uncertain) and SRR24523812, the isolate with all three modes fitted (phases 5–6), each as 3.6–4.8 M pairs by stride.
+
+**What runs** ([workflows/pfam](../workflows/pfam/README.md)): undosed, +0.002 and +0.01 copies, searched against Pfam 39.0; a fit of both anchors at each dose and of
+each anchor alone undosed; the undosed reads aligned to the genomes. `pfam_truth score` then, per library:
+- classifies every counted stop by the genome under it: `error` (a sense codon there), `genome` (a stop there: pseudogene, gene end, misplaced read),
+  `variant` (a site where these reads carry another base at ≥ 20 %), `indel` or `unaligned`;
+- labels **every base of every exposed codon**, not only the stop-adjacent ones a fit saw, and compares each fit's predicted errors with the observed ones per
+  op, Q, mate and read position.
+
+**Go rule** (`pfam_truth.verdict`; proposals until agreed, §10.2). A library passes if, for the fit with both anchors:
+- the ten ops' total is within 15 % of the genomes', and its floor's 95 % bound is ≤ 2 × 10⁻⁴ per base (`genome` + `variant` stops the fit kept);
+- no single op, Q group, mate or position quarter is `outside` 25 %, that is off by more than 25 % + 2 sd.
+
+A check counts only where its sd, from the stops and errors counted, is at most half its tolerance. A library whose total has no power neither passes nor fails. **Go** if five of seven
+pass, **no-go** once too many have failed for five to pass. This replaces the earlier "curves inside `reference`'s intervals", which a truth measured
+on millions of bases would have made impossible to meet. Reported but not judged: standard additions, each anchor alone, `A>G` and `T>C` (the anchor test).
+
+**The laptop rehearsal: what it changed before any HPC time was spent.** Reads were simulated from the ten genomes of ZymoBIOMICS' standard with ERR10889147's fitted heads
+and searched with all of Pfam 38.2.
+- **The floor criterion would have failed.** Error-free reads (250,000 pairs, 3x on the bacteria) give 109 stops in 3.9 M exposed codons at T1 35: 2.3 × 10⁻⁴ per base. T1 does not remove it (2.2 at 40, 2.0 at
+  45), nor does T2 (2.0 × 10⁻⁴ at 10, 2.1 at 15, rising beyond), and family weights cannot, as the stops are spread over about 100 families. They concentrate in *L. fermentum*, *Salmonella* and *E. coli*:
+  real pseudogenes.
+- **A stop that recurs at its locus is biology** (`pfam.replicates`, `drop_replicated`): same codon between the same 12-base flanks in other fragments, more often than errors at 1 %
+  could explain (p < 0.01). No Q, no genome, 2 seconds. It drops 80 of 114 at 3x, and nearly all that stay have no second read. **So it needs coverage: at 1x most of the floor remains.**
+- **Rehearsal with errors** (150,000 pairs, 5x on three bacteria, errors at 1.2 × 10⁻³; kit code throughout):
+
+  | | |
+  |---|---|
+  | stops | 279 found: 149 errors (none dropped), 128 in the genomes (113 dropped), 2 unaligned (both dropped) |
+  | floor per base | 4.4 × 10⁻⁴ → 5.2 × 10⁻⁵ (95 % bound 8 × 10⁻⁵) |
+  | ten-op total, fit over genomes | 1.00 ± 0.08 |
+  | standard additions, +0.002 / +0.01 | 1.02 / 0.99 |
+  | anchors alone (ten ops) | stops 1.10, overlap 1.09 |
+  | `A>G`, `T>C` | both 0.81, 1.25; stops alone 0.70, 1.34; overlap alone 0.82, 1.21 |
+
+  149 error stops are too few to test single ops, and the stop anchor's `A>G` / `T>C` are extrapolations. 4–5 M pairs should give 1,000–4,500, depending on the platform.
+- **On ERR10889147** the same filter drops 4 of 52 stops; 23 are contradicted by another read and 25 have none to compare with. Of the added errors 26 % have none, so
+  the undosed excess of unsupported stops (25, where 26 % of about 31 would be 8) is probably biology in rare genomes, and the crude rate an overestimate there. To be turned into an estimate in P3, after P2's
+  truth shows whether the argument holds: real errors also cluster in reads whose flanks are bad.
+
+**Not tested:** Slurm, the real images (the `singularity` profile ran with a stand-in runtime), Pfam 39.0, memory at 10 M reads (64 GB asked for a fit and 128 GB for scoring; a fit took 1.8 GB at 300,000 reads), real truth.
 - **No-go** outcome is still useful: report the floor and keep the mode as a lower-effort check, or drop it.
 
 ### P3: real libraries (HPC)
@@ -292,28 +327,9 @@ fit to the bit) and `compare.op_rates`. 16 tests in `tests/test_pfam.py`, 3 in `
 
 ## 8. HPC preparation
 
-Everything below is to be **written, tested on a laptop (`-profile test`) and handed over** under `workflows/pfam/`. It follows `workflows/hpc/`: one Nextflow
-workflow, a Singularity image built on the laptop, `site.config` copied and edited, `run.sh` submitted from a run directory on Slurm.
-
-| Process | Work | Image | Resources |
-|---|---|---|---|
-| `SUBSAMPLE` | every Nth pair of each raw FASTQ (no fastp, no merging) | seqkit | 1 cpu, 4 GB |
-| `DOSE` | standard-addition copies at 0, 0.002 and 0.01 (undosed first) | this repo | 1 cpu, 4 GB |
-| `ORFS` | six-frame ORFs, `pfam_proto.py orfs` | this repo | 1 cpu, 8 GB |
-| `FILTER` | `kfpfam filter join`, panel index, `FILTER_MIN_GAPPED=21.25` (or r999's bar) | kfpfam-filter | 8 cpu, 8 GB |
-| `PAIRS` | `recruit/pairs.py` | pyhmmer | 8 cpu, 16 GB |
-| `EXPOSURE` | `pfam_proto.py exposure` (later `sources/pfam.py`); output is a small table | this repo | 1 cpu, 8 GB |
-| `REFERENCE` | minimap2 / minibwa to the mock's genomes, truth per exposed codon (P2) | sem-tools | 8 cpu, 16 GB |
-| `FIT` | EM, curves, report JSON | this repo | 1 cpu, 8 GB |
-
-- **Cost, from a laptop run:** 1.2 core-ms per read for the filter plus HMMER on all of Pfam (480 CPU-s for 400,000 reads, ORF calling and exposure included).
-  Three doses of 5 M pairs (10 M reads) is about 10 core-hours per run on an M4, 140 for 14 runs. **kfpfam's README warns that Mode A cost about 13x its
-  laptop figure per read on Codon's x86 nodes**, so budget about 2,000 core-hours, or less with a panel index (§7, P1). Use `r999` or Mode A's bar, not `top`.
-- **Inputs to supply on HPC:** raw FASTQs (ENA paths are in B11's `samplesheet.csv`; fetch on a login node if compute nodes cannot reach ENA), the Pfam
-  index, `prep/` and `gapped.txt` already built for B11 (39.0), the mocks' genome FASTAs (B9 has the truth references), and the shovill assembly.
-- **Pfam release:** the prototype used 38.2; the HPC indexes are 39.0. Rebuild or pin one, and record it in the spec provenance.
-- **Returned:** aggregated count tables and report JSONs, megabytes at most (the per-codon table is ~50 MB per 400,000 reads and stays on HPC), for local fitting and plots. Nothing else.
-- **Not prepared yet:** the workflow. It is P2's first task and needs P1, the parquet question below, and the site settings.
+Done for P2: [workflows/pfam](../workflows/pfam/README.md) has the workflow, images, inputs, layout, commands, cost and what to bring back. The `test` profile runs it on a laptop
+without containers. It reuses `sem-tools.sif` (phase 6b), and the kfpfam image, Pfam 39.0 prep and index of B11. P3 uses the same workflow with other rows in `runs.csv`, but `ALIGN`, `SCORE` and
+`VERDICT` need genomes, so it will need a switch to skip them.
 
 ## 9. Risks
 
@@ -321,7 +337,8 @@ workflow, a Singularity image built on the laptop, `site.config` copied and edit
 |---|---|---|
 | **Selection on error**: recruitment drops error-rich reads | P1. Already cost a factor of 2 (3.2) | the standard-addition run, end to end, in every report |
 | **False homology** at low T1 | T1 25 gives 6x the stops | the T1 plateau |
-| **Biological floor** (pseudogenes, retroelements, recoding, phage) | Illumina below ~3 × 10⁻⁴ | panel; family random effects; P2 truth; per-stop excess test |
+| **Biological floor** (pseudogenes, retroelements, recoding, phage): measured at 2.3 × 10⁻⁴ on error-free Zymo reads | Illumina below ~3 × 10⁻⁴ | locus replication where a locus has ≥ 2 reads; family weights; P2 truth |
+| **Locus replication drops real errors** that recur (a hotspot, PCR copies) | deep libraries | none dropped of 149 in the rehearsal; P2's truth keeps them and will show it |
 | **Host reads** | human LINE-1 in a gut sample | host depletion first, and the panel |
 | **Stop-adjacent context only** | a rate that is not genome-wide | reported as such; compared on shared contexts |
 | **Reads < 90 bp, DNBSEQ** | no exposure | yield table; refuse under a threshold |
@@ -331,7 +348,7 @@ workflow, a Singularity image built on the laptop, `site.config` copied and edit
 ## 10. Open questions
 
 1. **The hmmalign parquet:** where is it, and does it have GA-only or all hits, nucleotides or residues?
-2. **Go / no-go thresholds** in P2 are proposals. They should be agreed before the run, not after.
+2. **Go / no-go rule** in P2 (§7): the 15 %, 25 %, 2 × 10⁻⁴ and five-of-seven are proposals, as is the power rule. They should be agreed before the run, not after.
 3. **The gate.** The main plan says nothing in phases 9–11 starts before §6.5.1 closes. The user made an exception for P1. P2 needs its own;
    the argument is that it does not touch `kmer` mode and can share an HPC window with the gate run.
 

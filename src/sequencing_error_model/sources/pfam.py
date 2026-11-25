@@ -25,6 +25,13 @@ too low counts chance homology. `add_errors` plus a rerun of the search is the e
 **The stack.** The codon a stop (or a disputed base) came from has a prior: the sample's own codons at that column
 plus `lam` codons' worth of the HMM's emissions, `lam` chosen by leave-one-out likelihood of the sense codons.
 
+**Stops that are biology** (pseudogenes, recoding, a gene's own end) recur in every read of their locus; an error does
+not. `replicates` counts the other fragments that show the same codon, or another, between the same flanking bases,
+and `drop_replicated` removes stops that recur more often than errors could. On error-free reads of the ZymoBIOMICS
+genomes at 3x, 109 in-frame stops (2.3e-4 per base, whatever `t1` and `t2`) fell to 34, nearly all at loci no other
+read covered: it needs coverage, so a library at 1x keeps most of its floor. `provenance["replication"]` says how many
+stops were checked.
+
 **Families with a real stop rate** (pseudogenes, retroelements, recoding) are found by a spike-and-slab on the
 family's stops against its exposure, and weighted down whole (rows as well as stops). It looks at the outcome, so it
 biases the rate down a little; `tests/test_pfam.py` measures that on clonal reads.
@@ -34,6 +41,7 @@ Substitutions only: the fitted head E gets -inf indel logits. `Tile` and longer 
 """
 
 import argparse
+import gzip
 import itertools
 import json
 import math
@@ -42,7 +50,7 @@ import sys
 import warnings
 from collections import Counter, defaultdict
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
@@ -75,6 +83,8 @@ _CIGAR = re.compile(r"(\d+)([MID])")
 _SLAB = np.logspace(-3.5, -1, 11)  # a real stop rate per codon, log-uniform
 SPREAD = 0.3  # relative sd of a family's error stops about head E's expectation
 UNIDENTIFIED_BY_STOPS = ("A>G", "T>C")
+FLANK = 12  # bases each side that make a locus
+CEILING = 0.01  # the highest error rate per base at which a recurring stop is still read as biology
 
 ReadPair = tuple[str, Sequence[int], str, Sequence[int]]
 Column = tuple[int, int]  # model, match column (0-based)
@@ -150,6 +160,8 @@ class Stop:
     erred: tuple[Key, ...]  # the substituted base's row, per source
     others: tuple[tuple[Key, ...], ...]  # the source's remaining opportunities, all "="
     quality: tuple[tuple[tuple[Key, ...], tuple[Key, ...]], ...]  # head Q rows with the source, and as observed
+    anchor: int  # whole bits
+    flanks: tuple[str, str] | None  # `FLANK` bases before and after, coding strand; None at a read end
 
 
 @dataclass
@@ -171,6 +183,7 @@ class Evidence:
     stats: Stats = field(default_factory=Stats)
     # (stops, opportunities) by family and whole-bit anchor score: the plateau over t1
     by_anchor: dict[tuple[int, int], list[int]] = field(default_factory=dict)
+    replication: dict[str, int] | None = None  # `drop_replicated`'s report
 
     def crude_rate(self, t1: float, weights: Mapping[int, float] | None = None) -> tuple[float, float]:
         """(substitutions per base if all were as likely, stops), anchor bar `t1`, families by `weights` (1)."""
@@ -390,6 +403,92 @@ def _stop_rows(read: _Read, codon: Codon, source: str, m: int, flank: tuple[int,
     return out
 
 
+def flanks(seq: str, codon: Codon) -> tuple[str, str] | None:
+    """The `FLANK` bases either side of a codon, on its strand; None where the read ends first."""
+    strand = _revcomp(seq) if codon.reverse else seq
+    at = len(seq) - 1 - codon.positions[0] if codon.reverse else codon.positions[0]
+    if at < FLANK or at + 3 + FLANK > len(seq):
+        return None
+    return strand[at - FLANK : at], strand[at + 3 : at + 3 + FLANK]
+
+
+Locus = tuple[int, str, tuple[str, str] | None]  # model, codon, flanks
+
+
+def _find(strand: str, left: str, right: str) -> list[int]:
+    """Where a codon lies between the flanks: one of them exact, the other with at most two mismatches.
+
+    The read's own errors fall in its flanks too, and must not leave its stop looking alone.
+    """
+    out = []
+    for exact, start, other, codon in ((left, FLANK + 3, right, FLANK), (right, -FLANK - 3, left, -3)):
+        i = strand.find(exact)
+        while i >= 0:
+            lo = i + start
+            if lo >= 0 and lo + FLANK <= len(strand):
+                near = sum(a != b for a, b in zip(strand[lo : lo + FLANK], other, strict=True)) <= 2
+                if near and i + codon not in out:
+                    out.append(i + codon)
+            i = strand.find(exact, i + 1)
+    return out
+
+
+def replicates(
+    loci: Sequence[Locus], pairs: Iterable[ReadPair], hits: Mapping[int, Sequence[Hit]]
+) -> list[tuple[int, int]]:
+    """Fragments with the same codon, and with another codon, between each locus' flanks: its own is counted.
+
+    Only reads with a hit to the locus' family are searched, which is what makes this cheap. Mates count once.
+    """
+    by_model: dict[int, list[int]] = defaultdict(list)
+    for k, (model, _, around) in enumerate(loci):
+        if around:
+            by_model[model].append(k)
+    out = [[0, 0] for _ in loci]
+    for number, (s1, _, s2, _) in enumerate(pairs):
+        seen: dict[int, bool] = {}
+        for mate, s in enumerate((s1, s2)):
+            wanted = [k for f in {h.model for h in hits.get(2 * number + mate, ())} for k in by_model.get(f, ())]
+            if not wanted:
+                continue
+            strands = (s.upper(), _revcomp(s.upper()))
+            for k in wanted:
+                _, codon, around = loci[k]
+                assert around is not None
+                for st in strands:
+                    if at := _find(st, *around):
+                        seen[k] = seen.get(k, False) or any(st[c : c + 3] == codon for c in at)
+        for k, same in seen.items():
+            out[k][0 if same else 1] += 1
+    return [(a, b) for a, b in out]
+
+
+def recurs(same: int, other: int) -> bool:
+    """Do `same` fragments of `same + other` share a stop more often than errors at `CEILING` would (p < 0.01)?
+
+    ponytail: PCR copies of one fragment count as replicates, so a library error in them is dropped too.
+    """
+    return same >= 2 and float(special.gammainc(same - 1, (same + other - 1) * CEILING / 3)) < 0.01
+
+
+def drop_replicated(ev: Evidence, pairs: Iterable[ReadPair], hits: Mapping[int, Sequence[Hit]]) -> dict[str, int]:
+    """Remove the stops that recur at their locus (biology) from `ev`, and say what was found."""
+    n = replicates([(s.model, s.observed, s.flanks) for s in ev.stops], pairs, hits)
+    found = {"stops": len(n), "replicated": 0, "contradicted": 0, "alone": 0}
+    kept = []
+    for s, (same, other) in zip(ev.stops, n, strict=True):
+        if recurs(same, other):
+            found["replicated"] += 1
+            ev.by_anchor[s.model, s.anchor][0] -= 1
+            ev.codons[s.model] -= 1
+            continue
+        found["contradicted" if other else "alone"] += 1
+        kept.append(s)
+    ev.stops = kept
+    ev.replication = found
+    return found
+
+
 def _stop(read: _Read, codon: Codon, m: int, flank: tuple[int, int]) -> Stop:
     sources, erred, others, q = [], [], [], []
     for p, source in _SOURCES[codon.bases]:
@@ -408,6 +507,8 @@ def _stop(read: _Read, codon: Codon, m: int, flank: tuple[int, int]) -> Stop:
         tuple(erred),
         tuple(others),
         cast("tuple[tuple[tuple[Key, ...], tuple[Key, ...]], ...]", tuple(q)),
+        int(codon.anchor),
+        flanks(read.seq, codon),
     )
 
 
@@ -847,13 +948,14 @@ def fit(
         "sources": list(sources),
         "identified_ops": ["substitution"],
         # fitted by extrapolation, from the other ops into the same base, unless mates overlap
-        "unidentified_ops": [] if ev.stats.overlaps else list(UNIDENTIFIED_BY_STOPS),
+        "unidentified_ops": [] if ev.overlap or ev.disputed else list(UNIDENTIFIED_BY_STOPS),
         "stats": asdict(ev.stats),
         "t1": ev.t1,
         "lam": prior.lam,
         "plateau": ev.plateau(w.family),
         "plateau_warning": ev.check_plateau(w.family),
         "floor": floor(ev.stats),
+        "replication": ev.replication,
         "downweighted_families": {profiles.names[f]: round(x, 4) for f, x in w.family.items() if x < 0.5},
         "downweighted_overlaps": {profiles.names[f]: round(x, 4) for f, x in w.placed.items() if x < 0.5},
     }
@@ -872,20 +974,42 @@ def read_pairs(
         yield s1, q1, s2, q2
 
 
+def write_pairs(pairs: Iterable[ReadPair], prefix: Path) -> int:
+    """`prefix`_1/2.fastq.gz with each pair named by its number, so an aligner's output maps back to read ids."""
+    n = 0
+    with gzip.open(f"{prefix}_1.fastq.gz", "wt", 3) as one, gzip.open(f"{prefix}_2.fastq.gz", "wt", 3) as two:
+        for n, (s1, q1, s2, q2) in enumerate(pairs, 1):
+            for out, s, q in ((one, s1, q1), (two, s2, q2)):
+                out.write(f"@{n - 1}\n{s}\n+\n{''.join(chr(v + 33) for v in q)}\n")
+    return n
+
+
+def only(ev: Evidence, anchor: str) -> Evidence:
+    """The evidence of one anchor, `stops` or `overlap`: for testing each against both (plan P2).
+
+    Codons that `collect` gave to the overlap are not handed back to the stops.
+    """
+    if anchor == "overlap":
+        return replace(ev, certain=defaultdict(Counter), stops=[], codons=Counter())
+    return replace(ev, overlap=defaultdict(Counter), disputed=[], shared=Counter())
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="python -m sequencing_error_model.sources.pfam", description="Fit a spec from reads placed on Pfam."
     )
     sub = p.add_subparsers(dest="command", required=True)
+    c = sub.add_parser("reads", help="write the strided, dosed pairs, named by number, for an aligner")
     a = sub.add_parser("orfs", help="write the six-frame ORFs to search with kfpfam and HMMER")
     b = sub.add_parser("fit", help="fit a spec from the search's pairs.tsv")
-    for x in (a, b):
+    for x in (a, b, c):
         x.add_argument("r1", type=Path, help="mate 1 FASTQ[.gz], raw: not merged and not error-corrected")
         x.add_argument("r2", type=Path, nargs="?", help="mate 2 FASTQ[.gz]; omit for a single-end library")
         x.add_argument("--max-pairs", type=int)
         x.add_argument("--every-n", type=int, default=1, metavar="N", help="keep every Nth pair, never a head slice")
-        x.add_argument("--dose", type=float, default=0.0, help="add substitutions at this rate; same in both commands")
+        x.add_argument("--dose", type=float, default=0.0, help="add substitutions at this rate; same in every command")
     a.add_argument("--output", type=Path, required=True, metavar="FASTA")
+    c.add_argument("--output", type=Path, required=True, metavar="PREFIX", help="PREFIX_1.fastq.gz and PREFIX_2")
     b.add_argument("--pairs", type=Path, required=True, help="kfpfam recruit/pairs.py's table, E <= 1000")
     b.add_argument("--prep", type=Path, required=True, help="kfpfam data/prep of the release searched")
     b.add_argument("--panel", type=Path, help="accessions to use, one per line (default: all)")
@@ -895,11 +1019,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     b.add_argument("--quality-tokens", nargs="+", default=["QualityMarkov(1)", "Position(48)", "Mate", "Context(1,1)"])
     b.add_argument("--t1", type=float, default=35.0, help="anchor bar, raw profile bits (see the plateau it reports)")
     b.add_argument("--t2", type=float, default=6.0)
+    b.add_argument("--anchors", choices=("both", "stops", "overlap"), default="both")
     b.add_argument("--quality-every", type=int, default=20, metavar="N", help="head Q from every Nth pair")
     b.add_argument("--iterations", type=int, default=30)
     b.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     pairs = read_pairs(args.r1, args.r2, args.max_pairs, args.every_n, args.dose)
+    if args.command == "reads":
+        if args.r2 is None:
+            p.error("reads needs both mates")
+        # through a staged link too: the output would truncate the reads it is made from
+        outputs = {Path(f"{args.output}_{i}.fastq.gz").resolve() for i in (1, 2)}
+        if outputs & {args.r1.resolve(), args.r2.resolve()}:
+            p.error(f"--output {args.output} would overwrite its own input")
+        print(write_pairs(pairs, args.output))
+        return 0
     if args.command == "orfs":
         with args.output.open("w") as out:
             for number, (s1, _, s2, _) in enumerate(pairs):
@@ -912,6 +1046,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     flank = (1, 1)
     m = max(Component(args.error_tokens[0]).args[0], Component(args.quality_tokens[0]).args[0])
     ev = collect(pairs, hits, profiles, m, flank, args.t1, args.t2, quality_every=args.quality_every)
+    drop_replicated(ev, read_pairs(args.r1, args.r2, args.max_pairs, args.every_n, args.dose), hits)
+    ev = ev if args.anchors == "both" else only(ev, args.anchors)
     spec, _ = fit(
         ev,
         profiles,
