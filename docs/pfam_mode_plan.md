@@ -441,6 +441,27 @@ effect does for substitutions. Indel rate and length mod 3 come out per locus; h
 - Test: P2's mocks, against indels in the aligned reads. Yield is the open question: Illumina indels are about 10⁻⁵ to 10⁻⁶, so it may only show a
   rate, not covariates.
 - Mate overlap could also show an indel as a change in offset along the overlap. Check whether `pe_overlap.place` allows one before using it.
+- **Prototyped 2026-11-25** ([pfam_indel_proto.py](pfam_indel_proto.py)). Each read's next 24 bases after a locus' 12-base key are compared with
+  the consensus of the locus' other reads; at the first difference the next 10 bases must match it exactly as a substitution, or after a shift of
+  1-3 (every compared consensus base confident: letting unclear ones match anything made 3 × 10⁻³ false calls per base). Mock (150,000 pairs, three
+  genomes, none with indels as simulated), 5 × 10⁻⁴ indels added (lengths 1 / 2 / 3 at 60 / 20 / 20 %, half insertions):
+
+  | Locus membership | Indels at the positions it covers | Found | Calls that are real | False calls, mock without indels |
+  |---|---|---|---|---|
+  | own exposed codon, search rerun | 9.6 × 10⁻⁵, 58 % of them in frame | 90 % | 100 % | 0 in 3.5 M positions |
+  | 12-base key, search rerun | 4.2 × 10⁻⁴ | 64 % | 99 % | 21 in 7.8 M (2.7 × 10⁻⁶) |
+  | **12-base key, loci from the undosed reads, no second search** | **5.15 × 10⁻⁴** | **64 %** (64, 65, 63 % by length) | **98 %** | as above |
+
+  - **Exposure selects on the error counted**: a frameshift ends the hit, so the codons before it stop being exposed, and frameshifts are seen at
+    1/10 of their rate (in-frame at 1/2). Reads mostly keep a hit (87 % with a frameshift, 91 % in frame), so the loss is local. A key that joins
+    reads by the 12 bases before the window does not look at the window, which is the rule of §3.1.
+  - **Sensitivity is 64 % at every length**, so standard additions calibrate it, and they need no second search: loci are placed by the undosed
+    reads and a dosed copy is scanned for their keys. P2's `keep/` (undosed reads and hit tables) is therefore enough.
+  - **ERR10889147** (535,458 reads, 4.9 M positions covered): 45 frameshift calls (38 one-base deletions) and 15 in frame. 9.3 × 10⁻⁶ per base raw,
+    1.0-1.5 × 10⁻⁵ after sensitivity and the mock's false-call rate, in Illumina's expected range. At P2's 9 M reads, about 750 a library: a rate
+    and a length split, not covariates.
+  - **Not shown:** real indels' truth (P2: the CIGARs of `keep/`'s alignments), the false-call rate on real reads, strain indels (D6331), and
+    homopolymer context. Scanning every read rather than those with a hit removes the last 13 % of selection.
 
 **13.2 The codons no anchor labels: anchors set the level, the rest the shape.** Every exposed codon is already used: as a row that showed no
 error (the denominator, and the Q / position / mate covariates), as the stack prior for a stop's source codon, and in the overlap and the locus.
