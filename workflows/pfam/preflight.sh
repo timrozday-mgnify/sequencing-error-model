@@ -41,6 +41,8 @@ ISOLATE=$SEM_HPC/data/SRR24523812_contigs.fa
 bad=0
 ok() { echo "  ok    $*"; }
 no() { echo "  FIX   $*"; bad=$((bad + 1)); }
+# The checkout may belong to another user (a shared service account): trust it for these reads, since the workflow runs its code anyway.
+git() { command git -c safe.directory="$REPO" "$@"; }
 run() { singularity exec -B "$REPO/src:/app/src" "$@"; }  # as the workflow runs it (nextflow.config)
 
 echo "== tools"
@@ -53,7 +55,7 @@ else
 fi
 
 echo "== code"
-if ! command -v git >/dev/null; then
+if ! type -P git >/dev/null; then
     no "no git on PATH"
 elif err=$(git -C "$REPO" rev-parse 2>&1); then
     git -C "$REPO" fetch -q origin main 2>/dev/null || echo "  note  could not fetch origin: checking the local main only"
