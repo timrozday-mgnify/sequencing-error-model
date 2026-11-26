@@ -53,14 +53,16 @@ else
 fi
 
 echo "== code"
-if git -C "$REPO" rev-parse >/dev/null 2>&1; then
+if ! command -v git >/dev/null; then
+    no "no git on PATH"
+elif err=$(git -C "$REPO" rev-parse 2>&1); then
     git -C "$REPO" fetch -q origin main 2>/dev/null || echo "  note  could not fetch origin: checking the local main only"
     here=$(git -C "$REPO" rev-parse HEAD) main=$(git -C "$REPO" rev-parse origin/main)
     [[ $(git -C "$REPO" branch --show-current) == main ]] || no "$REPO is not on main: git -C $REPO switch main"
     [[ $here == "$main" ]] && ok "$REPO at origin/main ${here:0:7}" || no "$REPO at ${here:0:7}, origin/main is ${main:0:7}: git -C $REPO pull"
     [[ -z $(git -C "$REPO" status --porcelain --untracked-files=no -- src workflows) ]] || no "$REPO has local changes under src/ or workflows/"
 else
-    no "no checkout at $REPO: set REPO"
+    no "no checkout at $REPO (git: ${err:-?}): set REPO"
 fi
 
 echo "== inputs"
