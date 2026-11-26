@@ -4,6 +4,25 @@
 // aligned to the genomes, and every fit is scored against them. Last: the go / no-go over all libraries.
 nextflow.enable.dsl = 2
 
+// The reads from FIRE, as raw-reads-analysis-pipeline's DOWNLOAD_FROM_FIRE does: once per run, for every dose.
+process FIRE {
+    tag "$run"
+    label 'small'
+    secret 'FIRE_ACCESS_KEY'
+    secret 'FIRE_SECRET_KEY'
+    container "${ workflow.containerEngine == 'singularity' ?
+        'oras://community.wave.seqera.io/library/boto3:1.35.37--a82b4d378d332259' :
+        'community.wave.seqera.io/library/pip_boto3:501beb4bd409b3e1' }"
+    input:
+    tuple val(run), val(url1), val(url2)
+    output:
+    tuple val(run), path("${url1.tokenize('/').last()}"), path("${url2.tokenize('/').last()}")
+    script:
+    """
+    fire_fetch.py $url1 $url2
+    """
+}
+
 // Every Nth pair over the whole run, never a head slice (observations.subset). Named by number, so the alignment
 // and the search speak of the same reads. Standard additions go in here, before any step can select on them.
 process READS {
@@ -141,10 +160,7 @@ process VERDICT {
 }
 
 def fastq(url) {
-    if (params.fastq_dir) return file("${params.fastq_dir}/${url.tokenize('/').last()}", checkIfExists: true)
-    // FIRE holds ENA's vol1/ as the era-public bucket; the aws scope comes from $CONFIGS' codon base.config (run.sh)
-    if (params.fire) return file(url.replaceFirst(/^\w+:\/\/[^\/]+\/vol1\//, 's3://era-public/'))
-    return file(url)
+    return params.fastq_dir ? file("${params.fastq_dir}/${url.tokenize('/').last()}", checkIfExists: true) : file(url)
 }
 
 workflow {
@@ -162,8 +178,10 @@ workflow {
     def fits = [['0', 'both', 'both'], ['0', 'stops', 'stops'], ['0', 'overlap', 'overlap']] +
         doses.collect { [it, "dose$it".toString(), 'both'] }
 
-    def reads = READS(rows.combine(channel.fromList(['0'] + doses))
-        .map { r, dose -> [r.run, r.every_n, fastq(r.r1), fastq(r.r2), dose] })
+    def fastqs = params.fire && !params.fastq_dir
+        ? FIRE(rows.map { r -> [r.run, r.r1, r.r2] })
+        : rows.map { r -> [r.run, fastq(r.r1), fastq(r.r2)] }
+    def reads = READS(rows.map { r -> [r.run, r.every_n] }.join(fastqs).combine(channel.fromList(['0'] + doses)))
     def pairs = SEARCH(ORFS(reads), prep, index, hmm, pairs_py)
     def ready = reads.join(pairs, by: [0, 1])
     def specs = FIT(ready.combine(channel.fromList(fits)).filter { it[1] == it[5] }
