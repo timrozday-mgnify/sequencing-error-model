@@ -32,7 +32,6 @@ import sys
 from collections import Counter
 from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import asdict, replace
-from itertools import islice
 from pathlib import Path
 from typing import Any, cast
 
@@ -43,7 +42,7 @@ from sequencing_error_model import recovery
 from sequencing_error_model import spec as spec_io
 from sequencing_error_model.fit import error, indel
 from sequencing_error_model.generate import _flank, observations
-from sequencing_error_model.observations import CountTable, Key
+from sequencing_error_model.observations import CountTable, Key, subset
 from sequencing_error_model.sources import bam, pe_overlap, skiver_analyze
 from sequencing_error_model.sources.skiver_analyze import SkiverAnalyze
 from sequencing_error_model.spec import ErrorModelSpec
@@ -73,6 +72,63 @@ def _exposure(table: CountTable, by: Sequence[str], indels: bool = False) -> dic
     return out
 
 
+def on_support(table: CountTable, like: CountTable, by: Sequence[str] = ("pos_start", "pos_end")) -> CountTable:
+    """`table` with every row reweighted so its `by` marginal matches `like`'s, and rows outside `like` dropped.
+
+    It answers "what would this comparison read if these rows sat where the other mode's rows sit". That is the
+    question phase 6b item 1 leaves open: only 1,687 of 20,000 pairs overlap at a 365 bp median insert, so
+    `pe-overlap` rows sit at the read ends, exactly where `kmer`'s position shape is wrong (3-4x low at the
+    start, 1.5-2x high at the end) - which would explain why `kmer` agrees with `reference` on reference rows
+    (1.52x) but not on overlap rows (2.09x) without any of its other components being at fault.
+
+    Standardisation, not selection: a kept row's count is scaled by `like`'s share of its `by` value over
+    `table`'s own, so the result has `table`'s rates conditional on `by` and `like`'s exposure over `by`. Rates
+    *within* a `by` value are therefore untouched, and only the pooled rate moves.
+    """
+    if missing := sorted((set(by) - set(table.fields)) | (set(by) - set(like.fields))):
+        raise ValueError(f"{table.source} and {like.source}: no fields {missing}")
+    idx, like_idx = [table.fields.index(f) for f in by], [like.fields.index(f) for f in by]
+    here: Counter[Key] = Counter()
+    for k, n in table.counts.items():
+        here[tuple(k[i] for i in idx)] += n
+    there: Counter[Key] = Counter()
+    for k, n in like.counts.items():
+        there[tuple(k[i] for i in like_idx)] += n
+    if not (shared := here.keys() & there.keys()):
+        raise ValueError(f"{table.source} and {like.source} share no values of {list(by)}")
+    hn, tn = sum(here[v] for v in shared), sum(there[v] for v in shared)
+    scale = {v: (there[v] / tn) / (here[v] / hn) for v in shared}
+    kept = _counts((k, n * scale[v]) for k, n in table.counts.items() if (v := tuple(k[i] for i in idx)) in scale)
+    meta = {**table.meta, "standardised_to": like.source, "standardised_by": list(by)}
+    return replace(table, source=f"{table.source}:on({like.source})", counts=kept, meta=meta)
+
+
+def op_rates(table: CountTable) -> dict[str, dict[str, float]]:
+    """Errors, exposure and rate per substitution, counting a base as exposed only to the ops its row can show.
+
+    Tables with an `ops` field (`sources.pfam`) label a subset of substitutions per row, so a rate per base is not
+    comparable with another source's; a rate per op is, on the bases each source exposes to it.
+    """
+    if missing := sorted({"op", "context"} - set(table.fields)):
+        raise ValueError(f"{table.source}: no fields {missing}")
+    oi, ci, left = table.fields.index("op"), table.fields.index("context"), tuple(table.meta.get("flank", (0, 0)))[0]
+    at = table.fields.index("ops") if "ops" in table.fields else None
+    errors: Counter[str] = Counter()
+    chance: Counter[str] = Counter()
+    for key, n in table.counts.items():
+        op, centre = str(key[oi]), str(key[ci])[left]
+        if "-" in op:
+            continue
+        for b in "ACGT" if at is None else str(key[at]):
+            if b != centre:
+                chance[f"{centre}>{b}"] += n
+        if op != "=":
+            errors[op] += n
+    return {
+        op: {"errors": errors[op], "exposure": x, "rate": errors[op] / x} for op, x in sorted(chance.items()) if x > 0
+    }
+
+
 def evidence(
     a: CountTable,
     b: CountTable,
@@ -82,7 +138,7 @@ def evidence(
 ) -> dict[str, Any]:
     """Substitution rates of two tables on the covariate values both observe, standardised to pooled exposure."""
     ea, eb = _exposure(a, by, indels), _exposure(b, by, indels)
-    shared = sorted((k for k in ea.keys() & eb.keys() if min(ea[k][0], eb[k][0]) >= min_exposure), key=str)
+    shared = sorted((k for k in ea.keys() & eb.keys() if min(ea[k][0], eb[k][0]) >= min_exposure), key=_order)
     if not shared:
         raise ValueError(f"{a.source} and {b.source} share no values of {list(by)} with {min_exposure} rows each")
     w = np.array([ea[k][0] + eb[k][0] for k in shared])
@@ -279,8 +335,24 @@ def models(a: ErrorModelSpec, b: ErrorModelSpec, table: CountTable, by: str = "q
     }
 
 
+def _order(key: Key) -> tuple[Any, ...]:
+    """Sort key for covariate values: numbers in numeric order, everything else after them, as text.
+
+    `pos_start` runs 1..150, and sorting those as strings interleaves 1, 10, 100, 11 - which made the
+    per-position arrays in these reports unreadable and easy to misplot (plan phase 6b item 1).
+    """
+    out: list[tuple[int, float, str]] = []
+    for part in key:
+        text = str(part)
+        try:
+            out.append((0, float(text), ""))
+        except ValueError:
+            out.append((1, 0.0, text))
+    return tuple(out)
+
+
 def _values(key: "np.ndarray[Any, Any]") -> list[str]:
-    return sorted(set(key.tolist()), key=lambda v: (len(v), v))
+    return sorted(set(key.tolist()), key=lambda v: _order((v,)))
 
 
 def _rates(p: "list[np.ndarray[Any, Any]]", n: "np.ndarray[Any, Any]", sel: "np.ndarray[Any, Any]") -> list[float]:
@@ -418,6 +490,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--min-overlap", type=int, default=20)
     p.add_argument("--min-mapq", type=int, default=20)
     p.add_argument("--max-pairs", type=int)
+    p.add_argument(
+        "--every-n",
+        type=int,
+        default=1,
+        metavar="N",
+        help="keep every Nth read or pair rather than a head slice; see `observations.subset`",
+    )
     p.add_argument("--max-reads", type=int)
     p.add_argument("--mask-alt-freq", type=float, help="mask sites with a non-reference allele at this frequency")
     p.add_argument("--skiver", type=Path, metavar="PREFIX", help="`skiver analyze -o` prefix on the same reads")
@@ -432,14 +511,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     flank = (max(2, *(f[0] for f in flanks)), max(2, *(f[1] for f in flanks)))
     m = max(h[0].args[0] for h in heads)
 
-    ev = pe_overlap.collect(
-        islice(pe_overlap.read_pairs(args.r1, args.r2), args.max_pairs), m, flank, min_overlap=args.min_overlap
-    )
-    overlap = pe_overlap.table(ev, a.error_head)
+    pairs = subset(pe_overlap.read_pairs(args.r1, args.r2), args.max_pairs, args.every_n)
+    ev = pe_overlap.collect(pairs, m, flank, min_overlap=args.min_overlap)
+    overlap = pe_overlap.table(ev, a.error_head, a.quality_head)
     masked = None
     if args.mask_alt_freq is not None:
         masked = bam.masks(bam.pileup(args.bam, args.reference, args.min_mapq), args.reference, args.mask_alt_freq)[0]
-    reads = islice(bam.records(args.bam, args.reference, args.min_mapq, masked), args.max_reads)
+    reads = subset(bam.records(args.bam, args.reference, args.min_mapq, masked), args.max_reads, args.every_n)
     reference = observations(reads, flank, m, "reference")
     if not overlap.counts or not reference.counts:
         p.error("no overlap rows" if not overlap.counts else "no usable aligned reads")
@@ -458,7 +536,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "components": components(k, other, t, min_exposure=args.min_exposure),
                 "models": models(k, other, t),
             }
-            for name, other, t in (("overlap", a, overlap), ("reference", b, reference))
+            for name, other, t in (
+                ("overlap", a, overlap),
+                ("reference", b, reference),
+                # The same reference rows, standardised to where the overlap rows sit: phase 6b item 1's
+                # open check on whether `kmer`'s position shape accounts for the two modes disagreeing.
+                ("reference_on_overlap_positions", b, on_support(reference, overlap)),
+            )
         }
         if args.generated_reads:
             report["kmer"]["generated"] = {

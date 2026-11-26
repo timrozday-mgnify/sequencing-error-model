@@ -1,0 +1,3 @@
+id,module,args,truth
+bare_k21,recovery,--reads 4000 -k 21,
+latent2_k21,recovery,--reads 4000 -k 21,latent2

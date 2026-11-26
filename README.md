@@ -1,7 +1,7 @@
 # sequencing-error-model
 
-> Working name. Early development: the native generator and the `pe-overlap` mode work; the `reference`
-> and `kmer` modes and the exporters are planned.
+> Working name. Early development: the native generator, the three evidence modes and the wave-1 exporters
+> (ART, InSilicoSeq, Badread, PBSIM3) work; see the plan for status.
 
 Train sequencing error models from read evidence. Models are
 quality-aware: they estimate the error profile of a base from its reported quality and the
@@ -39,6 +39,15 @@ Simulate reads (bases, qualities and CIGAR) from a spec, as single templates or 
 
 ```bash
 uv run sem-generate --model spec/ --input genome.fasta --output reads.fastq --pairs 10000 --read-length 125 --insert-mean 300 --insert-sd 50
+```
+
+Export a spec to another simulator's model files. Q-coupled simulators (ART, InSilicoSeq, PBSIM3 QSHMM)
+take `--q-policy preserve-quality` (default: the spec's qualities; errors follow the simulator's 10^(-Q/10))
+or `preserve-errors` (the spec's error rate; qualities remapped). `out/fidelity.json` lists what the format
+drops, the error rate and Q marginal the simulator will produce, and the simulator arguments to use:
+
+```bash
+uv run sem-export iss --model spec/ --output iss_model/ --read-length 150 --q-policy preserve-errors
 ```
 
 ## Development

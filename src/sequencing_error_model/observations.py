@@ -25,14 +25,17 @@ Field vocabulary (positions are 1-based):
 - `strand` ("+", "-"), `mate` (1, 2), `gc` ((lo, hi) GC % bin), `length` (read length).
 - `indel` ("I", "D"), `indel_length` (bases in one indel event), `run` (template homopolymer run length at the
   event); error labels like `op`, so they also need a truth-bearing source.
-- `read` (index of the read in its source), `latent` (read-level class of `Latent(S)`, 0-based).
+- `ops`: the observed bases a row's source can label as a substitution, e.g. "AG" (`fit.error`); needs `op`.
+- `read` (index of the read in its source), `latent` (read-level class of `Latent(S)`, 0-based),
+  `tile` (the read's flowcell tile, as an index into `Tile(n)`'s own levels).
 """
 
 import re
 from collections import Counter
-from collections.abc import Hashable, Iterable
+from collections.abc import Hashable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
-from typing import Any
+from itertools import islice
+from typing import Any, TypeVar
 
 # Upstream skiver `ALL_OPERATIONS` order.
 ERROR_OPS = (
@@ -44,7 +47,8 @@ OP_VALUES = frozenset(("=", "!", *ERROR_OPS))
 # What one count is: a base, a skiver value observation, a read, or an error event with no exposure.
 UNITS = frozenset(("base", "value", "read", "error"))
 _FIELD = re.compile(
-    r"op|context|locus|q|q[+-][1-9]\d*|t|pos_start|pos_end|strand|mate|gc|length|indel|indel_length|run|read|latent"
+    r"op|context|locus|q|q[+-][1-9]\d*|t|pos_start|pos_end|strand|mate|gc|length"
+    r"|indel|indel_length|run|read|latent|tile|ops"
 )
 
 Key = tuple[Hashable, ...]
@@ -56,6 +60,26 @@ def count(items: Iterable[tuple[Key, int]]) -> Counter[Key]:
     for key, n in items:
         c[key] += n
     return +c
+
+
+_T = TypeVar("_T")
+
+
+def subset(items: Iterable[_T], limit: int | None = None, every_n: int = 1, offset: int = 0) -> Iterator[_T]:
+    """Keep every `every_n`th record from `offset`, at most `limit` of them.
+
+    **Never slice a run contiguously.** At identical read counts, a head slice of a real Illumina run
+    reads 2.5x the per-base error rate of a tail slice of the same file (plan phase 6b item 2:
+    0.0081 against 0.0032 on ERR2935851), because flowcell position is read-level heterogeneity and
+    file order approximates it. So `limit` on its own is a *biased* subsample, not merely a small one,
+    and any cross-mode ratio built from two different blocks of one file measures read selection.
+    `every_n` spreads the sample over the whole run instead; `offset` takes a disjoint second sample.
+
+    Synthetic reads from `generate` are exchangeable, so `limit` alone is sound there.
+    """
+    if every_n < 1 or offset < 0:
+        raise ValueError(f"every_n must be >= 1 and offset >= 0, got every_n={every_n}, offset={offset}")
+    return islice(islice(items, offset, None, every_n), limit)
 
 
 @dataclass(frozen=True)

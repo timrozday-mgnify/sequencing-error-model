@@ -21,14 +21,14 @@ import numpy as np
 import numpy.typing as npt
 
 SCHEMA_VERSION = 1
-MODES = ("pe-overlap", "reference", "kmer")  # evidence modes (§1.1)
+MODES = ("pe-overlap", "reference", "kmer", "pfam")
 SKIVER_BUILDS = ("default", "enhanced")  # only for `kmer`
 MAX_Q = 93
 # Component name -> heads it may appear in (E: error, Q: quality). `Latent(S)` sits in both heads (its
 # per-class weights) and as the spec's `latent` layer (the class prior); all three must agree on S.
 # ponytail: names and heads only; argument arity is checked by each component's fitter.
 COMPONENTS = {
-    **dict.fromkeys(("Context", "ContextTable", "Position", "Mate", "Strand", "Homopolymer", "Latent"), "EQ"),
+    **dict.fromkeys(("Context", "ContextTable", "Position", "Mate", "Strand", "Homopolymer", "Latent", "Tile"), "EQ"),
     **dict.fromkeys(
         ("QualityWindow", "QualityxContext", "GC", "Weibull", "IndelLength", "FragmentOverdispersion"), "E"
     ),

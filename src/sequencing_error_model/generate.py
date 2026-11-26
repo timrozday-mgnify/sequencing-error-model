@@ -94,17 +94,38 @@ def generate(
     *,
     max_ins_run: int = 10,
     error_rate_scale: float = 1.0,
+    tracks: Sequence[Array] | None = None,
+    classes: Array | None = None,
+    strands: Sequence[int] | None = None,
+    tiles: Sequence[int] | Array | None = None,
 ) -> list[Read]:
-    """One read per template; mate 2 also uses the "-" strand covariate."""
+    """One read per template; mate 2 also uses the "-" strand covariate. `tracks` replaces head Q's draw with given
+    template-indexed Q tracks (values in the alphabet), e.g. an exporter's base profile. `classes` gives each
+    read's `Latent(S)` class instead of drawing it from the prior, so a caller can label the reads' tuples.
+
+    `strands` (0 forward, 1 reverse, per read) replaces that mate convention, which makes strand and mate the
+    same covariate and so unidentifiable together: a real library draws each fragment's orientation, so mate 1
+    is reverse half the time. The reads come back carrying it, which is what `_tuples` then records.
+
+    `tiles` gives each read's `Tile(n)` level, as `classes` does for `Latent(S)`. Without it a `Tile` head
+    draws from the component's own `prior` (uniform if it has none), since a tile is an observed covariate of
+    the library rather than part of the error process: the model says what each tile does, the prior says how
+    many reads come off each one.
+    """
     if max_ins_run < 1:
         raise ValueError("max_ins_run must be at least 1")
     templates = [t.upper() for t in templates]
     alphabet = np.asarray(model.quality_alphabet)
-    classes = None
-    if model.latent is not None:
+    if model.latent is not None and classes is None:
         prior = model.latent.params["prior"]
         classes = rng.choice(len(prior), size=len(templates), p=prior / prior.sum())
-    tracks = quality.sample(model.quality_head, model.quality_alphabet, templates, mates, rng, classes)
+    tile = next((c for c in model.error_head if c.name == "Tile"), None)
+    drawn_tiles = None if tiles is None else np.asarray(tiles, np.int64)
+    if tile is not None and drawn_tiles is None:
+        weights = np.asarray(tile.params.get("prior", np.ones(tile.args[0])), float)
+        drawn_tiles = rng.choice(len(weights), size=len(templates), p=weights / weights.sum())
+    if tracks is None:
+        tracks = quality.sample(model.quality_head, model.quality_alphabet, templates, mates, rng, classes)
     lengths = np.array([len(t) for t in templates], np.int64)
     n = int(lengths.sum())
     starts = np.r_[0, np.cumsum(lengths)[:-1]].astype(np.int64)
@@ -124,9 +145,12 @@ def generate(
         "pos_start": within + 1,
         "pos_end": rlen - within,
         "mate": mate,
-        "strand": (mate == 2).astype(np.int64),
+        "strand": (mate == 2).astype(np.int64)
+        if strands is None
+        else np.repeat(np.asarray(strands, np.int64), lengths),
         "gc": np.repeat([sum(gc_bin(t)) / 2 for t in templates], lengths),
         "latent": np.repeat(np.zeros(len(templates), np.int64) if classes is None else classes, lengths),
+        "tile": np.repeat(np.zeros(len(templates), np.int64) if drawn_tiles is None else drawn_tiles, lengths),
     }
     for o in range(1, model.error_head[0].args[0] + 1):
         for j, name in ((within - o, f"q-{o}"), (within + o, f"q+{o}")):
@@ -197,7 +221,16 @@ def generate(
     for i, track in enumerate(tracks):
         a, b = bounds[i], bounds[i + 1]
         e = emit[a:b]
-        reads.append(Read(seq[a:b][e].tobytes().decode(), qual[a:b][e].tobytes().decode(), _cigar(ops[a:b]), track))
+        on = None if strands is None else ("-" if strands[i] else "+")
+        reads.append(
+            Read(
+                seq[a:b][e].tobytes().decode(),
+                qual[a:b][e].tobytes().decode(),
+                _cigar(ops[a:b]),
+                track,
+                strand=on,
+            )
+        )
     return reads
 
 
@@ -303,23 +336,39 @@ def realign(
         w = min(max(0, a * min(n, m) - o - bound) // max(e, 1), max(n, m)) + 1
     neg = -(1 << 30)
     k = np.arange(2 * w + 1)
-    h, dl, ins = (np.full((n + 1, len(k)), neg, np.int32) for _ in range(3))
-    padded = np.r_[r, 0]
+    # One sentinel column past the band, left at `neg`, so the d+1 reads below never need a bounds check.
+    h, dl, ins = (np.full((n + 1, len(k) + 1), neg, np.int32) for _ in range(3))
+    e_k, oe_k = e * k, o + e * k  # the gap-extension ramp along the band, hoisted out of the row loop
+    # Only cells with 0 <= col <= m are ever valid, and `col` is contiguous and increasing along the band, so
+    # the valid part of a row is the slice [lo, hi). Computing just that slice is half the work of masking the
+    # whole band, which is where `reference` mode's soft-clip realignment spends its time (docs/test_cost.md).
     for i in range(n + 1):
-        col = i - w + k  # read index of each band cell
-        valid = (col >= 0) & (col <= m)
+        lo, hi = max(0, w - i), min(len(k), w - i + m + 1)
+        width = hi - lo
+        if width <= 0:  # past the band's reach: no cell of this row is valid, so it stays `neg`
+            continue
+        col_lo = i - w + lo  # == max(0, i - w)
+        first = 1 if col_lo == 0 else 0  # col 0 has no diagonal predecessor, so its diag is skipped
         if i == 0:
-            h0, d_row = np.where(col == 0, 0, neg), np.full(len(k), neg)
+            h0 = np.full(width, neg, np.int64)
+            if col_lo == 0:
+                h0[0] = 0
+            d_row = np.full(width, neg, np.int64)
         else:
-            diag = np.where(col >= 1, h[i - 1] + np.where(padded[np.clip(col - 1, 0, m)] == t[i - 1], a, -b), neg)
-            d_row = np.maximum(np.r_[h[i - 1, 1:], neg] - o - e, np.r_[dl[i - 1, 1:], neg] - e)
+            diag = np.full(width, neg, np.int64)
+            prev = r[col_lo - 1 + first : col_lo - 1 + width]  # the read base on each cell's diagonal
+            diag[first:] = h[i - 1, lo + first : hi].astype(np.int64) + np.where(prev == t[i - 1], a, -b)
+            d_row = np.maximum(h[i - 1, lo + 1 : hi + 1].astype(np.int64) - o, dl[i - 1, lo + 1 : hi + 1]) - e
             h0 = np.maximum(diag, d_row)
-            if free_template_ends:
-                h0 = np.where(col == 0, np.maximum(h0, 0), h0)
-        h0 = np.where(valid, h0, neg)
-        opened = np.maximum.accumulate(h0.astype(np.int64) + e * k)  # an insertion from any cell to the left
-        i_row = np.r_[neg, opened[:-1]] - o - e * k
-        h[i], dl[i], ins[i] = (np.where(valid, np.maximum(x, neg), neg) for x in (np.maximum(h0, i_row), d_row, i_row))
+            if free_template_ends and col_lo == 0:
+                h0[0] = max(h0[0], 0)
+        opened = np.maximum.accumulate(h0 + e_k[lo:hi])  # an insertion from any cell to the left
+        i_row = np.empty(width, np.int64)
+        i_row[0] = neg  # the cell to the left of the band is invalid
+        i_row[1:] = opened[:-1]
+        i_row -= oe_k[lo:hi]
+        for row, x in ((h, np.maximum(h0, i_row)), (dl, d_row), (ins, i_row)):
+            row[i, lo:hi] = np.maximum(x, neg)
 
     i = int(np.argmax(h[np.arange(n + 1), m - np.arange(n + 1) + w])) if free_template_ends else n
     j, end, state, ops = m, i, "H", []
@@ -411,6 +460,7 @@ def observations(
     source: str = "generator",
     per_event: bool = False,
     read_ids: bool = False,
+    template_index: bool = False,
 ) -> CountTable:
     """Head E tuples from (template, read, mate) triples, one row per draw, as `fit.error` expects.
 
@@ -420,11 +470,13 @@ def observations(
     aligned part; `strand` overrides the mate-based strand. Rows at template bases other than A, C, G, T, at
     `masked` template indices, or with a read base other than A, C, G, T (an N call), are skipped. With `per_event` (head E with `IndelLength`), an indel event gives
     one row, its first inserted or deleted base, as the generator draws it. `read_ids` adds a `read` field, the
-    record's index, for per-read fits (`Latent(S)`).
+    record's index, for per-read fits (`Latent(S)`); `template_index` adds `t`, the row's template base, which
+    a caller holding each record's placement turns into a reference site (`sites.joint`).
     """
     left, right = flank
     fields = ("q", *(f"q{s}{o}" for o in range(1, m + 1) for s in "-+"))
-    fields += ("context", "pos_start", "pos_end", "mate", "strand", "gc", *(("read",) if read_ids else ()), "op")
+    fields += ("context", "pos_start", "pos_end", "mate", "strand", "gc", *(("read",) if read_ids else ()))
+    fields += (*(("t",) if template_index else ()), "op")
     counts: Counter[Key] = Counter()
     for index, (template, read, mate) in enumerate(records):
         rid = (index,) if read_ids else ()
@@ -444,7 +496,7 @@ def observations(
                 filled[i + o] if 0 <= i + o < len(filled) else None for k in range(1, m + 1) for o in (-k, k)
             )
             key = (filled[i], *window, padded[t : t + left + right + 1], i + 1, len(filled) - i, mate, strand, gc)
-            key += (*rid, op)
+            key += (*rid, *((t,) if template_index else ()), op)
             counts[key] += 1
     return CountTable(source, fields, "base", True, counts, {"flank": flank})
 

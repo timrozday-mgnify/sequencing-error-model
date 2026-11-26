@@ -10,6 +10,10 @@ Each table row is one draw at a template base: the `context` centre is its true 
 `op` is "=", "X>Y" with X the centre, "->Y" or "X>-". An insertion is followed by another draw at the same
 base (as the generator does, up to its `max_ins_run`), so a base with an insertion contributes two rows.
 
+A source that can only label some substitutions says which per row in the optional field `ops` (the observed
+bases it can label, e.g. "AG"). The row's likelihood is then conditional on "=" or one of those; insertions,
+deletions and the other substitutions are masked. `sources.pfam` sees a substitution only if it makes a stop codon.
+
 Components and params (A = alphabet size, trailing axis K):
 
 - `QualityWindow(m)` (required, first): `bias` [K], `window` [2m+1, A+1, K] over offsets -m..m; row A is
@@ -21,6 +25,9 @@ Components and params (A = alphabet size, trailing axis K):
 - `GC(n)`: `knots` [n] over GC %, `weights` [n, K]: linear spline of the `gc` bin midpoint.
 - `QualityxContext(r)`: `quality` [A, r] and `context` [3, 5, r, K], a rank-r interaction of the centre Q
   with bases x_{t-1..t+1}.
+- `Tile(n)`: `weights` [n, K] by the read's flowcell tile - the one read-level covariate that is *observed*,
+  so unlike `Latent(S)` it needs no per-read inference and works where an overlap gives few observations per
+  read (plan phase 4). Categorical, never a monotone drift: file order only approximates tile order.
 - `Latent(S)`: `weights` [S, K] by the read's class, shared with head Q (`fit.latent`). Field `latent`.
 
 Q enters only as a categorical feature, never as 10^(-Q/10): the calibration is learned.
@@ -34,17 +41,19 @@ from typing import Any
 import numpy as np
 from scipy import optimize, sparse, special
 
-from sequencing_error_model.fit.quality import _BASE, Array, _csr, _hat
+from sequencing_error_model.fit.quality import _BASE, Array, _csr, _hat, _one_axis
 from sequencing_error_model.observations import CountTable, Key
 from sequencing_error_model.spec import Component
 
 CATEGORIES = ("=", ">A", ">C", ">G", ">T", "->A", "->C", "->G", "->T", "-")
 COMPONENTS = (
     *("QualityWindow", "Context", "Homopolymer", "Position", "Mate", "Strand", "GC", "QualityxContext", "Latent"),
+    "Tile",
 )
 # Rows per objective chunk: the softmax temporaries are [CHUNK, K], so peak memory does not grow with rows.
 CHUNK = 200_000
 _ARITY = {"QualityWindow": 1, "Context": 2, "Homopolymer": 0, "Position": 1, "Mate": 0, "Strand": 0, "GC": 1}
+_ARITY["Tile"] = 1
 _K = len(CATEGORIES)
 
 
@@ -54,7 +63,7 @@ def _check(components: Sequence[Component]) -> None:
         raise ValueError(f"head E needs QualityWindow(m) first, then distinct {COMPONENTS[1:]}, got {names}")
     for c in components:
         a = c.args
-        low = {"Position": 2, "GC": 2, "QualityxContext": 1, "Latent": 2}.get(c.name, 0)
+        low = {"Position": 2, "GC": 2, "QualityxContext": 1, "Latent": 2, "Tile": 2}.get(c.name, 0)
         if len(a) != _ARITY.get(c.name, 1) or (low and a[0] < low):
             raise ValueError(f"bad arguments in {c.token!r}")
 
@@ -63,7 +72,7 @@ def _fields(c: Component) -> set[str]:
     if c.name == "QualityWindow":
         return {"q"} | {f"q{s}{i}" for i in range(1, c.args[0] + 1) for s in "+-"}
     extra = {"Position": {"pos_start", "pos_end"}, "Mate": {"mate"}, "Strand": {"strand"}, "GC": {"gc"}}
-    extra["Latent"] = {"latent"}
+    extra["Latent"], extra["Tile"] = {"latent"}, {"tile"}
     return {"context"} | extra.get(c.name, set()) | ({"q"} if c.name == "QualityxContext" else set())
 
 
@@ -97,6 +106,10 @@ def _data(fields: Sequence[str], keys: Sequence[Key], alphabet: Sequence[int], m
             d[f] = np.array([s == "-" for s in col], np.int64)
         elif f == "gc":
             d[f] = np.array([(lo + hi) / 2 for lo, hi in col], float)
+        elif f == "ops":
+            if bad := {b for ops in set(col) for b in ops} - set("ACGT"):
+                raise ValueError(f"`ops` lists observed bases A, C, G and T, got {sorted(bad)}")
+            d[f] = np.array([[b in ops for b in "ACGT"] for ops in col], bool).reshape(n, 4)
         else:
             d[f] = np.asarray(col)
     d["centre"] = d["context"][:, d["flank"][0]]
@@ -117,12 +130,12 @@ def _shapes(c: Component, d: dict[str, Any]) -> dict[str, tuple[int, ...]]:
         return {"start": (c.args[0],), "end": (c.args[0],)}
     if c.name in ("Mate", "Strand"):
         return {"weights": (2,)}
-    if c.name in ("GC", "Latent"):
+    if c.name in ("GC", "Latent", "Tile"):
         return {"weights": (c.args[0],)}
     return {}  # QualityxContext is bilinear, handled by _interaction
 
 
-def _design(c: Component, d: dict[str, Any]) -> tuple[Array, Array]:
+def _design(c: Component, d: dict[str, Any], fitting: bool = False) -> tuple[Array, Array]:
     """(slot index, value) per row for the linear part of one component; both [R, J]."""
     n, f0 = len(d["centre"]), d["flank"][0]
     if c.name == "QualityWindow":
@@ -141,14 +154,17 @@ def _design(c: Component, d: dict[str, Any]) -> tuple[Array, Array]:
         return (run - 1)[:, None], np.ones((n, 1))
     if c.name == "Position":
         knots = c.params["knots"]
-        vals = np.hstack([_hat(d["pos_start"], knots), _hat(d["pos_end"], knots)])
+        start, end = _hat(d["pos_start"], knots), _hat(d["pos_end"], knots)
+        if fitting and _one_axis(d["pos_start"], d["pos_end"]):
+            end = np.zeros_like(end)  # collinear here: fit one axis, but never discard a fitted one
+        vals = np.hstack([start, end])
         return np.broadcast_to(np.arange(vals.shape[1]), vals.shape), vals
     if c.name == "Mate":
         return (d["mate"] - 1)[:, None], np.ones((n, 1))
     if c.name == "Strand":
         return d["strand"][:, None], np.ones((n, 1))
-    if c.name == "Latent":
-        return np.asarray(d["latent"], np.int64)[:, None], np.ones((n, 1))
+    if c.name in ("Latent", "Tile"):
+        return np.asarray(d["latent" if c.name == "Latent" else "tile"], np.int64)[:, None], np.ones((n, 1))
     if c.name == "GC":
         knots = c.params["knots"]
         vals = np.stack([np.interp(d["gc"], knots, e) for e in np.eye(len(knots))], axis=1)
@@ -156,14 +172,14 @@ def _design(c: Component, d: dict[str, Any]) -> tuple[Array, Array]:
     return np.zeros((n, 0), np.int64), np.zeros((n, 0))
 
 
-def _matrix(components: Sequence[Component], d: dict[str, Any]) -> sparse.csr_matrix:
+def _matrix(components: Sequence[Component], d: dict[str, Any], fitting: bool = False) -> sparse.csr_matrix:
     """The design matrix, built straight as CSR: every row has the same slots, so `indptr` is a stride.
 
     Going through COO would sort and de-duplicate 3 arrays of `rows x slots`, which is the fit's memory peak.
     """
     idxs, vals_, offset = [], [], 0
     for c in components:
-        idx, vals = _design(c, d)
+        idx, vals = _design(c, d, fitting)
         idxs.append(offset + idx)
         vals_.append(np.broadcast_to(vals, idx.shape))
         offset += sum(prod(s) for s in _shapes(c, d).values())
@@ -246,6 +262,9 @@ def _logits(components: Sequence[Component], d: dict[str, Any]) -> Array:
 def _mask(d: dict[str, Any]) -> Array:
     mask = np.zeros((len(d["centre"]), _K), bool)
     mask[np.arange(len(mask)), 1 + d["centre"]] = True
+    if "ops" in d:
+        mask[:, 1:5] |= ~d["ops"]
+        mask[:, 5:] = True
     return mask
 
 
@@ -255,6 +274,8 @@ def _labelled(
     """Validate a labelled table for `components`; return counts [R, K] and the feature columns."""
     if "op" not in table.fields:
         raise ValueError(f"{table.source}: head E needs op labels from a truth-bearing source")
+    if not table.counts:
+        raise ValueError(f"{table.source}: no rows, so head E is not identified by this evidence")
     fields = [f for f in table.fields if f != "op"]
     _validate(components, fields, table.meta, table.source)
     oi, ci, f0 = table.fields.index("op"), fields.index("context"), tuple(table.meta.get("flank", (0, 0)))[0]
@@ -268,6 +289,8 @@ def _labelled(
     d = _data(fields, list(keys), alphabet, table.meta)
     counts = np.zeros((len(keys), _K))
     np.add.at(counts, (r_idx, cat), n)
+    if "ops" in d and (counts * _mask(d)).any():
+        raise ValueError(f"{table.source}: an op is outside its row's `ops`")
     return counts, d
 
 
@@ -331,7 +354,7 @@ def fit(
             components[i] = Component(c.token, {"knots": np.linspace(0, 100, c.args[0])})
         elif c.name == "Homopolymer":
             components[i] = Component(c.token, meta={"flank": list(d["flank"])})
-    x = _matrix(components, d)
+    x = _matrix(components, d, fitting=True)
     n_lin, k_q = x.shape[1] * _K, len(alphabet)
     rank = next((c.args[0] for c in components if c.name == "QualityxContext"), 0)
     split = n_lin + k_q * rank
@@ -409,7 +432,7 @@ def probabilities(components: Sequence[Component], alphabet: Sequence[int], tabl
 def probabilities_at(components: Sequence[Component], columns: dict[str, Any]) -> Array:
     """P(category) [R, K] from feature columns shaped like `_data`'s (the generator builds them as arrays):
     `k_q`, `flank`, `context` [R, L+R+1] base indices, `centre`, `q` and `q±i` alphabet indices (A beyond a
-    read end), `pos_start`, `pos_end`, `mate`, `strand` (1 for "-"), `gc` (bin midpoint) and `latent` (class index)."""
+    read end), `pos_start`, `pos_end`, `mate`, `strand` (1 for "-"), `gc` (bin midpoint), `latent` (class index) and `tile` (level index)."""
     _check(components)
     logits = np.where(_mask(columns), -np.inf, _logits(components, columns))
     return np.asarray(special.softmax(logits, axis=1))

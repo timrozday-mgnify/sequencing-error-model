@@ -56,7 +56,7 @@ class ErrorRate:
     lambda_ci: CI
     beta: float
     beta_ci: CI
-    key_median_coverage: int
+    key_median_coverage: float  # a median over keys, so it can be a half-integer (real runs)
     key_coverage_ci: CI
     true_median_coverage: float
     true_coverage_ci: CI
@@ -193,7 +193,7 @@ def read_error_rate(path: Path) -> ErrorRate:
     r = rows[0]
     return ErrorRate(
         float(r[0]), _ci(r[1]), float(r[2]), _ci(r[3]), float(r[4]), _ci(r[5]), float(r[6]), _ci(r[7]),
-        int(r[8]), _ci(r[9]), float(r[10]), _ci(r[11]), float(r[12]), float(r[13]), float(r[14]),
+        float(r[8]), _ci(r[9]), float(r[10]), _ci(r[11]), float(r[12]), float(r[13]), float(r[14]),
     )  # fmt: skip
 
 
@@ -323,5 +323,7 @@ def tables(a: SkiverAnalyze, use_all: bool = False) -> list[CountTable]:
         table("spectrum_by_t", ("context", "t", "op"), "error", (((context(r.op, r.prev_base, r.next_base), t - k, r.op), n) for r in a.spectrum_by_t for t, n in r.freq_at_t.items()), flank=(1, 1)),
         # "=" counts values matching the consensus throughout; single-edit op counts have a latent t
         table("kvmer", ("locus", "op"), "value", (((r.key + r.consensus_value, op), n) for r in passing for op, n in (("=", r.consensus_count), *r.op_counts.items()))),
-        table("kvmer_survival", ("locus", "t", "op"), "value", (((r.key + r.consensus_value, t, "="), n) for r in passing for t, n in enumerate(r.consensus_count_up_to_v, 1))),
+        # t = 0 is `total_count`: everything at risk before the first value position, which is the universe
+        # the running counts live in (they include values two or more edits from the consensus).
+        table("kvmer_survival", ("locus", "t", "op"), "value", (((r.key + r.consensus_value, t, "="), n) for r in passing for t, n in enumerate((r.total_count, *r.consensus_count_up_to_v)))),
     ]  # fmt: skip

@@ -32,7 +32,6 @@ import sys
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import replace
-from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +41,7 @@ import pysam
 from sequencing_error_model.fit import error, indel, latent, quality
 from sequencing_error_model.fit.quality import Array
 from sequencing_error_model.generate import _CIGAR, Read, _revcomp, align, indel_events, observations, realign
-from sequencing_error_model.observations import CountTable, Key
+from sequencing_error_model.observations import CountTable, Key, subset
 from sequencing_error_model.spec import Component, ErrorModelSpec
 
 _OPS = "MIDNSHP=X"
@@ -314,6 +313,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--latent", type=int, default=0, metavar="S", help="fit S read-level classes (Latent(S)) by EM")
     p.add_argument("--min-mapq", type=int, default=20)
     p.add_argument("--max-reads", type=int)
+    p.add_argument(
+        "--every-n",
+        type=int,
+        default=1,
+        metavar="N",
+        help="keep every Nth record rather than a head slice (spreads a sorted BAM over the genome)",
+    )
     p.add_argument("--mask-alt-freq", type=float, help="mask sites with a non-reference allele at this frequency")
     p.add_argument("--min-contig-depth", type=float, default=0.0, help="drop contigs below this mean depth")
     p.add_argument("--contig-report", type=Path, metavar="TSV", help="per-contig depth, raw error rate, masks")
@@ -349,13 +355,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 writer.writeheader()
                 writer.writerows(report)
     flank, m = window(args.error_tokens, args.quality_tokens)
-    reads = islice(records(args.bam, args.reference, args.min_mapq, masked, unclip), args.max_reads)
+    reads = subset(records(args.bam, args.reference, args.min_mapq, masked, unclip), args.max_reads, args.every_n)
     per_event = any(Component(t).name == "IndelLength" for t in args.error_tokens)
     table = observations(reads, flank, m, "bam", per_event, read_ids=args.latent > 0)
     indels = None
     if per_event:  # a second pass over the same records
         again = records(args.bam, args.reference, args.min_mapq, masked, unclip)
-        indels = indel_events(islice(again, args.max_reads), "bam")
+        indels = indel_events(subset(again, args.max_reads, args.every_n), "bam")
     if not table.counts:
         p.error("no usable aligned reads")
     # Q windows can reach clipped bases, whose Q never appears at a centre.

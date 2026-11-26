@@ -42,14 +42,21 @@ counts, so they are left out. Fold them in as an E-step prior if a recovery run 
 import warnings
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 
 from sequencing_error_model.fit import error
 from sequencing_error_model.fit.quality import _BASE, Array, _hat
 from sequencing_error_model.observations import CountTable, Key
-from sequencing_error_model.sources.skiver_analyze import ErrorRate, RateBin, ReadPositionRow, SpectrumRow
+from sequencing_error_model.sources.skiver_analyze import (
+    ErrorRate,
+    RateBin,
+    ReadPositionRow,
+    SkiverAnalyze,
+    SpectrumRow,
+)
 from sequencing_error_model.spec import Component
 
 DUMMY_Q = 0  # the one-value alphabet standing in for the centre Q `kvmer.csv` does not report
@@ -66,6 +73,9 @@ class _Loci:
     centre: Array  # [n_loci, v] consensus base index
     total: Array  # [n_loci] observations that matched or carried one edit
     rows: dict[str, tuple[Array, Array]]  # op -> (locus indices, counts)
+    exposure: Array  # [n_loci, v] observations at risk at each value position
+    failed: Array  # [n_loci, v] observations whose *first* mismatch is at that position
+    censored: Array  # [n_loci, v] bool: positions right-censored, contributing neither exposure nor failures
 
 
 def _flank(tokens: Sequence[str]) -> tuple[int, int]:
@@ -78,7 +88,37 @@ def _decode(code: int, width: int) -> str:
     return "".join("ACGT."[(code // 5**i) % 5] for i in range(width - 1, -1, -1))
 
 
-def _prepare(table: CountTable, flank: tuple[int, int]) -> _Loci:
+def _risk_set(survival: CountTable, loci: Mapping[str, int], total: Array, v: int) -> Array:
+    """`N_{K,t}` [n_loci, v + 1] for t = 0..v from `skiver_analyze:kvmer_survival`: who is still matching.
+
+    `consensus_count_up_to_v{t}` is a *running* survival count, so an observation whose first mismatch is at
+    `t` is absent from every later count - skiver's scan stops there. The risk set at position `t` is therefore
+    the count through `t - 1`, and `N_{t-1} - N_t` is the number of observations that failed at `t`. That is
+    the shape right-censoring needs (plan phase 8): a censored position's failures come out of the numerator
+    while the exposure it already contributed stands.
+
+    The universe is the key's `total_count` (the table's t = 0 row), not the single-edit universe head E's
+    error rows live in, because that is what the running counts were taken over. So a value two or more edits
+    from the consensus contributes match exposure up to its own first mismatch and no modelled failure - it is
+    another locus or two independent errors, neither of which head E describes, and the multiplicity flag
+    (`sites.keys`) is what removes the keys where that mass is large.
+    """
+    if tuple(survival.fields) != ("locus", "t", "op"):
+        raise ValueError(f"{survival.source}: a risk set needs fields ('locus', 't', 'op'), got {survival.fields}")
+    counts = np.zeros((len(loci), v + 1))
+    counts[:, 0] = total  # the t = 0 rows below replace this where the table carries them
+    for (locus, pos, _), n in survival.counts.items():
+        if (i := loci.get(str(locus))) is not None:
+            counts[i, int(pos)] = n  # type: ignore[call-overload]
+    return counts
+
+
+def _prepare(
+    table: CountTable,
+    flank: tuple[int, int],
+    survival: CountTable | None = None,
+    censored: Mapping[str, Sequence[int]] | None = None,
+) -> _Loci:
     if tuple(table.fields) != ("locus", "op"):
         raise ValueError(f"{table.source}: kvmer fits need fields ('locus', 'op'), got {table.fields}")
     k, v = int(table.meta["k"]), int(table.meta["v"])
@@ -104,12 +144,36 @@ def _prepare(table: CountTable, flank: tuple[int, int]) -> _Loci:
     padded = np.concatenate([bases, np.full((len(loci), right), 4, np.int64)], axis=1)
     window = padded[:, k - left + np.arange(v)[:, None] + np.arange(width)]  # [n_loci, v, width]
     codes, ctx = np.unique(window @ 5 ** np.arange(width - 1, -1, -1), return_inverse=True)
+    total = np.array([totals[i] for i in range(len(loci))], float)
+    # Without the survival counts, every observation is exposed at every position, as it has always been here.
+    if survival is None:
+        exposure, failed = np.repeat(total[:, None], v, axis=1), np.zeros((len(loci), v))
+    else:
+        at_risk = _risk_set(survival, loci, total, v)
+        exposure, failed = at_risk[:, :v], np.maximum(-np.diff(at_risk, axis=1), 0.0)
+    mask = np.zeros((len(loci), v), bool)
+    if censored:
+        if survival is None:
+            raise ValueError("censoring positions needs the kvmer_survival table, to locate each key's failures")
+        for locus, positions in censored.items():
+            row = loci.get(str(locus))
+            if row is None:
+                continue
+            if bad := [pos for pos in positions if not 1 <= pos <= v]:
+                raise ValueError(f"censored positions {bad} are outside the value's 1..{v}")
+            # Right-censoring: no exposure at the position, and below, no failure attributed to it either.
+            # The exposure its observations contributed at earlier positions stands.
+            mask[row, [pos - 1 for pos in positions]] = True
+        exposure = np.where(mask, 0.0, exposure)
     return _Loci(
         [_decode(int(c), width) for c in codes],
         ctx.reshape(len(loci), v),
         centre,
-        np.array([totals[i] for i in range(len(loci))], float),
+        total,
         {op: (np.array([i for i, _ in r]), np.array([n for _, n in r], float)) for op, r in rows.items()},
+        exposure,
+        failed,
+        mask,
     )
 
 
@@ -143,25 +207,64 @@ def _positions(loci: _Loci, op: str, ratios: Array) -> Array:
     return r if base is None else np.where(loci.centre[loci.rows[op][0]] == base, r, 0.0)
 
 
-def _weights(loci: _Loci, ratios: Array) -> dict[str, Array]:
-    """Per-(locus, op) row, the posterior [rows, v] over the latent position."""
-    out = {}
-    for op in loci.rows:
+def _weights(loci: _Loci, ratios: Array) -> tuple[dict[str, Array], dict[str, Array]]:
+    """Per-(locus, op) row: the posterior [rows, v] over the latent position, and the share of it that is kept.
+
+    At a censored position an observation is not an error, so that position leaves the posterior's support and
+    the op's count is reduced by the mass it held there - *per op*, which is the whole point of doing this
+    inside EM: a variant produces one dominant alt base, and the posterior already knows which ops can sit at
+    the censored position. Scaling every op of the key by one proportional factor instead (the obvious
+    alternative, with no per-position alt identity in the default output) removes the right total from the
+    wrong ops and leaves the variant's own mass to be spread over the key's other positions.
+    """
+    weights, held = {}, {}
+    for op, (rows, n) in loci.rows.items():
         r = _positions(loci, op, ratios)
         total = r.sum(axis=1, keepdims=True)
         if not total.all():
             raise ValueError(f"operation {op!r} counted at a locus with no consensus base it can act on")
-        out[op] = r / total
-    return out
+        w = r / total
+        if loci.censored.any():
+            held[op] = n * np.where(loci.censored[rows], w, 0.0).sum(axis=1)
+            w = np.where(loci.censored[rows], 0.0, w)
+            left = w.sum(axis=1, keepdims=True)
+            w = np.divide(w, left, out=np.zeros_like(w), where=left > 0)
+        weights[op] = w
+    if not loci.censored.any():
+        return weights, {op: np.ones(len(rows)) for op, (rows, _) in loci.rows.items()}
+
+    # How many observations actually failed at the censored positions is *known*, from the running counts, so
+    # that is what leaves the numerator; the posterior only says which ops to take it from. Taking the
+    # posterior's own mass instead would leave most of a variant behind, since an op's position posterior
+    # spreads over every position whose consensus base it can act on (a third of them for a substitution).
+    target = np.where(loci.censored, loci.failed, 0.0).sum(axis=1)
+    mass = np.zeros(len(loci.exposure))
+    for op, (rows, _) in loci.rows.items():
+        np.add.at(mass, rows, held[op])
+    # `target` is how many failed there, `mass` the posterior's own expectation of op mass there, so the
+    # ratio rescales the posterior's split up to the observed count: capping at the posterior's mass instead
+    # would leave most of a variant in the fit, since that mass is a third of a substitution's count at best.
+    share = np.divide(target, mass, out=np.zeros_like(mass), where=mass > 0)
+    keep = {}
+    for op, (rows, n) in loci.rows.items():
+        removed = np.minimum(held[op] * share[rows], n)
+        keep[op] = np.where(n > 0, 1.0 - removed / np.maximum(n, _TINY), 1.0)
+    return weights, keep
 
 
-def _table(table: CountTable, loci: _Loci, flank: tuple[int, int], weights: dict[str, Array]) -> CountTable:
+def _table(
+    table: CountTable,
+    loci: _Loci,
+    flank: tuple[int, int],
+    weights: dict[str, Array],
+    keep: dict[str, Array] | None = None,
+) -> CountTable:
     """Head E rows over contexts: errors split by the position posterior, matches as the leftover exposure."""
     counts: Counter[Key] = Counter()
     n_contexts = len(loci.contexts)
-    match = np.repeat(loci.total[:, None], loci.ctx.shape[1], axis=1)
+    match = loci.exposure.copy()
     for op, (idx, n) in loci.rows.items():
-        w = n[:, None] * weights[op]
+        w = (n if keep is None else n * keep[op])[:, None] * weights[op]
         if _target(op)[1] is not None:  # a substitution or deletion replaces that position's match
             np.add.at(match, idx, -w)
         by_context = np.bincount(loci.ctx[idx].ravel(), w.ravel(), minlength=n_contexts)
@@ -174,10 +277,17 @@ def _table(table: CountTable, loci: _Loci, flank: tuple[int, int], weights: dict
 
 def _log_likelihood(loci: _Loci, p: Array, ratios: Array) -> float:
     """The mixture log-likelihood above, in nats."""
-    ll = float(loci.total @ np.log(np.maximum(p[loci.ctx, 0], _TINY)).sum(axis=1))
-    for op, (_, n) in loci.rows.items():
-        ll += float(n @ np.log(np.maximum(_positions(loci, op, ratios).sum(axis=1), _TINY)))
+    ll = float((loci.exposure * np.log(np.maximum(p[loci.ctx, 0], _TINY))).sum())
+    for op, (idx, n) in loci.rows.items():
+        r = np.where(loci.censored[idx], 0.0, _positions(loci, op, ratios))
+        ll += float(n @ np.log(np.maximum(r.sum(axis=1), _TINY)))
     return ll
+
+
+def _contexts(table: CountTable, loci: _Loci, flank: tuple[int, int]) -> CountTable:
+    """One row per distinct locus context, for `error.probabilities`."""
+    rows: Counter[Key] = Counter({(c, DUMMY_Q): 1 for c in loci.contexts})
+    return CountTable(table.source, ("context", "q"), "base", False, rows, {"flank": list(flank)})
 
 
 def fit(
@@ -189,6 +299,8 @@ def fit(
     tol: float = 1e-4,
     l2: float = 1.0,
     seed: int = 0,
+    survival: CountTable | None = None,
+    censored: Mapping[str, Sequence[int]] | None = None,
 ) -> tuple[Component, ...]:
     """Fit head E `tokens` from a `skiver_analyze:kvmer` table by EM over the latent edit position.
 
@@ -196,6 +308,15 @@ def fit(
     the context components `Context(L,R)` and `Homopolymer`. `flank` is the context window the rows carry
     (default: the widest `Context(L,R)`), so `Homopolymer` can be given a wider one. EM stops when the
     log-likelihood gains less than `tol` nats per observation.
+
+    `survival` is `skiver_analyze:kvmer_survival`. Given it, each position's exposure is the key's own risk set
+    `N_{K,t-1}` instead of all its observations, which is what the counts mean: an observation whose first
+    mismatch is at `t` is not observed after it. `censored` then right-censors positions (plan phase 8): a
+    censored position contributes neither exposure nor failures, while the exposure its observations
+    contributed *before* it stands. That is how a polymorphic site is removed without discarding the other
+    ~16 positions of a 34-base key, whose surviving context and GC composition is otherwise biased toward
+    conserved sequence - a bias on the very distribution this project exists to estimate, and one no external
+    source can repair.
     """
     if list(tokens[:1]) != ["QualityWindow(0)"] or not {Component(t).name for t in tokens[1:]} <= {
         "Context",
@@ -203,30 +324,50 @@ def fit(
     }:
         raise ValueError(f"kvmer fits need QualityWindow(0) then Context(L,R)/Homopolymer, got {list(tokens)}")
     window = _flank(tokens) if flank is None else flank
-    loci = _prepare(table, window)
-    contexts = CountTable(
-        table.source,
-        ("context", "q"),
-        "base",
-        False,
-        Counter({(c, DUMMY_Q): 1 for c in loci.contexts}),
-        {"flank": list(window)},
-    )
-    weights = _weights(loci, _ratios(np.ones((len(loci.contexts), len(error.CATEGORIES))) / len(error.CATEGORIES)))
+    loci = _prepare(table, window, survival, censored)
+    contexts = _contexts(table, loci, window)
+    flat = _ratios(np.ones((len(loci.contexts), len(error.CATEGORIES))) / len(error.CATEGORIES))
+    weights, keep = _weights(loci, flat)
     components: tuple[Component, ...] | None = None
     last = -np.inf
     for _ in range(iterations):
-        rows = _table(table, loci, window, weights)
+        rows = _table(table, loci, window, weights, keep)
         components = error.fit(rows, tokens, (DUMMY_Q,), l2=l2, seed=seed, init=components)
         p = error.probabilities(components, (DUMMY_Q,), contexts)
         ratios = _ratios(p)
         total = _log_likelihood(loci, p, ratios)
-        weights = _weights(loci, ratios)
+        weights, keep = _weights(loci, ratios)
         if total - last < tol * loci.total.sum():
             break
         last = total
     assert components is not None
     return components
+
+
+def predicted(
+    table: CountTable, components: Sequence[Component], flank: tuple[int, int] | None = None
+) -> tuple[list[str], list[str], Array, Array, Array]:
+    """Head E's own prediction for the single-edit counts of a `skiver_analyze:kvmer` table.
+
+    Of a locus's N observations that matched or carried one edit, the share carrying `op` is
+    R_op / (1 + sum_op' R_op'), with R_op = sum_t r_op(t): the likelihood `fit` maximises, conditioned on at most
+    one edit. Returns (loci in `table` order, the ops counted anywhere, N per locus, observed counts and predicted
+    shares as [loci, ops]).
+    """
+    window = _flank([c.token for c in components]) if flank is None else flank
+    loci = _prepare(table, window)
+    ratios = _ratios(error.probabilities(components, (DUMMY_Q,), _contexts(table, loci, window)))
+    norm = 1.0 + ratios[loci.ctx, 1:].sum(axis=(1, 2))  # masked self-substitutions have p = 0
+    ops = sorted(loci.rows)
+    observed = np.zeros((len(loci.total), len(ops)))
+    shares = np.zeros_like(observed)
+    for j, op in enumerate(ops):
+        idx, n = loci.rows[op]
+        observed[idx, j] = n
+        cat, base = _target(op)
+        r = ratios[loci.ctx, cat]
+        shares[:, j] = (r if base is None else np.where(loci.centre == base, r, 0.0)).sum(axis=1) / norm
+    return list(dict.fromkeys(str(locus) for locus, _ in table.counts)), ops, loci.total, observed, shares
 
 
 def _rates(phred: Sequence[RateBin]) -> dict[int, float]:
@@ -351,6 +492,38 @@ def rake(
     return CountTable(f"{exposure.source}:raked", ("context", "q", "op"), "base", True, +counts, dict(exposure.meta))
 
 
+def _with_mate(table: CountTable, mate: int) -> CountTable:
+    """`table` with a `mate` field carrying `mate`, inserted before `op` so the labels stay last."""
+    i = table.fields.index("op")
+    counts: Counter[Key] = Counter({(*k[:i], mate, *k[i:]): n for k, n in table.counts.items()})
+    return replace(table, fields=(*table.fields[:i], "mate", *table.fields[i:]), counts=counts)
+
+
+def rake_mates(
+    context_head: Sequence[Component],
+    mates: Sequence[tuple[Sequence[RateBin], CountTable]],
+    alphabet: Sequence[int],
+    **kwargs: int | float,
+) -> CountTable:
+    """One raked table over all mates, each raked against *its own* skiver Q marginal and FASTQ exposure (§6b.3).
+
+    skiver pooled over the mates gives one centre-Q head, and the mates of a real run differ (R2/R1 1.39x on
+    SRR24523812, phase 6b item 3). Running skiver once per mate and raking each against that mate's own
+    `summary_phred.csv` and exposure keeps the level per mate, so a `Mate` term in `tokens` is identified.
+    Context still comes from the pooled `kvmer.csv`: twice the coverage, on the assumption that context effects
+    are shared, which `pe-overlap` and `reference` rows can test.
+    """
+    if not mates:
+        raise ValueError("rake_mates needs at least one mate's (summary_phred.csv, exposure)")
+    tables = [_with_mate(rake(context_head, phred, exposure, alphabet, **kwargs), m)  # type: ignore[arg-type]
+              for m, (phred, exposure) in enumerate(mates, start=1)]  # fmt: skip
+    counts: Counter[Key] = Counter()
+    for table in tables:
+        counts.update(table.counts)
+    source = ", ".join(t.source for t in tables)
+    return replace(tables[0], source=f"{source}:raked-per-mate", counts=+counts)
+
+
 def fit_centre_q(
     context_head: Sequence[Component],
     phred: Sequence[RateBin],
@@ -358,6 +531,7 @@ def fit_centre_q(
     tokens: Sequence[str],
     alphabet: Sequence[int],
     *,
+    mates: Sequence[tuple[Sequence[RateBin], CountTable]] = (),
     l2: float = 1e-3,
     **kwargs: float | None,
 ) -> tuple[Component, ...]:
@@ -367,13 +541,18 @@ def fit_centre_q(
     window may be asked for. `error.fit`'s `smooth` is worth a value on an unbinned alphabet, and it is what
     carries a Q bin skiver reports no rate for.
 
+    With `mates`, each mate's own (`summary_phred.csv`, exposure) is raked separately (`rake_mates`) and
+    `phred`/`exposure` are unused, which is what identifies a `Mate` term in `tokens`.
+
     `l2` is weak by default: the raked counts are expected values, not draws, so the usual shrinkage would pull
     the fit off the very margins it exists to reproduce (it showed as a few percent at the extreme Q, where the
     error mass is thinnest). It stays non-zero to pin the softmax gauge.
     """
     if list(tokens[:1]) != ["QualityWindow(0)"]:
         raise ValueError(f"default mode identifies the centre Q only, so tokens start with QualityWindow(0): {tokens}")
-    table = rake(context_head, phred, exposure, alphabet)
+    if "Mate" in [Component(t).name for t in tokens] and not mates:
+        raise ValueError("a Mate term needs per-mate skiver runs; pass `mates` (plan phase 6b item 3)")
+    table = rake_mates(context_head, mates, alphabet) if mates else rake(context_head, phred, exposure, alphabet)
     return error.fit(table, tokens, alphabet, l2=l2, **kwargs)  # type: ignore[arg-type]
 
 
@@ -514,3 +693,176 @@ def hazard(rate: ErrorRate) -> dict[str, Array]:
             ]
         ),
     }
+
+
+def _clog_log(t: Array, h: Array) -> tuple[float, float, float]:
+    """Skiver's discrete-Weibull hazard fit by plain OLS: returns (lambda, beta, standard error of beta).
+
+    `h(t) = 1 - exp(-lambda * beta * t^(beta-1))`, so `log(-log(1 - h))` is linear in `log t` with slope
+    `beta - 1`; the reported per-base rate is `1 - exp(-lambda)`, i.e. `h` extrapolated to t = 1. The slope's
+    standard error comes back because the extrapolation reaches ~k positions past the data: a window of 9
+    noisy points pins `beta` far too loosely to read its `h(1)` as a point estimate.
+
+    ponytail: unweighted, as `docs/skiver_illumina_sim.py` has it. Weighting by the risk set would change
+    the points' influence, and the point of this fit is to be the *unpenalised* comparison for skiver's own
+    ridge + Huber estimate, not a better estimator.
+    """
+    x, y = np.log(t), np.log(-np.log(1.0 - h))
+    slope, intercept = np.polyfit(x, y, 1)
+    resid = y - (slope * x + intercept)
+    dof = len(x) - 2
+    se = float(np.sqrt((resid @ resid) / dof / ((x - x.mean()) @ (x - x.mean())))) if dof else float("inf")
+    beta = float(slope) + 1.0
+    return float(np.exp(intercept)) / beta, beta, se
+
+
+def _h1(lambda_: float) -> float:
+    return float(1.0 - np.exp(-lambda_))
+
+
+def hazard_window(a: SkiverAnalyze) -> tuple[Array, Array]:
+    """(t, h(t)) over the window skiver fitted: `hazard_rate.csv`'s rows with a hazard.
+
+    v0.3.2 observes `h(t)` only for t in (k, k+v] and narrows that to [k+3, k+v-2] by its undocumented
+    `--ignore-smallest-t 2 --ignore-largest-t 2`, so this is ~k positions above the t = 1 the level is
+    extrapolated to (plan phase 6b item 2).
+    """
+    rows = [r for r in a.hazard if r.hazard_ratio is not None and 0.0 < r.hazard_ratio < 1.0]
+    if len(rows) < 3:
+        raise ValueError(f"the hazard window has {len(rows)} usable points, too few to refit")
+    return np.array([r.t for r in rows], dtype=float), np.array([r.hazard_ratio for r in rows], dtype=float)
+
+
+def refit_level(a: SkiverAnalyze, betas: Sequence[float] = (1.0, 0.95, 0.9, 0.85, 0.8)) -> dict[str, Any]:
+    """Skiver's own hazard window refitted without its ridge, plus `h(1)` at pinned `betas`.
+
+    Skiver takes the per-base rate from `h(1)`, which is an extrapolation ~k positions below the window it can
+    see, and `beta` alone sets how far it reaches. Its ridge + Huber fit shrinks the slope toward 0, i.e. `beta`
+    toward 1, where no lift is applied at all - worth 1.6x of level on ERR2935851, where plain OLS on skiver's
+    own 13 points gives 0.00779 against skiver's 0.00489 (plan phase 6b item 2). So `ols` is the unpenalised
+    reading of the same data, and `pinned_beta` is the sensitivity band that says how much of the level is
+    extrapolation rather than measurement.
+
+    `beta` < 1 is real: conditioning on a clean key selects cleaner reads as t grows, so the observable hazard
+    sits below the unconditioned rate and the extrapolation is what undoes it. What is new is that `beta` is
+    *estimated* from a short window, so the undo is identified only as well as that window identifies a slope -
+    which, at 9 points and 15x, is barely (`beta_se`).
+
+    Two things this cannot separate, so neither is asserted: skiver's `beta` may differ from the OLS slope of
+    `hazard_rate.csv` because of the penalty, or because it is fitted on the per-Q curves with a common `beta`
+    rather than on this pooled one. The per-Q hazards by t are not in the default output, so the band is the
+    honest answer either way.
+    """
+    t, h = hazard_window(a)
+    lambda_ols, beta_ols, beta_se = _clog_log(t, h)
+    y = np.log(-np.log(1.0 - h))
+
+    def at_beta(beta: float) -> float:
+        intercept = float(np.mean(y - (beta - 1.0) * np.log(t)))
+        return _h1(float(np.exp(intercept)) / beta)
+
+    band = sorted(at_beta(beta_ols + s * 2 * beta_se) for s in (-1, 1)) if np.isfinite(beta_se) else [0.0, 0.0]
+    return {
+        "window": [int(t[0]), int(t[-1])],
+        "points": len(t),
+        "skiver": {"per_base_rate": a.error_rate.per_base_error_rate, "beta": a.error_rate.beta},
+        "ols": {
+            "per_base_rate": _h1(lambda_ols),
+            "beta": beta_ols,
+            "beta_se": beta_se,
+            "lambda": lambda_ols,
+            "per_base_rate_2se": band,
+        },
+        "pinned_beta": {f"{beta:.2f}": at_beta(beta) for beta in betas},
+        "ratio_ols_to_skiver": _h1(lambda_ols) / a.error_rate.per_base_error_rate,
+    }
+
+
+def kvmer_level(a: SkiverAnalyze, use_all: bool = False) -> dict[str, Any]:
+    """A Weibull-free level: single-edit values over the running survival exposure in `kvmer.csv`.
+
+    `consensus_count_up_to_v{t}` is the risk set `N_{K,t}`, the observations still matching the consensus
+    through value position t, so an observation whose single edit sits at t contributed exposure at
+    1..t-1 and one failure at t. Summing both sides over keys and positions gives the mean hazard over
+    t in [1, v] with no hazard model and no extrapolation - the level this repo owns rather than inherits
+    (plan phase 6b item 2). It is *not* `h(1)`: it averages the same selection `beta` < 1 describes, so it
+    reads below the unconditioned rate by however much that selection is worth, which is a lower bound of the
+    same kind as `position_level` and agrees with skiver's own level on a flat truth.
+
+    Failures are `neighbor_count`, the single-edit mass head E is fitted on; values two or more edits away are
+    another locus or two independent errors and are excluded from both sides.
+    """
+    rows = [r for r in a.kvmer if use_all or r.passes_filter]
+    if not rows:
+        raise ValueError("no kvmer keys left to take a level from")
+    failures = exposure = 0.0
+    for r in rows:
+        at_risk = r.consensus_count + r.neighbor_count
+        # N_{K,t-1} for t = 1..v: everything is at risk before the first value position.
+        survival = (at_risk, *(min(n, at_risk) for n in r.consensus_count_up_to_v[:-1]))
+        failures += r.neighbor_count
+        exposure += sum(survival)
+    return {
+        "keys": len(rows),
+        "single_edit_values": failures,
+        "exposure": exposure,
+        "per_base_rate": failures / exposure if exposure else float("nan"),
+        "ratio_to_skiver": (failures / exposure) / a.error_rate.per_base_error_rate if exposure else float("nan"),
+    }
+
+
+def position_level(a: SkiverAnalyze) -> dict[str, Any]:
+    """The fit-free per-cycle mean from `summary_read_position.csv`: `num_error / (num_error + num_correct)`.
+
+    Counted from the read start only, since the from-end rows are the same bases indexed the other way. Each
+    base counted here survived a clean neighbouring key, so it is a lower bound on the *unconditioned* rate -
+    which is below skiver's reported `h(1)` only when `beta` < 1 lifts that rate, and on a flat truth
+    (`beta` ~ 1, no lift) the two agree instead. What it is unconditionally is the one number in the default
+    output that involves no fit at all (plan phase 6b item 2).
+    """
+    rows = [r for r in a.read_position if r.from_start]
+    errors = sum(r.num_error for r in rows)
+    total = errors + sum(r.num_correct for r in rows)
+    return {
+        "cycles": len(rows),
+        "per_base_rate": errors / total if total else float("nan"),
+        "ratio_to_skiver": (errors / total) / a.error_rate.per_base_error_rate if total else float("nan"),
+    }
+
+
+def levels(a: SkiverAnalyze, use_all: bool = False) -> dict[str, Any]:
+    """Every level default mode can state, for the spec's provenance and the cross-mode reports.
+
+    Skiver's own `per_base_error_rate` is one estimate among these, not the level: it is `h(1)` from a ridge-fit
+    `beta` on a 9-13 point window (`refit`), against the same window unpenalised, a hazard-model-free count
+    (`kvmer`) and a fit-free one (`position`). A `kmer` level is reported with this whole set and with `beta`,
+    so a cross-mode gap can be read as extrapolation error rather than mistaken for evidence (plan phase 6b
+    item 2's remediation list).
+    """
+    return {
+        "refit": refit_level(a),
+        "kvmer": kvmer_level(a, use_all),
+        "position": position_level(a),
+        "beta": {"estimate": a.error_rate.beta, "ci": list(a.error_rate.beta_ci)},
+        "key_median_coverage": a.error_rate.key_median_coverage,
+    }
+
+
+LEVEL_SOURCES = ("skiver", "ols", "kvmer", "position")
+
+
+def level_ratio(a: SkiverAnalyze, source: str, use_all: bool = False) -> float:
+    """The factor `sources.kmer.fit(level=)` needs to put the level on `source`'s estimate.
+
+    `skiver` is 1.0, i.e. today's default: `summary_phred.csv`'s per-Q rates as reported. The others rescale
+    every per-Q rate by one factor, which keeps skiver's Q *shape* (the thing `p0` and the filter leave alone,
+    plan phase 6b item 2) and replaces only its level.
+    """
+    if source not in LEVEL_SOURCES:
+        raise ValueError(f"level source must be one of {LEVEL_SOURCES}, got {source!r}")
+    if source == "skiver":
+        return 1.0
+    report = levels(a, use_all)
+    key = "refit" if source == "ols" else source
+    ratio = report[key]["ratio_ols_to_skiver" if source == "ols" else "ratio_to_skiver"]
+    return float(ratio)

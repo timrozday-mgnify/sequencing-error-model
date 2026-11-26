@@ -167,6 +167,24 @@ def _lag1(tracks: Sequence[Array]) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def _classes(model: ErrorModelSpec, n: int, rng: np.random.Generator) -> Array | None:
+    """Each of `n` reads' `Latent(S)` class, drawn from the prior; None without `Latent`."""
+    if model.latent is None:
+        return None
+    prior = model.latent.params["prior"]
+    return rng.choice(len(prior), size=n, p=prior / prior.sum())
+
+
+def _with_class(table: CountTable, classes: Array) -> CountTable:
+    """`table` with its `read` field replaced by that read's class (`latent`), merging rows that then coincide."""
+    ri = table.fields.index("read")
+    counts: Counter[Key] = Counter()
+    for key, n in table.counts.items():
+        counts[(*key[:ri], *key[ri + 1 : -1], int(classes[int(str(key[ri]))]), key[-1])] += n
+    fields = (*table.fields[:ri], *table.fields[ri + 1 : -1], "latent", table.fields[-1])
+    return replace(table, fields=fields, counts=counts)
+
+
 def compare(
     truth: ErrorModelSpec,
     fitted: ErrorModelSpec,
@@ -175,13 +193,22 @@ def compare(
     rng: np.random.Generator,
     q_reads: int = 20000,
     substitutions_only: bool = False,
+    strands: Sequence[int] | None = None,
 ) -> Report:
     """Metrics of `fitted` against `truth` on reads generated from `templates`; Q-track statistics use at least
     `q_reads` sampled tracks per spec. `substitutions_only` compares both heads E conditional on no indel, the
-    support of `pe-overlap`."""
+    support of `pe-overlap`. `strands` gives the held-out reads their own orientation, as the training reads
+    had, so a fitted `Strand` term is scored on the convention it was fitted under (`generate`)."""
+    if fitted.latent is not None:
+        # ponytail: its classes need not match the truth's; scoring it needs a per-read class posterior.
+        raise ValueError("compare cannot score a fitted Latent(S) spec, only a Latent(S) truth")
     alphabet = np.asarray(truth.quality_alphabet)
-    true_reads = generate(truth, templates, mates, rng)
+    # A Latent(S) truth is scored at each held-out read's own class, which the generator is handed.
+    classes = _classes(truth, len(templates), rng)
+    true_reads = generate(truth, templates, mates, rng, classes=classes, strands=strands)
     table = _tuples(truth, templates, true_reads, mates, fitted)
+    if classes is not None:
+        table = _with_class(table, classes)
     n = np.array(list(table.counts.values()), float)
     p_true, p_fit = (
         error.probabilities(indel.split(s.error_head)[0], truth.quality_alphabet, table) for s in (truth, fitted)
@@ -201,7 +228,8 @@ def compare(
     reps = -(-q_reads // len(templates))
     tiled, tiled_mates = list(templates) * reps, list(mates) * reps
     q_true, q_fit = (
-        quality.sample(s.quality_head, truth.quality_alphabet, tiled, tiled_mates, rng) for s in (truth, fitted)
+        quality.sample(s.quality_head, truth.quality_alphabet, tiled, tiled_mates, rng, _classes(s, len(tiled), rng))
+        for s in (truth, fitted)
     )
     top = min(len(t) for t in templates)
     tv = 0.5 * np.abs(_q_hist(q_true, alphabet, top) - _q_hist(q_fit, alphabet, top)).sum(axis=1)
@@ -470,6 +498,27 @@ def run_aligner(aligner: str, reference: Path, reads: Path, sam: Path, preset: s
         subprocess.run(cmd, check=True, stdout=out, stderr=subprocess.PIPE)
 
 
+def scale_error_rate(truth: ErrorModelSpec, scale: float) -> ErrorModelSpec:
+    """`truth` with every non-match logit of head E's first component shifted by `log(scale)`, which is exactly
+    what `generate(error_rate_scale=)` does - so the scaled spec is the truth throughout, not a scaled fit."""
+    head0 = truth.error_head[0]
+    shift = np.r_[0.0, np.full(_K - 1, np.log(scale))]
+    scaled = (replace(head0, params={**head0.params, "bias": head0.params["bias"] + shift}), *truth.error_head[1:])
+    return replace(truth, error_head=scaled)
+
+
+def miscalibrate(truth: ErrorModelSpec) -> ErrorModelSpec:
+    """`truth` with head E's dependence on Q reversed along the alphabet: the bases reported at the top Q get the
+    bottom Q's error odds and vice versa, at every window offset. Head Q is untouched, so the qualities read the
+    same and only what they mean changes - the "Q is never a label" guard's truth (§10), where a fit that read
+    rates off 10^(-Q/10) would come out backwards."""
+    head0 = truth.error_head[0]
+    window = head0.params["window"].copy()
+    a = len(truth.quality_alphabet)
+    window[:, :a] = window[:, a - 1 :: -1]  # row `a` (no base there) keeps its weights
+    return replace(truth, error_head=(replace(head0, params={**head0.params, "window": window}), *truth.error_head[1:]))
+
+
 def aligner_bias(
     truth: ErrorModelSpec,
     aligner: str,
@@ -503,10 +552,7 @@ def aligner_bias(
     (seeding, bands, clipping); `edits_hidden` and `observable_rate_ratio` size what even the optimal alignment
     doesn't show."""
     lengths = lengths or ALIGNER_READS[aligner]
-    head0 = truth.error_head[0]
-    shift = np.r_[0.0, np.full(_K - 1, np.log(error_rate_scale))]
-    scaled = (replace(head0, params={**head0.params, "bias": head0.params["bias"] + shift}), *truth.error_head[1:])
-    truth = replace(truth, error_head=scaled)
+    truth = scale_error_rate(truth, error_rate_scale)
 
     rng = np.random.default_rng(seed)
     genome = "".join(rng.choice(list("ACGT"), size=genome_length))
@@ -656,9 +702,12 @@ def run_skiver(skiver: str, reads: Path, prefix: Path, k: int, v: int, c: int, e
     """`skiver analyze` from a released binary, writing `<prefix>.*.csv`."""
     cmd = [skiver, "analyze", str(reads), "-k", str(k), "-v", str(v), "-c", str(c), "-o", str(prefix), *extra]
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
     except FileNotFoundError as e:
         raise FileNotFoundError(f"no skiver binary at {skiver!r}: --skiver takes a path to a released binary") from e
+    except subprocess.CalledProcessError as e:
+        # Its exit 101 is a Rust panic, whose only explanation is the stderr capture_output swallows.
+        raise RuntimeError(f"{' '.join(cmd)} exited {e.returncode}:\n{(e.stderr or '(no stderr)').strip()}") from e
 
 
 def skiver_recovery(
@@ -668,7 +717,7 @@ def skiver_recovery(
     n_reads: int = 20_000,
     read_length: int = 150,
     genome_length: int = 20_000,
-    k: int = 11,
+    k: int = kmer_source.DEFAULT_K,
     v: int = kmer_source.GOOD_V,
     c: int = 8,
     seed: int = 0,
@@ -715,6 +764,7 @@ def skiver_recovery(
         {"mode": "kmer", "skiver_build": "default", "sources": ["synthetic-recovery"]},
         use_all=use_all,
         flank=flank,
+        min_k=1,  # the harnesses measure any k; the refusal is for real data (`_check_k`)
     )
     if tuple(fitted.quality_alphabet) != tuple(truth.quality_alphabet):
         raise ValueError(
@@ -747,7 +797,7 @@ def outlier_filter_cost(
     n_reads: int = 20_000,
     read_length: int = 150,
     genome_length: int = 20_000,
-    k: int = 11,
+    k: int = kmer_source.DEFAULT_K,
     v: int = kmer_source.GOOD_V,
     c: int = 8,
     seed: int = 0,
@@ -815,20 +865,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--genome-length", type=int, default=20_000, help="with --mask-cost")
     p.add_argument("--depth", type=float, default=30.0, help="with --mask-cost")
     p.add_argument("--aligner", choices=sorted(ALIGNER_READS), help="report aligner bias instead (uses --reads)")
-    p.add_argument("--error-rate-scale", type=float, default=1.0, help="with --aligner")
+    p.add_argument("--error-rate-scale", type=float, default=1.0, help="with --aligner or --skiver")
     p.add_argument("--preset", default="map-ont", help="minimap2 preset, with --aligner minimap2")
     p.add_argument("--unclip", action="store_true", help="with --aligner: realign soft-clipped reads end to end")
     p.add_argument("--skiver", help="path to a released skiver binary: run the `kmer` default-mode loop instead")
     p.add_argument("--filter-cost", action="store_true", help="with --skiver: the outlier filter's clonal cost")
     p.add_argument("--use-all", action="store_true", help="with --skiver: run skiver with --use-all")
-    p.add_argument("-k", type=int, default=11, help="with --skiver")
+    p.add_argument("-k", type=int, default=kmer_source.DEFAULT_K, help="with --skiver")
     p.add_argument("-v", type=int, default=kmer_source.GOOD_V, help="with --skiver")
     p.add_argument("-c", type=int, default=8, help="with --skiver: FracMinHash denominator")
     p.add_argument("--read-length", type=int, default=150, help="with --skiver")
     p.add_argument("--skiver-arg", action="append", default=[], metavar="ARG", help="extra `skiver analyze` argument")
     args = p.parse_args(argv)
     if args.skiver:
-        truth = spec_io.load(args.spec) if args.spec else example_spec()
+        truth = scale_error_rate(spec_io.load(args.spec) if args.spec else example_spec(), args.error_rate_scale)
         shared: dict[str, Any] = dict(
             n_reads=args.reads,
             read_length=args.read_length,

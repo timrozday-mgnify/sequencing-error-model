@@ -37,6 +37,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 from sequencing_error_model.fit.quality import Array
 from sequencing_error_model.generate import Read, align, observations
+from sequencing_error_model.observations import subset
 from sequencing_error_model.sources import bam
 
 CLASSES = ("match", "substitution", "deletion", "insertion")
@@ -246,6 +247,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--cycle-bin", type=int, default=10, help="bases per cycle bin (hundreds for long reads)")
     p.add_argument("--min-mapq", type=int, default=20)
     p.add_argument("--max-reads", type=int)
+    p.add_argument(
+        "--every-n",
+        type=int,
+        default=1,
+        metavar="N",
+        help="keep every Nth record rather than a head slice (`observations.subset`)",
+    )
     p.add_argument("--unclip", nargs=4, type=int, metavar=("MATCH", "MISMATCH", "OPEN", "EXTEND"))
     args = p.parse_args(argv)
     sims = dict(s.split("=", 1) for s in args.simulated)
@@ -254,10 +262,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         ref_kmers = np.unique(kmers((fasta.fetch(c) for c in fasta.references), args.k))
 
     def run(path: Path) -> Profile:
-        records = islice(bam.records(path, args.reference, args.min_mapq, unclip=unclip), args.max_reads)
-        return profile(
-            records, islice(bam_reads(path, args.reference), args.max_reads), ref_kmers, args.k, args.cycle_bin
-        )
+        records = subset(bam.records(path, args.reference, args.min_mapq, unclip=unclip), args.max_reads, args.every_n)
+        reads = subset(bam_reads(path, args.reference), args.max_reads, args.every_n)
+        return profile(records, reads, ref_kmers, args.k, args.cycle_bin)
 
     real = run(args.real)
     profiles = {name: run(Path(path)) for name, path in sims.items()}
