@@ -38,10 +38,10 @@ BASE=/hps/nobackup/<group>/<user>
 RUNS=$BASE/sequencing-error-model_runs/sem-pfam
 ```
 
-1. Update the checkout on HPC (the image holds no repo code; it is bound from here). Until PR #57 is merged the kit is on `pfam-p2`; after, use `main`:
+1. Update the checkout on HPC (the image holds no repo code; it is bound from here). Until PR #58 is merged the kit is on `pfam-locus-source` (`main` lacks the kept reads); after, use `main`:
 
    ```bash
-   ssh $HPC "git -C $BASE/sequencing-error-model fetch && git -C $BASE/sequencing-error-model checkout pfam-p2 && git -C $BASE/sequencing-error-model pull"
+   ssh $HPC "git -C $BASE/sequencing-error-model fetch && git -C $BASE/sequencing-error-model checkout pfam-locus-source && git -C $BASE/sequencing-error-model pull"
    ```
 
    `sem-tools.sif` needs no rebuild: `uv.lock` has not changed since phase 6b.
@@ -69,7 +69,7 @@ RUNS=$BASE/sequencing-error-model_runs/sem-pfam
    ```
 
    Check in `trial/score/ERR2984773.json`: `stats.reads_aligned` close to `stats.reads_exposed`, and `stops.unaligned` small. Also that
-   `trial/locus/` has `ERR2984773.0.json` and `ERR2984773.0.01.json`, and `trial/keep/ERR2984773/` has `aligned.sam` and a `pairs.tsv` per dose.
+   `trial/locus/` has `ERR2984773.0.json` and `ERR2984773.0.01.json`, and `trial/keep/ERR2984773/` has `aligned.sam`, `ERR2984773.kept_{1,2}.fastq.gz` (undosed only) and a `pairs.tsv` per dose.
    Then remove it: `rm -rf trial`.
 
 4. **The run:**
@@ -92,7 +92,7 @@ README measured 13 times its laptop figure on the HPC's x86 nodes** before its k
 reads of a simulated mock (half of its reads place, against 15 % in ERR10889147), so about 35 GB and 90 minutes for 9 M: 64 GB is asked for. Scoring holds every exposed codon: 128 GB is asked
 for, unmeasured at that size. A task killed for memory retries with more.
 Work directories hold the SAM (about 5 GB a library) and the hit tables (1-2 GB): budget about 150 GB, removable after the run. Copies of
-both go to `results/keep/` (8-11 GB a library, about 70 GB in all): **keep it on HPC**. Later analyses (plan sections 12-13) start from it
+both, and the undosed reads, go to `results/keep/` (9-12 GB a library, about 80 GB in all): **keep it on HPC**. Later analyses (plan sections 12-13) start from it
 instead of searching again, which is most of the run's cost.
 
 ## Bring back

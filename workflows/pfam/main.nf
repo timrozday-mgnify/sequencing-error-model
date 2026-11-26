@@ -9,6 +9,8 @@ nextflow.enable.dsl = 2
 process READS {
     tag "$run $dose"
     label 'small'
+    // the undosed reads, for keep/: the dosed ones are redone from them exactly (`pfam.read_pairs --dose`, seeded per read)
+    publishDir { "${params.outdir}/keep/$run" }, mode: 'copy', saveAs: { dose == '0' ? it : null }
     input:
     tuple val(run), val(every), path(r1), path(r2), val(dose)
     output:
