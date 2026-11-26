@@ -8,7 +8,9 @@
 # Check everything P2 reads, then write $RUNS/site.config with the paths found. Changes nothing else, apart from
 # a .fai beside each genome FASTA (pysam would otherwise write it from several tasks at once).
 #
-#   BASE=/hps/nobackup/<group>/<user> B9_DIR=... B11_DIR=... KF_DIR=... bash preflight.sh
+#   export BASE=/hps/nobackup/<group>/<user> B9_DIR=... B11_DIR=... KF_DIR=...
+#   mkdir -p $BASE/sequencing-error-model_runs/sem-pfam && cd $BASE/sequencing-error-model_runs/sem-pfam
+#   sbatch $BASE/sequencing-error-model/workflows/pfam/preflight.sh        # log: sem-pfam-preflight.<job>.log here
 #
 # BASE     holds sequencing-error-model/ (this checkout) and sequencing-error-model_runs/
 # B9_DIR   the B9 nobackup directory (truth/refs/{std,d6331}/refs.fna from B9's `truth.sh refs`)
@@ -17,8 +19,8 @@
 # KFPFAM   a kfpfam checkout, for recruit/pairs.py (default ~/src/kfpfam, as B11 used)
 # QUEUE, ACCOUNT  optional: Slurm partition and account, written into site.config
 #
-# Run it where `singularity` works (a compute node: `srun --pty bash`, or sbatch this file). It prints every check
-# and ends with READY or with what to fix.
+# It prints every check and ends with READY (exit 0) or NOT READY and what to fix (exit 1), so a job chained with
+# --dependency=afterok runs only on READY (README step 4).
 set -uo pipefail
 : "${BASE:?set BASE}" "${B9_DIR:?set B9_DIR}" "${B11_DIR:?set B11_DIR}" "${KF_DIR:?set KF_DIR}"
 REPO=${REPO:-$BASE/sequencing-error-model}
@@ -55,7 +57,7 @@ if git -C "$REPO" rev-parse >/dev/null 2>&1; then
     here=$(git -C "$REPO" rev-parse HEAD) main=$(git -C "$REPO" rev-parse origin/main)
     [[ $(git -C "$REPO" branch --show-current) == main ]] || no "$REPO is not on main: git -C $REPO switch main"
     [[ $here == "$main" ]] && ok "$REPO at origin/main ${here:0:7}" || no "$REPO at ${here:0:7}, origin/main is ${main:0:7}: git -C $REPO pull"
-    [[ -z $(git -C "$REPO" status --porcelain -- src workflows) ]] || no "$REPO has local changes under src/ or workflows/"
+    [[ -z $(git -C "$REPO" status --porcelain --untracked-files=no -- src workflows) ]] || no "$REPO has local changes under src/ or workflows/"
 else
     no "no checkout at $REPO: set REPO"
 fi
@@ -91,7 +93,7 @@ if command -v singularity >/dev/null; then
     }
     [[ -s $FILTER_SIF ]] && {
         v=$(singularity exec "$FILTER_SIF" python3 -c "import pyhmmer; print(pyhmmer.__version__)" 2>/dev/null) \
-            && ok "kfpfam image pyhmmer $v" || no "no pyhmmer in $FILTER_SIF: kfpfam 3ccf01c or later (README step 2)"
+            && ok "kfpfam image pyhmmer $v" || no "no pyhmmer in $FILTER_SIF: kfpfam 3ccf01c or later (README, What it needs)"
         singularity exec "$FILTER_SIF" sh -c 'command -v filter' >/dev/null 2>&1 && ok "kfpfam image has filter" \
             || no "no filter binary in $FILTER_SIF"
     }

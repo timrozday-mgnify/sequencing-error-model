@@ -32,48 +32,61 @@ The local prototype used Pfam 38.2; this uses 39.0. `pfam.read_hits` refuses hit
 
 ## Steps
 
-On the HPC (a login node), with your own values:
+On the HPC login node, as for B11's kfpfam runs: export the directories once, then submit everything with `sbatch`.
 
 ```bash
-BASE=/hps/nobackup/<group>/<user>          # holds sequencing-error-model/ and sequencing-error-model_runs/
-B9_DIR=/hps/nobackup/<...>/nar-review-B9   # B9's truth.sh refs output
-B11_DIR=/hps/nobackup/<...>/nar-review-B11 # B11's pfam_setup.sh output
-KF_DIR=<nar-review-response checkout>/hpc/B11_pfam_arms/kfpfam   # where kfpfam_setup.sh was run
-RUNS=$BASE/sequencing-error-model_runs/sem-pfam
+export BASE=/hps/nobackup/<group>/<user>          # holds sequencing-error-model/ and sequencing-error-model_runs/
+export B9_DIR=/hps/nobackup/<...>/nar-review-B9   # B9's truth.sh refs output
+export B11_DIR=/hps/nobackup/<...>/nar-review-B11 # B11's pfam_setup.sh output
+export KF_DIR=<nar-review-response checkout>/hpc/B11_pfam_arms/kfpfam   # where kfpfam_setup.sh was run
+export RUNS=$BASE/sequencing-error-model_runs/sem-pfam
+export REPO=$BASE/sequencing-error-model
 ```
+
+Add `export QUEUE=<partition> ACCOUNT=<account>` if your site needs them, and `export KFPFAM=<path>` if the kfpfam checkout is not
+`~/src/kfpfam`. Jobs see these (`--export=ALL`).
 
 1. Update the checkout (the image holds no repo code; it is bound from here):
 
    ```bash
-   git -C $BASE/sequencing-error-model switch main && git -C $BASE/sequencing-error-model pull
+   git -C $REPO switch main && git -C $REPO pull
    ```
 
-   `sem-tools.sif` needs no rebuild: neither its Dockerfile nor `uv.lock` has changed since phase 6b. Step 2 checks it runs this code.
+   `sem-tools.sif` needs no rebuild: neither its Dockerfile nor `uv.lock` has changed since phase 6b. The preflight checks it runs this code.
 
-2. **Preflight**, on a compute node (it needs Singularity). It checks every input, that `Pfam-A.hmm` is the file `prep` was built
+2. **Preflight, then the trial chained on it.** The preflight checks every input, that `Pfam-A.hmm` is the file `prep` was built
    from, that both images work, that ENA is reachable and the disk has room; builds each genome's `.fai` once; and writes
-   `$RUNS/site.config`. Add `QUEUE=<partition> ACCOUNT=<account>` if your site needs them, `KFPFAM=` if the kfpfam checkout is not `~/src/kfpfam`:
+   `$RUNS/site.config`. It exits non-zero unless it ends `READY`, so the trial (one library, 20,000 pairs) starts only then:
 
    ```bash
-   srun --cpus-per-task 2 --mem 8G --time 1:00:00 --pty env BASE=$BASE B9_DIR=$B9_DIR B11_DIR=$B11_DIR KF_DIR=$KF_DIR bash $BASE/sequencing-error-model/workflows/pfam/preflight.sh
+   mkdir -p $RUNS/p2 && cd $RUNS && p=$(sbatch --parsable $REPO/workflows/pfam/preflight.sh) && cd p2 && sbatch --dependency=afterok:$p $REPO/workflows/pfam/run.sh --only ERR2984773 --max_pairs 20000 --outdir trial
    ```
-
-   Fix every `FIX` line and rerun until it ends `READY`. If `site.config` already existed and differs, it writes `site.config.new` beside it.
-
-3. **A trial first**, one library and 20,000 pairs. It should finish in minutes and end with a `verdict.md` that says no power:
 
    ```bash
-   cd $RUNS/p2 && sbatch $BASE/sequencing-error-model/workflows/pfam/run.sh --only ERR2984773 --max_pairs 20000 --outdir trial
+   squeue --me
    ```
 
-   Check in `trial/score/ERR2984773.json`: `stats.reads_aligned` close to `stats.reads_exposed`, and `stops.unaligned` small. Also that
-   `trial/locus/` has `ERR2984773.0.json` and `ERR2984773.0.01.json`, and `trial/keep/ERR2984773/` has `aligned.sam`, `ERR2984773.kept_{1,2}.fastq.gz` (undosed only) and a `pairs.tsv` per dose.
-   Then remove it: `rm -rf trial`.
+   ```bash
+   cat $RUNS/sem-pfam-preflight.*.log
+   ```
+
+   If it says `NOT READY`, the trial stays pending (`DependencyNeverSatisfied`): `scancel` it, fix every `FIX` line, and submit the
+   line above again. If `site.config` already existed and differs, the preflight writes `site.config.new` beside it, with the diff in its log.
+
+3. **Check the trial** (`$RUNS/p2/sem-pfam.<job>.log`; minutes once it starts). `trial/verdict.md` should say no power. In
+   `trial/score/ERR2984773.json`: `stats.reads_aligned` close to `stats.reads_exposed`, and `stops.unaligned` small. And:
+
+   ```bash
+   ls $RUNS/p2/trial/locus $RUNS/p2/trial/keep/ERR2984773/*
+   ```
+
+   `ERR2984773.0.json` and `ERR2984773.0.01.json`; `aligned.sam`, `ERR2984773.kept_{1,2}.fastq.gz` (undosed only) and a `pairs.tsv` per dose.
+   Then remove it: `rm -rf $RUNS/p2/trial`.
 
 4. **The run:**
 
    ```bash
-   cd $RUNS/p2 && sbatch $BASE/sequencing-error-model/workflows/pfam/run.sh
+   cd $RUNS/p2 && sbatch $REPO/workflows/pfam/run.sh
    ```
 
    Re-submitting resumes. `--only A,B` runs some libraries; the verdict then counts those only.
