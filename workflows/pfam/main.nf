@@ -141,7 +141,10 @@ process VERDICT {
 }
 
 def fastq(url) {
-    return params.fastq_dir ? file("${params.fastq_dir}/${url.tokenize('/').last()}", checkIfExists: true) : file(url)
+    if (params.fastq_dir) return file("${params.fastq_dir}/${url.tokenize('/').last()}", checkIfExists: true)
+    // FIRE holds ENA's vol1/ as the era-public bucket; the aws scope comes from $CONFIGS' codon base.config (run.sh)
+    if (params.fire) return file(url.replaceFirst(/^\w+:\/\/[^\/]+\/vol1\//, 's3://era-public/'))
+    return file(url)
 }
 
 workflow {

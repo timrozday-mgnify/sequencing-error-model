@@ -46,6 +46,11 @@ export REPO=$BASE/sequencing-error-model
 Add `export QUEUE=<partition> ACCOUNT=<account>` if your site needs them, and `export KFPFAM=<path>` if the kfpfam checkout is not
 `~/src/kfpfam`. Jobs see these (`--export=ALL`).
 
+To read from FIRE rather than ENA's FTP, as B11 does, also `export CONFIGS=<pipelines-nextflow-configs checkout>`. `run.sh` then adds
+`$CONFIGS/profile-bases/codon/base.config` (FIRE's endpoint, signed with the `FIRE_ACCESS_KEY` and `FIRE_SECRET_KEY` Nextflow secrets) and
+`fire.config`, which stages each `runs.csv` URL as `s3://era-public/...` and keeps `work/` after a run. The preflight checks both secrets.
+Switching on FIRE re-fetches reads that were already fetched over FTP.
+
 1. Update the checkout (the image holds no repo code; it is bound from here):
 
    ```bash
@@ -93,7 +98,7 @@ Add `export QUEUE=<partition> ACCOUNT=<account>` if your site needs them, and `e
 
 Nextflow may warn about an `undefined parameter` (`container`, `filter_container`); it is harmless, the images named in `site.config` are used.
 
-If the head job cannot reach ENA (`Can't stage file`; see [workflows/hpc/README.md](../hpc/README.md)), fetch the FASTQs where that works and set
+If the head job cannot reach ENA (`Can't stage file`; see [workflows/hpc/README.md](../hpc/README.md)), set `CONFIGS` to read from FIRE (above), or fetch the FASTQs where that works and set
 `params.fastq_dir` to their directory. The names are ENA's, and only the files named in `runs.csv` are read.
 
 ## Cost
