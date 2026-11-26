@@ -14,5 +14,11 @@ REPO=${REPO:-../../../sequencing-error-model}
 [[ -f ../site.config ]] || { echo "submit from <runs>/sem-pfam/<run>/, next to ../site.config" >&2; exit 1; }
 [[ -f $REPO/workflows/pfam/main.nf ]] || { echo "no checkout at $REPO: set REPO" >&2; exit 1; }
 command -v nextflow >/dev/null || { echo "nextflow not on PATH" >&2; exit 1; }
+# With CONFIGS (a pipelines-nextflow-configs checkout, as for B11), reads come from FIRE with the FIRE_* Nextflow secrets.
+fire=()
+if [[ -n ${CONFIGS:-} ]]; then
+    [[ -f $CONFIGS/profile-bases/codon/base.config ]] || { echo "no $CONFIGS/profile-bases/codon/base.config" >&2; exit 1; }
+    fire=(-c "$CONFIGS/profile-bases/codon/base.config" -c "$REPO/workflows/pfam/fire.config")
+fi
 export NXF_OPTS='-Xms1g -Xmx4g'
-nextflow run "$REPO/workflows/pfam" -profile slurm,singularity -c ../site.config --outdir results -resume "$@"
+nextflow run "$REPO/workflows/pfam" -profile slurm,singularity "${fire[@]}" -c ../site.config --outdir results -resume "$@"

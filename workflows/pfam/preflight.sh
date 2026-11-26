@@ -18,6 +18,7 @@
 # KF_DIR   the kfpfam/ directory B11's kfpfam_setup.sh wrote (beside that script): the image, prep/ and index/
 # KFPFAM   a kfpfam checkout, for recruit/pairs.py (default ~/src/kfpfam, as B11 used)
 # QUEUE, ACCOUNT  optional: Slurm partition and account, written into site.config
+# CONFIGS  optional: a pipelines-nextflow-configs checkout; run.sh then reads from FIRE (FIRE_* Nextflow secrets)
 #
 # It prints every check and ends with READY (exit 0) or NOT READY and what to fix (exit 1), so a job chained with
 # --dependency=afterok runs only on READY (README step 4).
@@ -116,8 +117,20 @@ done
 
 echo "== reads and disk"
 url=$(awk -F, 'NR == 2 { print $3 }' "$REPO/workflows/pfam/runs.csv")
-curl -sfI --max-time 30 "$url" >/dev/null && ok "ENA reachable from $(hostname)" \
-    || echo "  note  ENA not reachable from $(hostname): if the head job's node is the same, fetch the FASTQs and set fastq_dir (README)"
+if [[ -n ${CONFIGS:-} ]]; then  # run.sh then reads from FIRE
+    [[ -f $CONFIGS/profile-bases/codon/base.config ]] && ok "FIRE settings: $CONFIGS/profile-bases/codon/base.config" \
+        || no "no $CONFIGS/profile-bases/codon/base.config: set CONFIGS to a pipelines-nextflow-configs checkout"
+    secrets=$(nextflow secrets list 2>/dev/null)
+    for k in FIRE_ACCESS_KEY FIRE_SECRET_KEY; do
+        grep -qx "$k" <<< "$secrets" && ok "nextflow secret $k" || no "no nextflow secret $k: nextflow secrets set $k <value>"
+    done
+    fire=https://hl.fire.sdo.ebi.ac.uk/era-public/${url#*/vol1/}
+    curl -sfI --max-time 30 "$fire" >/dev/null && ok "FIRE reachable from $(hostname)" \
+        || echo "  note  $fire not reachable unsigned from $(hostname) (the run signs its requests)"
+else
+    curl -sfI --max-time 30 "$url" >/dev/null && ok "ENA reachable from $(hostname)" \
+        || echo "  note  ENA not reachable from $(hostname): set CONFIGS to read from FIRE, or fetch the FASTQs and set fastq_dir (README)"
+fi
 free=$(df -BG --output=avail "$BASE" 2>/dev/null | tail -1 | tr -dc 0-9)
 [[ ${free:-0} -ge 250 ]] && ok "${free} GB free under $BASE" || no "${free:-?} GB free under $BASE: the run needs about 250 GB (150 work, 80 keep)"
 
