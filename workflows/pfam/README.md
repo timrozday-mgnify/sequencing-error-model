@@ -32,35 +32,33 @@ The local prototype used Pfam 38.2; this uses 39.0. `pfam.read_hits` refuses hit
 
 ## Steps
 
+On the HPC (a login node), with your own values:
+
 ```bash
-HPC=codon-login
-BASE=/hps/nobackup/<group>/<user>
+BASE=/hps/nobackup/<group>/<user>          # holds sequencing-error-model/ and sequencing-error-model_runs/
+B9_DIR=/hps/nobackup/<...>/nar-review-B9   # B9's truth.sh refs output
+B11_DIR=/hps/nobackup/<...>/nar-review-B11 # B11's pfam_setup.sh output
+KF_DIR=<nar-review-response checkout>/hpc/B11_pfam_arms/kfpfam   # where kfpfam_setup.sh was run
 RUNS=$BASE/sequencing-error-model_runs/sem-pfam
 ```
 
-1. Update the checkout on HPC (the image holds no repo code; it is bound from here). Until PR #58 is merged the kit is on `pfam-locus-source` (`main` lacks the kept reads); after, use `main`:
+1. Update the checkout (the image holds no repo code; it is bound from here):
 
    ```bash
-   ssh $HPC "git -C $BASE/sequencing-error-model fetch && git -C $BASE/sequencing-error-model checkout pfam-locus-source && git -C $BASE/sequencing-error-model pull"
+   git -C $BASE/sequencing-error-model switch main && git -C $BASE/sequencing-error-model pull
    ```
 
-   `sem-tools.sif` needs no rebuild: `uv.lock` has not changed since phase 6b.
+   `sem-tools.sif` needs no rebuild: neither its Dockerfile nor `uv.lock` has changed since phase 6b. Step 2 checks it runs this code.
 
-2. Make the run directory and the site config, then edit the config's `CHANGE` paths, queue and account:
+2. **Preflight**, on a compute node (it needs Singularity). It checks every input, that `Pfam-A.hmm` is the file `prep` was built
+   from, that both images work, that ENA is reachable and the disk has room; builds each genome's `.fai` once; and writes
+   `$RUNS/site.config`. Add `QUEUE=<partition> ACCOUNT=<account>` if your site needs them, `KFPFAM=` if the kfpfam checkout is not `~/src/kfpfam`:
 
    ```bash
-   ssh $HPC "mkdir -p $RUNS/p2 && cp $BASE/sequencing-error-model/workflows/pfam/site.config $RUNS/site.config"
+   srun --cpus-per-task 2 --mem 8G --time 1:00:00 --pty env BASE=$BASE B9_DIR=$B9_DIR B11_DIR=$B11_DIR KF_DIR=$KF_DIR bash $BASE/sequencing-error-model/workflows/pfam/preflight.sh
    ```
 
-   Two checks on what it names, from a node with Singularity:
-
-   ```bash
-   singularity exec kfpfam-filter.sif python3 -c "import pyhmmer; print(pyhmmer.__version__)"
-   ```
-
-   ```bash
-   singularity exec sem-tools.sif minimap2 --version
-   ```
+   Fix every `FIX` line and rerun until it ends `READY`. If `site.config` already existed and differs, it writes `site.config.new` beside it.
 
 3. **A trial first**, one library and 20,000 pairs. It should finish in minutes and end with a `verdict.md` that says no power:
 
