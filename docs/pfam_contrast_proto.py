@@ -11,6 +11,7 @@ never a label: the labels are mismatches with the column's other reads.
 """
 
 import argparse
+from array import array
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +26,7 @@ Q_EDGES = (15, 20, 25, 30, 35, 38)
 CYCLE_EDGES = (25, 50, 75, 100, 125)
 MIN_DEPTH = {"group": 20, "locus": 3}  # bases per group: fewer cannot separate b from e; a locus needs a majority
 FLANK = 12  # bases each side that make a locus (pfam_locus)
-FIELDS = ("group", "locus", "base", "q", "cycle", "mate", "rid", "true")
+FIELDS = ("group", "locus", "base", "q", "cycle", "mate", "rid", "true", "length")
 
 
 def table(args: argparse.Namespace) -> dict[str, np.ndarray]:
@@ -34,7 +35,7 @@ def table(args: argparse.Namespace) -> dict[str, np.ndarray]:
     hits = pfam.read_hits(args.pairs, profiles)
     keys: dict[tuple[int, int, int, bool], int] = {}
     loci: dict[tuple[int, int, int, bool, str], int] = {}
-    rows: dict[str, list[int]] = {f: [] for f in FIELDS}
+    rows = {f: array("q") for f in FIELDS}  # typed: tens of millions of bases at P2 depth
     for number, (s1, q1, s2, q2) in enumerate(pfam.read_pairs(args.r1, args.r2, None, args.every_n, args.dose)):
         for mate, (seq, qual) in enumerate(((s1, q1), (s2, q2))):
             rid = 2 * number + mate
@@ -53,9 +54,9 @@ def table(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     g = keys.setdefault((*c.column, idx, c.reverse), len(keys))
                     # the same column and the same bases either side: one gene in one strain (-1: a flank runs off the read)
                     locus = loci.setdefault((*c.column, idx, c.reverse, flank), len(loci)) if flank else -1
-                    for f, v in zip(FIELDS, (g, locus, BASE[s[at]], q[at], at, mate, rid, -1), strict=True):
+                    for f, v in zip(FIELDS, (g, locus, BASE[s[at]], q[at], at, mate, rid, -1, len(s)), strict=True):
                         rows[f].append(v)
-    out = {f: np.array(v, np.int64) for f, v in rows.items()}
+    out = {f: np.frombuffer(v, np.int64).copy() for f, v in rows.items()}
     if args.sam:
         add_truth(out, args.sam, args.reference)
     return out
