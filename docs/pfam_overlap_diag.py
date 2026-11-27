@@ -33,6 +33,11 @@ from sequencing_error_model.sources import bam
 BASES = "ACGT"
 COMP = str.maketrans("ACGT", "TGCA")
 Q_BINS = ((0, 20), (20, 30), (30, 36), (36, 99))
+Q_EDGES = (20, 30, 36)  # the same groups, for np.digitize
+INSERT_STEP = 50
+INSERT_BINS = tuple(f"{k}+" for k in range(0, 750, INSERT_STEP))  # the last holds 700 and over
+SHORT, LONG = 200, 350  # inserts compared in the substitution spectrum
+CODE4 = {b: i for i, b in enumerate("ACGT")}
 CODE = np.full(256, -1, np.int64)
 for _i, _b in enumerate(BASES):
     CODE[ord(_b)] = _i
@@ -79,6 +84,47 @@ def _op(g: str, b: str, reverse: bool) -> str:
     return (f"{g}>{b}".translate(COMP)) if reverse else f"{g}>{b}"
 
 
+def _rates(bases: np.ndarray, errors: np.ndarray) -> list[float | None]:
+    return [float(e / n) if n else None for n, e in zip(bases.tolist(), errors.tolist(), strict=True)]
+
+
+def by_insert(strata: np.ndarray) -> dict[str, object]:
+    """Error by insert: per Q group, standardised over Q x cycle quarter x mate, and the long-insert spectrum."""
+    match = np.eye(4, dtype=bool)
+    bases = strata.sum((4, 5))  # insert x q x quarter x mate
+    errors = (strata * ~match).sum((4, 5))
+    # standardised: each insert's per-stratum rates, weighted by the strata's share of all bases
+    weight = bases.sum(0) / max(bases.sum(), 1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rate = errors / bases
+    seen = bases > 0
+    standard = [
+        float((rate[i][seen[i]] * weight[seen[i]]).sum() / weight[seen[i]].sum()) if seen[i].any() else None
+        for i in range(len(INSERT_BINS))
+    ]
+    q_names = [f"q{lo}-{hi - 1}" for lo, hi in Q_BINS]
+    spectrum = {}
+    short, long = slice(0, SHORT // INSERT_STEP), slice(LONG // INSERT_STEP, None)
+    for mate in range(2):
+        for name, part in (("short", short), ("long", long)):
+            t = strata[part, :, :, mate].sum((0, 1, 2))  # genome base x read base
+            spectrum[f"mate{mate + 1}_{name}"] = {
+                f"{'ACGT'[a]}>{'ACGT'[b]}": float(t[a, b] / t[a].sum()) if t[a].sum() else None
+                for a in range(4)
+                for b in range(4)
+                if a != b
+            }
+    return {
+        "bins": list(INSERT_BINS),
+        "bases": bases.sum((1, 2, 3)).tolist(),
+        "crude": _rates(bases.sum((1, 2, 3)), errors.sum((1, 2, 3))),
+        "standardised": standard,
+        "by_q": {q: _rates(bases[:, i].sum((1, 2)), errors[:, i].sum((1, 2))) for i, q in enumerate(q_names)},
+        "spectrum": spectrum,
+        "short_long": [f"< {SHORT}", f">= {LONG}"],
+    }
+
+
 def diagnose(sam: Path, ref: dict[str, str], min_mapq: int = 20, max_alt_freq: float = 0.2) -> dict[str, object]:
     masks = variant_masks(sam, ref, min_mapq, max_alt_freq)
     n: Counter[str] = Counter()
@@ -88,7 +134,9 @@ def diagnose(sam: Path, ref: dict[str, str], min_mapq: int = 20, max_alt_freq: f
     region: dict[str, dict[str, list[int]]] = {"inside": {}, "outside": {}}
     # a `one` error: the Q of the mate that erred against the Q of the mate that did not
     pairs_q: Counter[str] = Counter()
-    insert: dict[int, list[int]] = {}
+    # every aligned base of a proper pair, 10 or more from either alignment end, in read orientation:
+    # insert bin x Q group x cycle quarter x mate x genome base x read base
+    strata = np.zeros((len(INSERT_BINS), len(Q_EDGES) + 1, 4, 2, 4, 4), np.int64)
     mates: dict[str, pysam.AlignedSegment] = {}
 
     def mask_of(x: pysam.AlignedSegment) -> np.ndarray | None:
@@ -105,24 +153,23 @@ def diagnose(sam: Path, ref: dict[str, str], min_mapq: int = 20, max_alt_freq: f
             continue
         n["pairs"] += 1
         if r1.is_proper_pair and r1.template_length:
-            cell = insert.setdefault(min(abs(r1.template_length) // 50 * 50, 700), [0, 0])
-            for x in (r1, r2):
-                seq, qual, start, stop = (
-                    x.query_sequence or "",
-                    x.query_qualities or [],
-                    x.query_alignment_start,
-                    x.query_alignment_end,
-                )
+            size = min(abs(r1.template_length) // INSERT_STEP, len(INSERT_BINS) - 1)
+            for mate, x in enumerate((r1, r2)):
+                seq, qual, mask = x.query_sequence or "", x.query_qualities or [], mask_of(x)
+                start, stop, length = x.query_alignment_start, x.query_alignment_end, len(seq)
+                contig = ref[x.reference_name or ""]
                 for qp, rp in x.get_aligned_pairs(matches_only=True):
-                    if (
-                        qual[qp] >= 36
-                        and min(qp - start, stop - 1 - qp) >= 10
-                        and not (mask_of(x) is not None and mask_of(x)[rp])
-                    ):
-                        g, b = ref[x.reference_name][rp], seq[qp]
-                        if g in BASES and b in BASES:
-                            cell[0] += 1
-                            cell[1] += b != g
+                    g, b = contig[rp], seq[qp]
+                    if g not in BASES or b not in BASES or min(qp - start, stop - 1 - qp) < 10:
+                        continue
+                    if mask is not None and mask[rp]:
+                        continue
+                    cycle = length - 1 - qp if x.is_reverse else qp
+                    if x.is_reverse:
+                        g, b = g.translate(COMP), b.translate(COMP)
+                    strata[
+                        size, int(np.digitize(qual[qp], Q_EDGES)), 4 * cycle // length, mate, CODE4[g], CODE4[b]
+                    ] += 1
         s1, s2 = _sites(r1), _sites(r2)
         both = s1.keys() & s2.keys()
         n["pairs_overlapping"] += bool(both)
@@ -174,7 +221,7 @@ def diagnose(sam: Path, ref: dict[str, str], min_mapq: int = 20, max_alt_freq: f
             for k, v in region.items()
         },
         "one_by_q_pair": dict(pairs_q.most_common()),
-        "q36_by_insert": {f"{k}+": {"bases": v[0], "rate": v[1] / max(v[0], 1)} for k, v in sorted(insert.items())},
+        "insert": by_insert(strata),
     }
 
 
@@ -204,7 +251,22 @@ def main() -> None:
     )
     for region, rows in out["rate_by_q"].items():
         print(f"{region:>8}: " + ", ".join(f"{b} {x['rate']:.2e}" for b, x in rows.items()))
-    print("Q>=36 by insert: " + ", ".join(f"{k} {x['rate']:.1e}" for k, x in out["q36_by_insert"].items()))
+    ins = out["insert"]
+
+    def row(values: list[float | None]) -> str:
+        return " ".join(f"{v:.1e}" if v is not None else "   -   " for v in values)
+
+    print("insert            " + " ".join(f"{b:>7}" for b in ins["bins"]))
+    print("bases             " + " ".join(f"{n:>7.0e}" for n in ins["bases"]))
+    print("crude             " + row(ins["crude"]))
+    print("std Q*cycle*mate  " + row(ins["standardised"]))
+    for q, values in ins["by_q"].items():
+        print(f"{q:<18}" + row(values))
+    for mate in ("mate1", "mate2"):
+        short, long = ins["spectrum"][f"{mate}_short"], ins["spectrum"][f"{mate}_long"]
+        fold = {op: long[op] / short[op] for op in short if short[op] and long[op]}
+        top = sorted(fold, key=lambda op: -fold[op])[:4]
+        print(f"{mate} long/short insert, by op: " + ", ".join(f"{op} {fold[op]:.1f}x ({long[op]:.1e})" for op in top))
 
 
 if __name__ == "__main__":

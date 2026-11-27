@@ -35,6 +35,8 @@ from sequencing_error_model.pfam_truth import CELL  # noqa: E402
 BASES = "ACGT"
 Q_EDGES = (20, 30, 36)  # pfam_truth's Q groups
 Q_NAMES = ("q:0+", "q:20+", "q:30+", "q:36+")
+INSERT_EDGES = (150, 200, 250, 300, 350)  # from the alignment (proper pairs); -1 without one
+INSERT_NAMES = ("insert:unknown", "insert:0+", *(f"insert:{x}+" for x in INSERT_EDGES))
 OTHERS = 2  # unanimous other reads that make a label (pfam_locus)
 
 
@@ -71,6 +73,8 @@ def score(t: dict[str, np.ndarray], boot: int = 5) -> dict[str, dict[str, object
         "q": (np.digitize(t["q"], Q_EDGES), Q_NAMES),
         "position": (np.minimum(4 * t["cycle"] // np.maximum(t["length"], 1), 3), [f"position:{i}" for i in range(4)]),
         "mate": (t["mate"], ["mate:1", "mate:2"]),
+        # not a covariate any mode but `reference` sees for long inserts: here to see whether error depends on it
+        "insert": (np.where(t["insert"] < 0, 0, 1 + np.digitize(t["insert"], INSERT_EDGES)), INSERT_NAMES),
     }
     # the contrast, as the prototype fits it: every read of a locus of three or more against the locus' majority
     # (a leave-one-out label would leave an erring read alone in its locus, and b(locus) would absorb it)

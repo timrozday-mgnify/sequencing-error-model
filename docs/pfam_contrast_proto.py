@@ -26,7 +26,7 @@ Q_EDGES = (15, 20, 25, 30, 35, 38)
 CYCLE_EDGES = (25, 50, 75, 100, 125)
 MIN_DEPTH = {"group": 20, "locus": 3}  # bases per group: fewer cannot separate b from e; a locus needs a majority
 FLANK = 12  # bases each side that make a locus (pfam_locus)
-FIELDS = ("group", "locus", "base", "q", "cycle", "mate", "rid", "true", "length")
+FIELDS = ("group", "locus", "base", "q", "cycle", "mate", "rid", "true", "length", "insert")
 
 
 def table(args: argparse.Namespace) -> dict[str, np.ndarray]:
@@ -54,7 +54,7 @@ def table(args: argparse.Namespace) -> dict[str, np.ndarray]:
                     g = keys.setdefault((*c.column, idx, c.reverse), len(keys))
                     # the same column and the same bases either side: one gene in one strain (-1: a flank runs off the read)
                     locus = loci.setdefault((*c.column, idx, c.reverse, flank), len(loci)) if flank else -1
-                    for f, v in zip(FIELDS, (g, locus, BASE[s[at]], q[at], at, mate, rid, -1, len(s)), strict=True):
+                    for f, v in zip(FIELDS, (g, locus, BASE[s[at]], q[at], at, mate, rid, -1, len(s), -1), strict=True):
                         rows[f].append(v)
     out = {f: np.frombuffer(v, np.int64).copy() for f, v in rows.items()}
     if args.sam:
@@ -75,6 +75,8 @@ def add_truth(t: dict[str, np.ndarray], sam: Path, reference: Path) -> None:
             if lo == hi or n is None:
                 continue
             sites = pfam_truth.sites(r, n)
+            if r.is_proper_pair and r.template_length:
+                t["insert"][lo:hi] = abs(r.template_length)
             contig = genome.setdefault(r.reference_name, fa.fetch(r.reference_name).upper())
             for k in range(lo, hi):
                 site = sites[t["cycle"][k]]
