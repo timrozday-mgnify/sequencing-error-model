@@ -349,12 +349,18 @@ and searched with all of Pfam 38.2.
   insert 0.80–1.05), D6331's strains included. SRR12324253 and SRR23926920 have binned Q, so their Q shape is not tested.
 - **Insert size is a covariate of error here**, in the exposed Pfam bases too (ERR2935805: 6.8 × 10⁻⁴ under 150 bp, 1.35 × 10⁻³ at ≥ 350). Only an alignment
   shows it beyond the overlap, so modelling it is a question for `reference` mode in the main plan, not this one.
-- **Correction (2026-11-27).** The locus figures just above compare against the truth of `pfam_p2_cells`, which reuses the contrast prototype's and so
-  neither masks strain-variant sites nor requires MAPQ >= 20, as `pfam_truth` does. Over all seven libraries it runs 4–37 % above P2's truth, and 2.6x in
-  SRR12829160 (6.55 against 2.53 × 10⁻³ per base). The contrast checks compare like with like and stand; how much cleaner the locus bases are is uncertain
-  until that truth is masked. `pfam_contrast_proto.add_truth` now masks as `pfam_truth` does (variant sites by `pfam_overlap_diag.variant_masks`, MAPQ
-  >= 20; checked on a synthetic genome with a repeat and a 50 % variant), and `pfam_p2_cells` rebuilds any older table: the locus figures wait for that
-  rerun (`CELLS_ONLY=1 sbatch workflows/pfam/diagnose.sh`).
+- **Correction (2026-11-27), settled with a masked truth.** The locus figures just above came from `pfam_p2_cells`, whose truth then neither masked
+  strain-variant sites nor required MAPQ >= 20. It now masks as `pfam_truth` does, and over all seven full libraries its truth equals P2's to the
+  third digit, counting all twelve ops (P2's Q, position and mate cells count the ten stops identify; the "4–37 % above P2" first given here was mostly
+  that). Unmasked it was 2–6 % high, but 2.0x in SRR12829160. Masked, on the full libraries:
+
+  | | ERR2935805 | ERR2984773 | SRR12324253 | SRR12829160 | SRR23926920 | SRR24523812 | SRR32629731 |
+  |---|---|---|---|---|---|---|---|
+  | locus bases' error / all exposed | 0.71 | 0.61 | 0.87 | 0.55 | 0.66 | 0.56 | 0.83 |
+  | contrast shape within 25 % | 17/17 | 14/17 | 13/13 | 17/17 | 13/13 | 15/17 | 15/16 |
+
+  The locus does label cleaner bases, within Q groups too (ERR2984773 0.67 at Q < 20, 0.90 at Q >= 36; SRR12829160 about 0.70 in every Q group, falling
+  from 0.70 to 0.51 with insert size). The contrast misses are small high-Q cells (ERR2984773, the isolate) and SRR32629731's Q 20–29 (1.68).
 
 **Redesign prototype (2026-11-27; development on P2's data, not a verdict)** ([pfam_redesign_proto.py](pfam_redesign_proto.py)). The overlap anchor is
 dropped; each remaining piece does one job, from the reads and the stop fit alone, and P2's masked score cells judge it under P2's rule:
