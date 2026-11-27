@@ -324,7 +324,8 @@ and searched with all of Pfam 38.2.
 - **The mate-overlap anchor undercounts on real Illumina reads** (0.22–0.88), which it did not in the rehearsal (1.09), and combining it with the stops pulls the fit down.
   The stop anchor alone is within 15 % in 7 of 7 and would pass in 3 (ERR2935805, SRR12829160, SRR32629731); the other four miss 1–3 cells, most often `T>G` (0.45–0.67 in four).
   **This is exploratory**: choosing the anchor after seeing the result does not change the verdict.
-- **Locus consensus** (reported, not judged): the mixture estimate is within about 2 % of the truth on the labelled bases in six libraries (e.g. 8.33 vs 8.40 × 10⁻⁴); the isolate 5.43 vs 6.70 × 10⁻³.
+- **Locus consensus** (reported, not judged): the mixture estimate is within about 2 % of the truth **on the codons it labels** in six libraries (e.g. 8.33 vs 8.40 × 10⁻⁴); the isolate 5.43 vs 6.70 × 10⁻³.
+  Those codons are cleaner than the rest: against the truth over all exposed bases the mixture is 0.69–0.95 (0.49 the isolate), so the locus selects on error too, less than the overlap.
 - Next, if the mode is kept, all on P2's `keep/` (hit tables, undosed reads and alignments; no new search): why the overlap anchor undercounts here (§3.8); the
   `T>G` deficit of the stop anchor; the locus mixture (Tier 1c, §13.2 item 2) and the within-locus contrast (Tier 3, §13.2 item 1) scored per op, Q, mate and
   position against the same truth, which P2 did not do. A fit of stops and locus without the overlap is then a new design: its rule is to be agreed before it
