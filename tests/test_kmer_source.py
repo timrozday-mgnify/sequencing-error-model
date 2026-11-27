@@ -275,3 +275,25 @@ def test_default_mode_refuses_a_tile_term() -> None:
     with pytest.raises(ValueError, match="not identifiable in `kmer` default mode"):
         kmer_source._split(["QualityWindow(0)", "Context(1,1)", "Tile(2)"])
     assert a.k == 11  # the fixture this stands on
+
+
+def test_a_level_from_another_mode_rescales_only_the_level(reads_fastq: Path, tmp_path: Path) -> None:
+    """Gate outcome (b): skiver's shape, another mode's level (e.g. pfam's stops, ten ops without A>G and T>C)."""
+    a = skiver_analyze.read_analyze(FIXTURES / "analyze")
+    mass = Counter[str]()
+    for row in a.spectrum:
+        mass[row.op] += row.total
+    ten = [o for o in kmer_fit.SUBSTITUTIONS if o not in ("A>G", "T>C")]
+    own = a.error_rate.per_base_error_rate * sum(mass[o] for o in ten) / sum(mass.values())
+    assert kmer_fit.anchored(a, own, ten) == pytest.approx(1.0)
+    assert kmer_fit.anchored(a, 2 * own, ten) == pytest.approx(2.0)
+    assert kmer_fit.anchored(a, own, ten, "kvmer") == pytest.approx(1 / kmer_fit.level_ratio(a, "kvmer"))
+    with pytest.raises(ValueError, match="substitutions"):
+        kmer_fit.anchored(a, own, ["A>-"])
+    out = tmp_path / "spec"
+    argv = [str(FIXTURES / "analyze"), str(reads_fastq), "--output", str(out), "--quality-tokens", *QUALITY_TOKENS,
+            "--min-k", "11", "--level-rate", str(2 * own), "--level-ops", *ten]  # fmt: skip
+    assert kmer_source.main(argv) == 0
+    spec = spec_io.load(out)
+    assert spec.provenance["level_scale"] == pytest.approx(2.0)
+    assert spec.provenance["level_anchor"] == {"rate": 2 * own, "ops": ten}

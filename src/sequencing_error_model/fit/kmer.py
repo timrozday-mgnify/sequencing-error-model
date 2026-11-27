@@ -851,6 +851,31 @@ def levels(a: SkiverAnalyze, use_all: bool = False) -> dict[str, Any]:
 LEVEL_SOURCES = ("skiver", "ols", "kvmer", "position")
 
 
+SUBSTITUTIONS = tuple(f"{x}>{y}" for x in "ACGT" for y in "ACGT" if x != y)
+
+
+def anchored(
+    a: SkiverAnalyze, rate: float, ops: Sequence[str] = SUBSTITUTIONS, source: str = "skiver", use_all: bool = False
+) -> float:
+    """The `level` for `sources.kmer.fit` that puts the per-base rate of `ops` on `rate`, from another mode.
+
+    For gate outcome (b) (plan §6.5.1): default mode keeps its spectrum and context and takes its level from elsewhere,
+    here e.g. `pfam`'s stop anchor, a level with no reference and no mate overlap. `ops`' share of skiver's error mass
+    (`summary_error_spectrum.csv`) turns `source`'s total rate into theirs.
+    """
+    # ponytail: shares are of error mass, so a composition gap between the two modes' bases (pfam is coding DNA) passes
+    # into the level; per-source-base rates need skiver's base exposure, which `analyze` does not report
+    mass = Counter[str]()
+    for row in a.spectrum:
+        mass[row.op] += row.total
+    if unknown := set(ops) - set(SUBSTITUTIONS):
+        raise ValueError(f"not substitutions: {sorted(unknown)}")
+    share = sum(mass[o] for o in ops) / sum(mass.values())
+    if not share:
+        raise ValueError(f"skiver saw no errors of {list(ops)}: nothing to scale")
+    return rate / (a.error_rate.per_base_error_rate * level_ratio(a, source, use_all) * share)
+
+
 def level_ratio(a: SkiverAnalyze, source: str, use_all: bool = False) -> float:
     """The factor `sources.kmer.fit(level=)` needs to put the level on `source`'s estimate.
 

@@ -267,6 +267,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "without the ridge, a hazard-model-free kvmer.csv count, or the fit-free per-cycle mean. Every "
         "estimate goes into the spec's provenance whichever is chosen (plan phase 6b item 2).",
     )
+    p.add_argument(
+        "--level-rate",
+        type=float,
+        metavar="RATE",
+        help="put the per-base rate of --level-ops on RATE, a level from another mode (e.g. pfam's stop anchor; "
+        "plan §6.5.1 outcome (b)), keeping skiver's Q shape, spectrum and context",
+    )
+    p.add_argument(
+        "--level-ops",
+        nargs="+",
+        default=list(kmer.SUBSTITUTIONS),
+        metavar="OP",
+        help="the substitutions RATE covers (default all twelve; pfam's stops alone cover ten, without A>G T>C)",
+    )
     args = p.parse_args(argv)
     flank = (args.flank[0], args.flank[1])
     m = Component(args.quality_tokens[0]).args[0]
@@ -308,6 +322,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "mate_sources": [str(x) for x in (args.mate_analyze or ())],
         "identified_ops": ["substitution", "insertion", "deletion"],  # kvmer.csv reports all three, 1 bp only
     }
+    level = 1.0
+    if args.level_rate is not None:
+        level = kmer.anchored(a, args.level_rate, args.level_ops, args.level_from, args.use_all)
+        provenance["level_anchor"] = {"rate": args.level_rate, "ops": args.level_ops}
     spec = fit(
         a,
         profile,
@@ -316,6 +334,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.quality_tokens,
         provenance,
         use_all=args.use_all,
+        level=level,
         level_from=args.level_from,
         flank=flank,
         min_k=args.min_k,

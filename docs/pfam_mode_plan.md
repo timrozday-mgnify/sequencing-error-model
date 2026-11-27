@@ -418,7 +418,8 @@ the locus and contrast scoring of `diagnose.sh`.
   (72 bp, DNBSEQ) are too short (§6), and are run only to show the mode refuses them.
 - Report: rate, ops, Q / position / mate curves, the floor interval, T1 plateau, standard additions at two doses, and a stop-code check
   (per-stop `TAA`/`TAG`/`TGA` excess by family, to catch recoding: code 4, 11, 15, and selenocysteine).
-- Compare with `pe-overlap` where it works. Skip long reads here.
+- Compare with `pe-overlap` where it works, and with `kmer` default mode's spectrum on the same reads (§14): whether the stops' rate holds
+  outside coding DNA and stop-adjacent contexts. Skip long reads here.
 - **Exit:** the plateau and the dose-response hold in every biome, or the biomes where they do not are named.
 
 ### P4: tiers 2 and 3, and long reads (HPC, only after P2's go)
@@ -605,3 +606,26 @@ rate is genome-wide (§5).
 
 **Where they land.** P3: 13.1, and 13.2 (1) scored on P2's kept hit tables against P2's truth (D6331 for strain variation). P4: 13.2 (1) as Tier 3 in the fit, if
 it beats the anchors alone on held-out data.
+
+## 14. Explored: k-mer evidence beside the anchors (2026-11-27)
+
+The question: would k-mer evidence fit alongside the locus, with broader coverage of the reads, to give more shape? **Not for shape.** The locus already is
+k-mer evidence (§12: a key and the consensus of what follows, with flanks on both sides and a frame), and its measured fault is selection: the bases it
+labels hold 0.67-0.95 of the true error, and the within-locus contrast's shape is wrong on all bases (Q >= 36 1.6-3.1x; §7, P2). A k-mer key has the
+same rule, an error-free run before the value, so broader coverage adds bases with the same bias that depends on Q. A correction would come from the stops,
+so it would be no stronger than the stop fit where the stop fit is weak (the high-Q groups). So:
+
+- **Level and shape stay with the stops, the op mix with the locus** (P2b's design, unchanged).
+- **The selection is measured, from the stops.** `pfam_locus.selection`, in every locus report: the stop rate on codons whose locus' other fragments agree on a
+  sense codon, over that on all exposed codons. Being keyed depends on the other fragments only, never on the codon itself, and a stop's label is the genetic
+  code's, so the ratio is the clean-flank rule's bias with no genome. With truth it also gives the factor over every base, which tests whether the stops' factor
+  holds for all ops. Simulated uniform errors give 1.22 ± 0.15 and 1.08 ± 0.19 (truth 1.01, 0.96). It runs on P2's `keep/` in `diagnose.sh`
+  (`--mask-variants`: P2's truth, MAPQ >= 20 and strain sites masked). **Reported, not judged.** If the stops' factor matches the truth's, it is a
+  truth-free correction for the locus level, and for any k-mer level built the same way.
+- **K-mers for what pfam cannot see**: non-coding DNA, genes without a Pfam hit, every context, homopolymers and indels. That is the spectrum and context
+  that the main plan's gate (§6.5.1) expects default mode to keep; P3 compares them (above).
+- **pfam as `kmer` mode's level**: outcome (b) of that gate takes the level from another mode, and `sources.kmer --level-rate RATE --level-ops ...`
+  (`fit.kmer.anchored`) puts it on the stop anchor: a level with no reference and no mate overlap. The ops' share is of skiver's error mass, so a
+  composition gap between coding DNA and the genome passes into the level (recorded in the spec's `level_anchor`).
+- Default mode is untouched: joining k-mers to pfam bases one by one needs base or read ids, which `skiver analyze` does not give, so it is done
+  with pfam's own keys (`pfam_locus`), never with skiver output.

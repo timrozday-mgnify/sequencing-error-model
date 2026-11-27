@@ -131,6 +131,29 @@ def variant_sites(
     return bam.site_masks(counts, lambda c: genome[c], max_alt_freq)[0]
 
 
+def sam_variant_masks(sam: Path, genome: Mapping[str, str], min_mapq: int, max_alt_freq: float) -> dict[str, Array]:
+    """`variant_sites` from every primary alignment at `min_mapq` or more, not only the exposed reads'."""
+    code = np.full(256, -1, np.int64)
+    for i, b in enumerate(BASES):
+        code[ord(b)] = i
+    counts: dict[str, Array] = {}
+    with pysam.AlignmentFile(str(sam), check_sq=False) as f:
+        for r in f.fetch(until_eof=True):
+            contig, seq = r.reference_name, r.query_sequence
+            if r.is_secondary or r.is_supplementary or r.is_unmapped or r.mapping_quality < min_mapq:
+                continue
+            if contig is None or seq is None:
+                continue
+            at = np.array(r.get_aligned_pairs(matches_only=True), np.int64).reshape(-1, 2)
+            base = code[np.frombuffer(seq.encode(), np.uint8)[at[:, 0]]]
+            table = counts.get(contig)
+            if table is None:
+                table = counts[contig] = np.zeros((len(genome[contig]) + 1, 6), np.int32)
+            on = base >= 0
+            np.add.at(table, (at[on, 1], base[on]), 1)
+    return bam.site_masks(counts, lambda c: genome[c], max_alt_freq)[0]
+
+
 def true_bases(codon: Codon, p: Placement, genome: Mapping[str, str]) -> tuple[str, str] | None:
     """The genome's bases under the codon, (read orientation, coding orientation); None off it or across a gap."""
     sites = [int(p.sites[x]) for x in codon.positions]

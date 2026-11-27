@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pysam
 
-from sequencing_error_model.sources import bam
+from sequencing_error_model import pfam_truth
 
 BASES = "ACGT"
 COMP = str.maketrans("ACGT", "TGCA")
@@ -57,16 +57,7 @@ def reads(sam: Path, min_mapq: int) -> Iterator[pysam.AlignedSegment]:
 
 
 def variant_masks(sam: Path, ref: dict[str, str], min_mapq: int, max_alt_freq: float) -> dict[str, np.ndarray]:
-    counts: dict[str, np.ndarray] = {}
-    for r in reads(sam, min_mapq):
-        at = np.array(r.get_aligned_pairs(matches_only=True), np.int64).reshape(-1, 2)
-        base = CODE[np.frombuffer(r.query_sequence.encode(), np.uint8)[at[:, 0]]]
-        table = counts.get(r.reference_name)
-        if table is None:
-            table = counts[r.reference_name] = np.zeros((len(ref[r.reference_name]) + 1, 6), np.int32)
-        on = base >= 0
-        np.add.at(table, (at[on, 1], base[on]), 1)
-    return bam.site_masks(counts, lambda c: ref[c], max_alt_freq)[0]
+    return pfam_truth.sam_variant_masks(sam, ref, min_mapq, max_alt_freq)
 
 
 def q_bin(q: int) -> str:
