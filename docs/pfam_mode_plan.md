@@ -349,6 +349,35 @@ and searched with all of Pfam 38.2.
   insert 0.80–1.05), D6331's strains included. SRR12324253 and SRR23926920 have binned Q, so their Q shape is not tested.
 - **Insert size is a covariate of error here**, in the exposed Pfam bases too (ERR2935805: 6.8 × 10⁻⁴ under 150 bp, 1.35 × 10⁻³ at ≥ 350). Only an alignment
   shows it beyond the overlap, so modelling it is a question for `reference` mode in the main plan, not this one.
+- **Correction (2026-11-27).** The locus figures just above compare against the truth of `pfam_p2_cells`, which reuses the contrast prototype's and so
+  neither masks strain-variant sites nor requires MAPQ >= 20, as `pfam_truth` does. Over all seven libraries it runs 4–37 % above P2's truth, and 2.6x in
+  SRR12829160 (6.55 against 2.53 × 10⁻³ per base). The contrast checks compare like with like and stand; how much cleaner the locus bases are is uncertain
+  until that truth is masked. `pfam_contrast_proto.add_truth` now masks as `pfam_truth` does (variant sites by `pfam_overlap_diag.variant_masks`, MAPQ
+  >= 20; checked on a synthetic genome with a repeat and a 50 % variant), and `pfam_p2_cells` rebuilds any older table: the locus figures wait for that
+  rerun (`CELLS_ONLY=1 sbatch workflows/pfam/diagnose.sh`).
+
+**Redesign prototype (2026-11-27; development on P2's data, not a verdict)** ([pfam_redesign_proto.py](pfam_redesign_proto.py)). The overlap anchor is
+dropped; each remaining piece does one job, from the reads and the stop fit alone, and P2's masked score cells judge it under P2's rule:
+
+| design | level | Q, position, mate | op mix | passes (of 7) |
+|---|---|---|---|---|
+| P2's `both` | stops + overlap | the fit | the fit | 1 |
+| `stops` alone | stops | the fit | the fit | 3 |
+| contrast shape (`--shape relative` / `additive`) | stops | within-locus contrast | locus label | 1 / 3 |
+| **hybrid** (`--shape stops`, the default) | stops | the stop fit's own | locus label | **5** |
+
+- The locus op mix removes the stop fit's op failures: `T>G`, outside in four libraries with stops alone (0.45–0.67), is within in all seven. What remains
+  outside in the hybrid is one cell each in two libraries: Q ≥ 36 in ERR2984773 (1.80, the stop fit's own Q curve) and `A>T` in SRR12829160 (0.71).
+- `A>G` / `T>C`, which P2 does not judge, come from the locus label at 0.90–1.24 of the truth where there are no strains (both: 0.01–0.84); in D6331 the
+  label's strain transitions push them to 1.29–2.56, and the isolate's `T>C` is 1.49.
+- **With P2's locus mixture** (`--locus`: each op's labels times its complementary pair's error share on the coding strand; not where omega ≥ 0.5, as in
+  the isolate, 0.89, where biology looks like error) the passes stay 5 of 7 and D6331 comes down only part of the way: SRR32629731 `A>G` 1.29 → 1.02,
+  `T>C` 2.56 → 2.03; SRR23926920 1.59 → 1.41 and 1.85 → 1.65. The mixture's omega is from recurring alleles, and singleton variants are less purged
+  (`pfam_locus`), so it leaves strain transitions in. Without strains it changes little (0.99–1.22).
+- The contrast's shape, right on its own bases, is wrong on all bases (Q ≥ 36 1.6–3.1, Q < 20 0.58–0.67): the locus bases are not equally clean in every
+  Q group, so their shape is not the library's. The contrast stays a check, not a source of the shape.
+- **Chosen after seeing P2, on P2's libraries**, so it cannot reverse P2's no-go. Before a P2b: the mixture-corrected op mix for `A>G` / `T>C`, the
+  masked truth in `pfam_p2_cells`, a rule written down first, and libraries P2 did not use.
 
 - **No-go** outcome is still useful: report the floor and keep the mode as a lower-effort check, or drop it.
 
