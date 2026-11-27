@@ -11,7 +11,8 @@
 #   docs/pfam_p2_cells.py      the locus label and the within-locus contrast per op, Q, mate and position, against truth
 # With the exports of README step 2 (BASE, B9_DIR, KF_DIR; REPO, SEM_HPC as the preflight), from <runs>/sem-pfam/p2:
 #   cd $RUNS/p2 && sbatch $REPO/workflows/pfam/diagnose.sh        # or --array=2 for one library
-# Writes diagnose/<run>.overlap.json, <run>.cells.json and <run>.cells.npz (the per-base table, reused on a rerun).
+# Writes diagnose/<run>.overlap.json, <run>.cells.json and <run>.cells.npz (the per-base table, reused on a rerun;
+# a table from before its truth was masked is rebuilt). CELLS_ONLY=1 skips the overlap diagnostic.
 set -euo pipefail
 : "${BASE:?set BASE}" "${B9_DIR:?set B9_DIR}" "${KF_DIR:?set KF_DIR}"
 REPO=${REPO:-$BASE/sequencing-error-model}
@@ -30,7 +31,7 @@ keep=results/keep/$run out=diagnose
 mkdir -p "$out"
 py() { singularity exec -B "$REPO/src:/app/src" -B "$BASE" -B "$B9_DIR" -B "$KF_DIR" "$SIF" python "$@"; }
 echo "$run against $genomes"
-py "$REPO/docs/pfam_overlap_diag.py" "$keep/aligned.sam" "$genomes" --output "$out/$run.overlap.json"
+[[ ${CELLS_ONLY:-0} == 1 ]] || py "$REPO/docs/pfam_overlap_diag.py" "$keep/aligned.sam" "$genomes" --output "$out/$run.overlap.json"
 py "$REPO/docs/pfam_p2_cells.py" "$keep/$run.kept_1.fastq.gz" "$keep/$run.kept_2.fastq.gz" --pairs "$keep/0/pairs.tsv" \
     --prep "$KF_DIR/prep" --sam "$keep/aligned.sam" --reference "$genomes" --table "$out/$run.cells.npz" \
     --output "$out/$run.cells.json"

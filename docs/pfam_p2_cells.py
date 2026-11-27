@@ -3,7 +3,8 @@
 P2 judged the fits per op, Q group, mate and read-position quarter, but showed the locus anchor only as a total, and on
 the bases it labels. This scores both per cell against the truth over **all** exposed bases, the truth P2's checks use:
 
-- `truth`: errors per base of every exposed codon, by the genome under it (`pfam_contrast_proto.add_truth`);
+- `truth`: errors per base of every exposed codon, by the genome under it (`pfam_contrast_proto.add_truth`), masked as
+  `pfam_truth` masks P2's truth: variant sites (another base in >= 20 % of reads) and MAPQ < 20 are unknown;
 - `truth_locus`: the same on the bases the locus labels; equal to `truth` in a cell when the locus selects only
   through the cell's covariates, unequal when its clean-flank, three-fragment rule picks cleaner reads within it;
 - `locus`: the label rate, a base against the unanimous base of two or more other reads of its locus (same column,
@@ -207,7 +208,8 @@ def main() -> None:
         "--contrast-rows", type=int, default=50_000_000, help="fit the contrast on every k-th locus above this"
     )
     a = p.parse_args()
-    if not a.table.exists():
+    stale = a.table.exists() and "masked" not in np.load(a.table).files  # tables before the truth was masked
+    if not a.table.exists() or stale:
         if not (a.r1 and a.r2 and a.pairs and a.prep and a.sam and a.reference):
             p.error("building the table needs R1 R2 --pairs --prep --sam --reference")
         a.every_n, a.dose = 1, 0.0

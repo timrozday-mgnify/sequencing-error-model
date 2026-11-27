@@ -10,8 +10,9 @@ P2's diagnosis kept three of the four pieces, each for one job, and dropped the 
   mean times the level. Both carry the shape of the locus bases, which are cleaner than the rest by different amounts
   in different Q groups (P2's diagnosis), so neither is the library's shape exactly;
 - **op mix**: each substitution's locus label rate (a base against the unanimous base of two or more other reads),
-  scaled so the ten ops sum to the level. It is the only source of A>G / T>C here; strains inflate its transitions
-  where the label is not corrected for biology (D6331).
+  scaled so the ten ops sum to the level. It is the only source of A>G / T>C here. With `--locus`, each op's labels
+  are scaled by the share that P2's locus mixture calls errors (`error_share`), which takes out strains' transitions;
+  not where omega >= `MAX_OMEGA`, where the mixture cannot split biology from error.
 
 Nothing here reads the truth: the shape and the op mix come from the reads alone (`pfam_p2_cells` tables, built from
 reads and hits), the level from the stop fit. The truth enters only to judge, against P2's score cells (masked
@@ -37,6 +38,31 @@ from sequencing_error_model import pfam_truth  # noqa: E402
 
 BASES = "ACGT"
 TEN = np.array([[f"{a}>{b}" in pfam_truth.TEN for b in BASES] for a in BASES])  # source x read base
+COMP = str.maketrans("ACGT", "TGCA")
+MAX_OMEGA = 0.5  # above it, biology looks like error (missense near synonymous) and the mixture cannot split them
+
+
+def error_share(locus: dict[str, Any], flank: int = 12, others: int = 2) -> dict[str, float] | None:
+    """Per read-orientation substitution, the share of locus labels that are errors, from P2's mixture (`pfam_locus`).
+
+    The mixture is on the coding strand; reads cover both strands of a gene, so a read's X>Y is the coding X>Y on
+    one and its complement on the other. Each op takes its complementary pair's share: strains hit both strands
+    alike, and the label's own strand asymmetry (8-oxoG G>T against C>A) is kept. None where omega is too high.
+    """
+    row = next(x for x in locus["loci"] if x["flank"] == flank and x["others"] == others)
+    if not (row["omega"] < MAX_OMEGA) or not row["ops"]:
+        return None
+    ops = locus["ops"]
+    errors = {op: row["ops"][op] * sum(row["chance"][i]) for i, op in enumerate(ops)}
+    labels = {op: sum(row["labels"][i]) for i, op in enumerate(ops)}
+    out = {}
+    for op in ops:
+        pair = (op, op.translate(COMP))
+        n = sum(labels[x] for x in pair)
+        out[op] = min(sum(errors[x] for x in pair) / n, 1.0) if n else 1.0
+    return out
+
+
 COLUMNS = {"locus": np.int64, "base": np.int8, "q": np.uint8, "cycle": np.int16, "length": np.int16, "mate": np.int8}
 
 
@@ -75,7 +101,9 @@ def schemes(t: dict[str, np.ndarray]) -> dict[str, tuple[np.ndarray, list[str]]]
     }
 
 
-def predict(score: dict[str, Any], t: dict[str, np.ndarray], shape: str = "stops") -> dict[str, float]:
+def predict(
+    score: dict[str, Any], t: dict[str, np.ndarray], shape: str = "stops", share: dict[str, float] | None = None
+) -> dict[str, float]:
     """Predicted errors per cell of `score` (P2's cells), from the stop fit's level and the reads."""
     c = score["cells"]
     bases = c["mate:1"]["exposure"] + c["mate:2"]["exposure"]
@@ -110,6 +138,8 @@ def predict(score: dict[str, Any], t: dict[str, np.ndarray], shape: str = "stops
     src, got = cons[lab], t["base"][lab]
     pairs = np.bincount(src.astype(np.int64) * 4 + got, minlength=16).reshape(4, 4).astype(float)
     per_source = np.bincount(src, minlength=4).astype(float)
+    if share is not None:  # biology out of the labels, op by op
+        pairs *= np.array([[share.get(f"{a}>{b}", 1.0) if a != b else 1.0 for b in BASES] for a in BASES])
     rate = pairs / np.maximum(per_source, 1)[:, None]  # per base of the source
     ten_label = float((pairs * TEN).sum() / per_source.sum())
     for a in range(4):
@@ -140,13 +170,21 @@ def main() -> None:
     p.add_argument("table", type=Path, help="the run's pfam_p2_cells table, .npz")
     p.add_argument("--shape", choices=("stops", "relative", "additive"), default="stops")
     p.add_argument("--max-rows", type=int, default=50_000_000, help="every k-th locus beyond this many rows")
+    p.add_argument("--locus", type=Path, help="P2's locus/<run>.0.json: take biology out of the op mix by its mixture")
     p.add_argument("--output", type=Path)
     a = p.parse_args()
     score = json.loads(a.score.read_text())
     table, every = load(a.table, a.max_rows)
-    predicted = predict(score, table, a.shape)
+    share = error_share(json.loads(a.locus.read_text())) if a.locus else None
+    predicted = predict(score, table, a.shape, share)
     del table
-    out = {"predicted": predicted, "redesign": judge(score, predicted), "shape": a.shape, "loci_every": every}
+    out = {
+        "predicted": predicted,
+        "redesign": judge(score, predicted),
+        "shape": a.shape,
+        "loci_every": every,
+        "error_share": share,
+    }
     for spec in ("both", "stops"):
         found = pfam_truth.checks(score, spec)
         out[spec] = {"passed": pfam_truth.passed(found), "checks": found}

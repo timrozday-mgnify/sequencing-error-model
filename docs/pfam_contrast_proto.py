@@ -59,13 +59,24 @@ def table(args: argparse.Namespace) -> dict[str, np.ndarray]:
     out = {f: np.frombuffer(v, np.int64).copy() for f, v in rows.items()}
     if args.sam:
         add_truth(out, args.sam, args.reference)
+        out["masked"] = np.array(1)  # truth as pfam_truth's: variant sites and MAPQ < 20 left unknown
     return out
 
 
-def add_truth(t: dict[str, np.ndarray], sam: Path, reference: Path) -> None:
-    """The genome's base under each row, in read orientation, from the read's primary alignment."""
-    genome: dict[str, str] = {}
-    with pysam.FastaFile(str(reference)) as fa, pysam.AlignmentFile(str(sam), check_sq=False) as f:
+def add_truth(
+    t: dict[str, np.ndarray], sam: Path, reference: Path, min_mapq: int = 20, max_alt_freq: float = 0.2
+) -> None:
+    """The genome's base under each row, in read orientation, from the read's primary alignment.
+
+    As `pfam_truth` judges P2: only alignments at `min_mapq` or more, and not at sites where these reads carry another
+    base at `max_alt_freq` or more (two reads at least, `bam.site_masks`): strains there, not errors. Masked rows stay
+    unknown (-1). The insert size is kept for every primary alignment.
+    """
+    import pfam_overlap_diag  # the same docs/ folder: its masks, so both diagnoses mask alike
+
+    genome = pfam_overlap_diag.genome(reference)
+    masks = pfam_overlap_diag.variant_masks(sam, genome, min_mapq, max_alt_freq)
+    with pysam.AlignmentFile(str(sam), check_sq=False) as f:
         for r in f.fetch(until_eof=True):
             if r.is_secondary or r.is_supplementary or r.is_unmapped or r.query_name is None or not r.reference_name:
                 continue
@@ -74,13 +85,17 @@ def add_truth(t: dict[str, np.ndarray], sam: Path, reference: Path) -> None:
             n = r.infer_read_length()
             if lo == hi or n is None:
                 continue
-            sites = pfam_truth.sites(r, n)
             if r.is_proper_pair and r.template_length:
                 t["insert"][lo:hi] = abs(r.template_length)
-            contig = genome.setdefault(r.reference_name, fa.fetch(r.reference_name).upper())
+            if r.mapping_quality < min_mapq:
+                continue
+            sites = pfam_truth.sites(r, n)
+            contig, mask = genome[r.reference_name], masks.get(r.reference_name)
             for k in range(lo, hi):
                 site = sites[t["cycle"][k]]
-                if site >= 0 and (b := BASE.get(contig[site], -1)) >= 0:
+                if site < 0 or (mask is not None and mask[site]):
+                    continue
+                if (b := BASE.get(contig[site], -1)) >= 0:
                     t["true"][k] = COMP[b] if r.is_reverse else b
 
 
