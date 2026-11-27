@@ -159,6 +159,53 @@ process VERDICT {
     """
 }
 
+// P2b (plan section 7): the redesign, from the stop fit, the locus labels and the locus mixture; judged by P2b's rule.
+// The scripts are docs/ prototypes, staged into the task (the image binds src/ only).
+process CELLS {
+    tag "$run"
+    label 'locus'
+    input:
+    tuple val(run), path(r1), path(r2), path(pairs)
+    path prep
+    path scripts
+    output:
+    tuple val(run), path("${run}.cells.npz")
+    script:
+    """
+    python pfam_contrast_proto.py table $r1 $r2 --pairs $pairs --prep $prep --t1 ${params.t1} --t2 ${params.t2} \\
+        --output ${run}.cells.npz
+    """
+}
+
+process REDESIGN {
+    tag "$run"
+    label 'locus'
+    publishDir "${params.outdir}/p2b", mode: 'copy'
+    input:
+    tuple val(run), path(score), path(table), path(locus)
+    path scripts
+    output:
+    path "${run}.json"
+    script:
+    """
+    python pfam_redesign_proto.py $score $table --locus $locus --output ${run}.json
+    """
+}
+
+process VERDICT_P2B {
+    label 'small'
+    publishDir params.outdir, mode: 'copy'
+    input:
+    path runs
+    path scripts
+    output:
+    path 'verdict_p2b.*'
+    script:
+    """
+    python pfam_redesign_proto.py verdict $runs --output verdict_p2b
+    """
+}
+
 def fastq(url) {
     return params.fastq_dir ? file("${params.fastq_dir}/${url.tokenize('/').last()}", checkIfExists: true) : file(url)
 }
@@ -173,7 +220,8 @@ workflow {
     def keep = params.only ? params.only.toString().tokenize(',') : null
     def rows = channel.fromPath(params.runs, checkIfExists: true).splitCsv(header: true)
         .filter { keep == null || it.run in keep }
-    def doses = params.doses.toString().tokenize(',')
+    // P2b's rule judges no standard additions, so it runs none: a third of P2's search
+    def doses = params.p2b ? [] : params.doses.toString().tokenize(',')
     // The spec's name says what it is: `both`, `stops` and `overlap` undosed, `doseX` the standard additions.
     def fits = [['0', 'both', 'both'], ['0', 'stops', 'stops'], ['0', 'overlap', 'overlap']] +
         doses.collect { [it, "dose$it".toString(), 'both'] }
@@ -200,4 +248,13 @@ workflow {
     def without = ready.filter { it[1] != '0' }.map { it + [[]] }
     LOCUS(with_truth.mix(without), prep)
     VERDICT(SCORE.out.collect(), LOCUS.out.collect())
+
+    if (params.p2b) {
+        def scripts = ['pfam_contrast_proto.py', 'pfam_p2_cells.py', 'pfam_redesign_proto.py', 'pfam_overlap_diag.py']
+            .collect { name -> file("${projectDir}/../../docs/${name}", checkIfExists: true) }
+        def tables = CELLS(undosed.map { run, _d, r1, r2, p -> [run, r1, r2, p] }, prep, scripts)
+        def scores = SCORE.out.map { f -> [f.name - '.json', f] }
+        def loci = LOCUS.out.filter { f -> f.name.endsWith('.0.json') }.map { f -> [f.name - '.0.json', f] }
+        VERDICT_P2B(REDESIGN(scores.join(tables).join(loci), scripts).collect(), scripts)
+    }
 }

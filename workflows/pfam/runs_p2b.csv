@@ -1,0 +1,8 @@
+run,every_n,r1,r2,genomes
+SRR32316197,4,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR323/097/SRR32316197/SRR32316197_1.fastq.gz,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR323/097/SRR32316197/SRR32316197_2.fastq.gz,std
+SRR33710516,6,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR337/016/SRR33710516/SRR33710516_1.fastq.gz,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR337/016/SRR33710516/SRR33710516_2.fastq.gz,std
+SRR15702472,5,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR157/072/SRR15702472/SRR15702472_1.fastq.gz,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR157/072/SRR15702472/SRR15702472_2.fastq.gz,std
+ERR16012166,2,https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR160/066/ERR16012166/ERR16012166_1.fastq.gz,https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR160/066/ERR16012166/ERR16012166_2.fastq.gz,std
+SRR33795049,4,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR337/049/SRR33795049/SRR33795049_1.fastq.gz,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR337/049/SRR33795049/SRR33795049_2.fastq.gz,std
+SRR23926931,6,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR239/031/SRR23926931/SRR23926931_1.fastq.gz,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR239/031/SRR23926931/SRR23926931_2.fastq.gz,d6331
+SRR11558947,2,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR115/047/SRR11558947/SRR11558947_1.fastq.gz,https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR115/047/SRR11558947/SRR11558947_2.fastq.gz,k12

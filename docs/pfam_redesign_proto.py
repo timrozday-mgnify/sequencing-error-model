@@ -18,7 +18,8 @@ Nothing here reads the truth: the shape and the op mix come from the reads alone
 reads and hits), the level from the stop fit. The truth enters only to judge, against P2's score cells (masked
 variant sites, MAPQ >= 20) under P2's rule (`pfam_truth.checks`): ten-op total within 15 %, no cell outside 25 % + 2 sd.
 
-    python docs/pfam_redesign_proto.py SCORE.json TABLE.npz [--output OUT.json]
+    python docs/pfam_redesign_proto.py SCORE.json TABLE.npz [--locus LOCUS.json] [--output RUN.json]
+    python docs/pfam_redesign_proto.py verdict RUN.json ... [--output verdict_p2b]        # P2b's go / no-go (plan §7)
 """
 
 import argparse
@@ -137,6 +138,7 @@ def predict(
     lab, cons = cells.labels(t, counts)
     src, got = cons[lab], t["base"][lab]
     pairs = np.bincount(src.astype(np.int64) * 4 + got, minlength=16).reshape(4, 4).astype(float)
+    labels = pairs.copy()  # counted labels: the counting error of the op mix
     per_source = np.bincount(src, minlength=4).astype(float)
     if share is not None:  # biology out of the labels, op by op
         pairs *= np.array([[share.get(f"{a}>{b}", 1.0) if a != b else 1.0 for b in BASES] for a in BASES])
@@ -147,6 +149,7 @@ def predict(
             if a != b and f"op:{BASES[a]}>{BASES[b]}" in c:
                 key = f"op:{BASES[a]}>{BASES[b]}"
                 out[key] = float(rate[a, b]) * level / ten_label * c[key]["exposure"]
+                out[f"labels:{BASES[a]}>{BASES[b]}"] = float(labels[a, b])
     out["level"] = level
     return out
 
@@ -161,10 +164,75 @@ def judge(score: dict[str, Any], predicted: dict[str, float]) -> dict[str, Any]:
         },
     }
     found = pfam_truth.checks(report, "redesign")
-    return {"passed": pfam_truth.passed(found), "checks": found}
+    passed = pfam_truth.passed(found)
+    # P2b also judges A>G and T>C, which the locus gives: sd from the op's labels, its observed errors and the level's stops
+    stops = sum(score["cells"][f"op:{op}"]["stops"] for op in pfam_truth.TEN if f"op:{op}" in score["cells"])
+    for op in pfam_truth.UNIDENTIFIED_BY_STOPS:
+        cell, n = score["cells"].get(f"op:{op}"), predicted.get(f"labels:{op}", 0.0)
+        if not cell or not cell["observed"]:
+            continue
+        ratio = predicted[f"op:{op}"] / cell["observed"]
+        sd = ratio * math.sqrt(1 / n + 1 / cell["observed"] + 1 / stops) if n and stops else math.inf
+        tol = pfam_truth.CELL
+        off = abs(ratio - 1)
+        result = (
+            "untested"
+            if not sd <= tol / 2
+            else "within"
+            if off <= tol
+            else "outside"
+            if off > tol + 2 * sd
+            else "unclear"
+        )
+        found.append({"check": f"op:{op}", "ratio": ratio, "sd": sd, "tolerance": tol, "result": result})
+    if passed is not None:
+        passed = passed and not any(c["result"] == "outside" for c in found)
+    return {"passed": passed, "checks": found}
+
+
+def verdict(paths: list[Path], needed: int = 5, out: Path | None = None) -> dict[str, Any]:
+    """P2b's go / no-go over the libraries' outputs of this script: go at `needed` passes, no-go once too many failed."""
+    runs = {path.name.split(".")[0]: json.loads(path.read_text()) for path in paths}
+    passed = {n: r["redesign"]["passed"] for n, r in runs.items()}
+    n, failed = sum(x is True for x in passed.values()), sum(x is False for x in passed.values())
+    # as pfam_truth.verdict: no-go only when enough libraries failed that the rest could not make it up
+    go = "go" if n >= needed else "no-go" if len(runs) >= needed and len(runs) - failed < needed else "undecided"
+    result = {"verdict": go, "passed": n, "failed": failed, "libraries": len(runs), "needed": needed, "runs": runs}
+    lines = [
+        f"# P2b verdict: {go}",
+        "",
+        f"{n} of {len(runs)} libraries pass ({failed} failed); {needed} are needed.",
+        "",
+        "| library | passed | ten-op total | A>G | T>C | outside | both-anchor fit passed | stops alone passed |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for name, r in sorted(runs.items()):
+        by = {c["check"]: c for c in r["redesign"]["checks"]}
+
+        def cell(k: str, by: dict[str, Any] = by) -> str:
+            return f"{by[k]['ratio']:.2f} ± {by[k]['sd']:.2f}" if k in by else "-"
+
+        outside = ", ".join(c["check"] for c in r["redesign"]["checks"] if c["result"] == "outside") or "-"
+        lines.append(
+            f"| {name} | {r['redesign']['passed']} | {cell('total')} | {cell('op:A>G')} | {cell('op:T>C')} | {outside} "
+            f"| {r['both']['passed']} | {r['stops']['passed']} |"
+        )
+    if out:
+        out.with_suffix(".json").write_text(json.dumps(result, indent=1, default=float))
+        out.with_suffix(".md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    return result
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["verdict"]:
+        v = argparse.ArgumentParser(prog="pfam_redesign_proto.py verdict", description="P2b's go / no-go")
+        v.add_argument("runs", type=Path, nargs="+", help="this script's <run>.json outputs")
+        v.add_argument("--needed", type=int, default=5)
+        v.add_argument("--output", type=Path, help="prefix: writes PREFIX.md and PREFIX.json")
+        args = v.parse_args(sys.argv[2:])
+        verdict(args.runs, args.needed, args.output)
+        return
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("score", type=Path, help="P2's score/<run>.json")
     p.add_argument("table", type=Path, help="the run's pfam_p2_cells table, .npz")
@@ -191,14 +259,14 @@ def main() -> None:
     by = {s: {c["check"]: c for c in out[s]["checks"]} for s in ("both", "stops", "redesign")}
     print(f"passed: both {out['both']['passed']}, stops {out['stops']['passed']}, redesign {out['redesign']['passed']}")
     print(f"{'check':>11} {'both':>14} {'stops':>14} {'redesign':>14}")
-    # P2 does not judge A>G and T>C (stops cannot identify them): reported beside the checks
+    # P2 does not judge A>G and T>C (stops cannot identify them); P2b does (in the checks): shown here against both fits
     for op in pfam_truth.UNIDENTIFIED_BY_STOPS:
         cell = score["cells"].get(f"op:{op}")
         if cell and cell["observed"]:
             fits = {s: cell["predicted"][s] / cell["observed"] for s in ("both", "stops")}
             fits["redesign"] = predicted[f"op:{op}"] / cell["observed"]
             out.setdefault("unjudged", {})[op] = fits
-            print(f"{op} (not judged): " + ", ".join(f"{s} {r:.2f}" for s, r in fits.items()))
+            print(f"{op} (P2: not judged; P2b: judged): " + ", ".join(f"{s} {r:.2f}" for s, r in fits.items()))
     if a.output:
         a.output.write_text(json.dumps(out, indent=1, default=float))
     for name in by["redesign"]:

@@ -381,6 +381,37 @@ dropped; each remaining piece does one job, from the reads and the stop fit alon
 
 - **No-go** outcome is still useful: report the floor and keep the mode as a lower-effort check, or drop it.
 
+### P2b: the redesign against truth, on libraries P2 did not use (HPC) - **go / no-go**; rule agreed 2026-11-27, before any P2b data
+
+**Design, fixed by the prototype above** (`pfam_redesign_proto.py`, default `--shape stops` with `--locus`): the stop fit of P2 (T1 35, T2 6, Pfam
+39.0, kfpfam Mode A) gives the level and the Q / position / mate shape; the substitution mix is the locus label (a base against the unanimous base of two
+or more other reads of its locus, 12 bases each side), each op scaled by its complementary pair's error share from the locus mixture
+(`pfam_locus`), except where the mixture's omega is 0.5 or more, where the raw label is used. The mate-overlap anchor is not used. No standard additions.
+
+**Libraries** (`workflows/pfam/runs_p2b.csv`), seven, none of them P2's and six from studies P2 did not use:
+
+| run | standard | instrument | read length | pairs kept | study |
+|---|---|---|---|---|---|
+| SRR32316197 | D6305 | NovaSeq 6000 | 151 | every 4th of 18.0 M | PRJNA1222139 |
+| SRR33710516 | D6300 | NovaSeq 6000 | 134 | every 6th of 28.3 M | PRJNA1268178 |
+| SRR15702472 | D6300 | NextSeq 500 | 142 | every 5th of 21.2 M | PRJNA759733 |
+| ERR16012166 | D6300 | NextSeq 2000 | 150 | every 2nd of 8.1 M | PRJEB105240 |
+| SRR33795049 | D6305/D6306 | MiSeq | 301 | every 4th of 15.2 M | PRJNA1271121 |
+| SRR23926931 | D6331 | NovaSeq 6000 | 150 | every 6th of 28.0 M | PRJNA804004, **P2's study** (SRR23926920): not independent, the only D6331 without a human background |
+| SRR11558947 | *E. coli* K-12 MG1655 (isolate) | HiSeq 2000 | 150 | every 2nd of 7.5 M | PRJNA615952; truth U00096.3 |
+
+The truth is P2's (`pfam_truth score`: minimap2 to the genomes, MAPQ >= 20, variant sites at >= 20 % masked). The std genomes cover D6300, D6305/D6306
+(same ten strains); D6331's 21. SRR16925273 (D6300, NextSeq 500, 4.9 M pairs, PRJNA777429) was dropped to keep seven, so that P2's bar stays as agreed.
+
+**Rule** (`pfam_redesign_proto.py verdict`; agreed 2026-11-27, not to be changed after seeing P2b's results). A library passes if, for the design:
+- P2's checks pass (`pfam_truth.checks`, `passed`): the ten-op total within 15 %, the floor's 95 % bound <= 2 × 10⁻⁴, no op, Q group, mate or position
+  quarter `outside` 25 % + 2 sd, each check counted only where its sd is at most half its tolerance; and
+- **`A>G` and `T>C` are judged too**, at 25 % + 2 sd, with sd = ratio × √(1 / labels of that op + 1 / observed + 1 / stops in the fit), and the same
+  power condition. A library whose total has no power neither passes nor fails.
+
+**Go** if five of the seven pass, **no-go** once three have failed. Reported, not judged: the both-anchor and stops-alone fits on the same libraries, and
+the locus and contrast scoring of `diagnose.sh`.
+
 ### P3: real libraries (HPC)
 - The three biome runs long enough (freshwater 145 bp, human gut 112, marine 151), the two 250 bp runs (DRR160704 soil, DRR092732 deep sea), and
   ERR10889147, each 5 M pairs by stride (`observations.subset`; file order is biased). Soil ERR5866877 (75 bp) and bird gut ERR6785304
