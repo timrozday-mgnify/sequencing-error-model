@@ -119,6 +119,44 @@ Megabytes: `results/verdict.*`, `results/score/*.json`, `results/locus/*.json` a
 rsync -av --exclude keep/ $HPC:$RUNS/p2/results/ results-pfam-p2/
 ```
 
+## P2b: the redesign on new libraries
+
+[docs/pfam_mode_plan.md](../../docs/pfam_mode_plan.md) §7, P2b: seven libraries P2 did not use (`runs_p2b.csv`), judged by a rule agreed before any of
+their data. `--p2b` adds three steps, CELLS (a per-base locus table from the reads and hits), REDESIGN (the stop fit's level and shape with the locus
+mixture's op mix, checked against the genomes) and VERDICT_P2B, and runs no standard additions. The scripts are `docs/` prototypes, staged into each task.
+
+1. The K-12 genome (the isolate's truth), once:
+
+   ```bash
+   curl -s "https://www.ebi.ac.uk/ena/browser/api/fasta/U00096.3" > $BASE/sequencing-error-model_runs/sem-hpc/data/U00096.3.fna
+   ```
+
+2. Preflight with `P2B=1`, which requires that genome and adds `k12` to `site.config`. The existing `site.config` differs, so the new one is written
+   beside it: check the diff in the log, then move it into place.
+
+   ```bash
+   cd $RUNS && P2B=1 sbatch $REPO/workflows/pfam/preflight.sh
+   ```
+
+   ```bash
+   mv $RUNS/site.config.new $RUNS/site.config
+   ```
+
+3. The run, in its own directory beside `p2`:
+
+   ```bash
+   mkdir -p $RUNS/p2b && cd $RUNS/p2b && sbatch $REPO/workflows/pfam/run.sh --runs $REPO/workflows/pfam/runs_p2b.csv --p2b
+   ```
+
+   About a third of P2's search per library (no doses). CELLS and REDESIGN ask for 48 GB.
+
+4. Bring back `results/verdict_p2b.*`, `results/p2b/`, `results/verdict.*` (P2's own verdict on these libraries, reported beside), `results/score/`,
+   `results/locus/` and `results/fits/`; not `keep/`.
+
+   ```bash
+   cd $RUNS/p2b/results && tar czf $RUNS/p2b/results-pfam-p2b.tar.gz verdict* p2b score locus fits
+   ```
+
 ## On a laptop
 
 ```bash

@@ -18,6 +18,7 @@
 # KF_DIR   the kfpfam/ directory B11's kfpfam_setup.sh wrote (beside that script): the image, prep/ and index/
 # KFPFAM   a kfpfam checkout, for recruit/pairs.py (default ~/src/kfpfam, as B11 used)
 # QUEUE, ACCOUNT  optional: Slurm partition and account, written into site.config
+# K12, P2B  optional: P2b's K-12 genome (default $SEM_HPC/data/U00096.3.fna); P2B=1 makes it required
 #
 # It prints every check and ends with READY (exit 0) or NOT READY and what to fix (exit 1), so a job chained with
 # --dependency=afterok runs only on READY (README step 4).
@@ -36,6 +37,7 @@ PAIRS_PY=$KFPFAM/recruit/pairs.py
 STD=$B9_DIR/truth/refs/std/refs.fna
 D6331=$B9_DIR/truth/refs/d6331/refs.fna
 ISOLATE=$SEM_HPC/data/SRR24523812_contigs.fa
+K12=${K12:-$SEM_HPC/data/U00096.3.fna}  # P2b's isolate, E. coli K-12 MG1655 (README, P2b)
 
 bad=0
 ok() { echo "  ok    $*"; }
@@ -70,6 +72,13 @@ echo "== inputs"
 for f in "$SIF" "$FILTER_SIF" "$PREP/models.tsv" "$PREP/offs.u32" "$PREP/profile.f32" "$INDEX" "$HMM" "$PAIRS_PY" "$STD" "$D6331" "$ISOLATE"; do
     [[ -s $f ]] && ok "$f" || no "missing $f"
 done
+if [[ -s $K12 ]]; then
+    ok "$K12"
+elif [[ ${P2B:-0} == 1 ]]; then
+    no "missing $K12 (P2b's K-12 genome; README, P2b)"
+else
+    echo "  note  no $K12: only P2b needs it (P2B=1 makes it required)"
+fi
 
 echo "== the HMM is the one prep was built from"
 if [[ -s $HMM && -s $PREP/models.tsv ]]; then
@@ -105,7 +114,7 @@ fi
 [[ -s $PAIRS_PY ]] && echo "  note  pairs.py at kfpfam $(git -C "$KFPFAM" log -1 --format=%h 2>/dev/null || echo '?'), sha256 $(sha256sum "$PAIRS_PY" | cut -c1-16) (the laptop rehearsal: 9833cf6, 9ff396bc4d4fd99b)"
 
 echo "== genome indexes"
-for pair in "std:$STD" "d6331:$D6331" "isolate:$ISOLATE"; do
+for pair in "std:$STD" "d6331:$D6331" "isolate:$ISOLATE" "k12:$K12"; do
     name=${pair%%:*} f=${pair#*:}
     [[ -s $f ]] || continue
     if [[ -s $f.fai && $f.fai -nt $f ]]; then
@@ -147,6 +156,7 @@ params {
         std    : '$STD',
         d6331  : '$D6331',
         isolate: '$ISOLATE',
+        k12    : '$K12',
     ]
     // fastq_dir = '/path/to/fastq'   // if the head job cannot reach ENA (README)
 }
