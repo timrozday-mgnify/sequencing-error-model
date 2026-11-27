@@ -1,6 +1,6 @@
 # Plan: a `pfam` evidence mode (minimal reference)
 
-Status: **explored 2026-11-24; P0 and P1 done (results in §7, P1); P2 is ready to run on HPC (2026-11-25), and not run.** P0 is [pfam_proto.py](pfam_proto.py);
+Status: **explored 2026-11-24; P0 and P1 done (results in §7, P1); P2 ran on HPC on 2026-11-27: no-go (1 of 7 libraries pass; §7, P2).** P0 is [pfam_proto.py](pfam_proto.py);
 P1 is [sources/pfam.py](../src/sequencing_error_model/sources/pfam.py), started before the gate closed as a user exception.
 It sits behind the §6.5.1 decision gate of [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) like the rest of
 phase 11, and is not an input to it. §3's numbers are P0's; where P1 corrects one, §7 says so.
@@ -23,8 +23,9 @@ What it will not give: `A>G` / `T>C` from stops at all, a full `Context(L,R)`, o
 library. It should be scoped as a **rate, op-composition and Q / position / mate source**, and as a check on the
 other modes. It is not a fourth full mode.
 
-**The decisive test is not done.** Every number here is on one library without ground truth, or with errors
-injected into it. P2 (mock communities, on HPC) decides go or no-go.
+**The decisive test is a no-go** (P2, §7). Against the genomes of seven libraries, the fit with both anchors predicts
+0.67–0.93 of the errors, and only one library passes the rule agreed beforehand. The stop anchor alone gets the total
+within 15 % in all seven; the mate-overlap anchor alone undershoots in six, and it is what pulls the combined fit low.
 
 ## 2. Why the shared component needs an anchor
 
@@ -262,7 +263,7 @@ fit to the bit) and `compare.op_rates`. 16 tests in `tests/test_pfam.py`, 3 in `
 
 **Not done:** the RawR / hmmalign parquet adapter (question 1 below; `pairs.tsv` only), panel file, the `Tile` term, indels.
 
-### P2: mock communities and an isolate, with truth (HPC) - **go / no-go**; prepared, not run
+### P2: mock communities and an isolate, with truth (HPC) - **go / no-go**; run 2026-11-27: **no-go**
 
 **Libraries** (`workflows/pfam/runs.csv`): six ZymoBIOMICS runs (ERR2984773, SRR12324253, SRR12829160, ERR2935805, SRR23926920, SRR32629731; two are
 about 100 bp, where yield is uncertain) and SRR24523812, the isolate with all three modes fitted (phases 5–6), each as 3.6–4.8 M pairs by stride.
@@ -305,7 +306,30 @@ and searched with all of Pfam 38.2.
   the undosed excess of unsupported stops (25, where 26 % of about 31 would be 8) is probably biology in rare genomes, and the crude rate an overestimate there. To be turned into an estimate in P3, after P2's
   truth shows whether the argument holds: real errors also cluster in reads whose flanks are bad.
 
-**Not tested:** Slurm, the real images (the `singularity` profile ran with a stand-in runtime), Pfam 39.0, memory at 10 M reads (64 GB asked for a fit and 128 GB for scoring; a fit took 1.8 GB at 300,000 reads), real truth.
+**Result (2026-11-27): no-go.** 1 of 7 pass, all 7 with power. All seven ran on Slurm with the real images and Pfam 39.0, reads from FIRE. 3.6–4.8 M pairs each;
+88–99 % of exposed reads align, except SRR23926920 (82 %) and SRR32629731 (85 %). Ten-op total, fit over genomes:
+
+| library | both (judged) | passes | stops alone | overlap alone | floor, 95 % bound | additions +0.002 / +0.01 |
+|---|---|---|---|---|---|---|
+| ERR2935805 (D6310, 101 bp) | 0.93 ± 0.02 | yes | 1.08 | 0.71 | 9.9 × 10⁻⁶ | 0.96 / 0.99 |
+| ERR2984773 (D6300) | 0.76 ± 0.01 | no | 0.98 | 0.72 | 3.3 × 10⁻⁵ | 0.99 / 0.98 |
+| SRR12324253 (D6300) | 0.67 ± 0.01 | no | 0.91 | 0.22 | 1.3 × 10⁻⁵ | 0.98 / 0.97 |
+| SRR12829160 (D6300) | 0.84 ± 0.01 | no | 1.01 | 0.88 | 3.2 × 10⁻⁵ | 0.98 / 0.98 |
+| SRR23926920 (D6331, 150 bp) | 0.84 ± 0.01 | no | 0.99 | 0.47 | 1.7 × 10⁻⁵ | 0.96 / 0.96 |
+| SRR24523812 (isolate) | 0.81 ± 0.00 | no | 0.87 | 0.56 | 1.2 × 10⁻⁵ | 0.91 / 0.91 |
+| SRR32629731 (D6331, 99 bp) | 0.90 ± 0.03 | no (`C>T`, `q:30+`) | 0.98 | 0.80 | 5.8 × 10⁻⁵ | 1.00 / 1.00 |
+
+- **The floor holds everywhere**, at most 5.8 × 10⁻⁵ against the 2 × 10⁻⁴ allowed: locus replication and family weights did what the rehearsal said, at real coverage.
+- **Standard additions hold** (0.96–1.00; the isolate 0.91), so the shortfall is not selection on error.
+- **The mate-overlap anchor undercounts on real Illumina reads** (0.22–0.88), which it did not in the rehearsal (1.09), and combining it with the stops pulls the fit down.
+  The stop anchor alone is within 15 % in 7 of 7 and would pass in 3 (ERR2935805, SRR12829160, SRR32629731); the other four miss 1–3 cells, most often `T>G` (0.45–0.67 in four).
+  **This is exploratory**: choosing the anchor after seeing the result does not change the verdict.
+- **Locus consensus** (reported, not judged): the mixture estimate is within about 2 % of the truth on the labelled bases in six libraries (e.g. 8.33 vs 8.40 × 10⁻⁴); the isolate 5.43 vs 6.70 × 10⁻³.
+- Next, if the mode is kept, all on P2's `keep/` (hit tables, undosed reads and alignments; no new search): why the overlap anchor undercounts here (§3.8); the
+  `T>G` deficit of the stop anchor; the locus mixture (Tier 1c, §13.2 item 2) and the within-locus contrast (Tier 3, §13.2 item 1) scored per op, Q, mate and
+  position against the same truth, which P2 did not do. A fit of stops and locus without the overlap is then a new design: its rule is to be agreed before it
+  sees libraries P2 did not use. Results: `results/` on HPC.
+
 - **No-go** outcome is still useful: report the floor and keep the mode as a lower-effort check, or drop it.
 
 ### P3: real libraries (HPC)
@@ -323,7 +347,7 @@ and searched with all of Pfam 38.2.
 
 ### P5: integration
 - Update §1.1, §5.6, §8 of the main plan, the README, and the user guide. Repeat the novelty search. No exporter work: exporters read a spec, and
-  the mode adds a source, not a component. It earns a place in joint fitting (phase 11) only if P2 is a go.
+  the mode adds a source, not a component. It earns a place in joint fitting (phase 11) only if P2 is a go, and P2 was a no-go (§7).
 
 ## 8. HPC preparation
 
@@ -348,7 +372,7 @@ without containers. It reuses `sem-tools.sif` (phase 6b), and the kfpfam image, 
 ## 10. Open questions
 
 1. **The hmmalign parquet:** where is it, and does it have GA-only or all hits, nucleotides or residues?
-2. ~~Go / no-go rule in P2~~: agreed as proposed on 2026-11-25 (§7).
+2. ~~Go / no-go rule in P2~~: agreed as proposed on 2026-11-25 (§7); applied 2026-11-27, no-go.
 3. **The gate.** The main plan says nothing in phases 9–11 starts before §6.5.1 closes. The user made an exception for P1. P2 needs its own;
    the argument is that it does not touch `kmer` mode and can share an HPC window with the gate run.
 
