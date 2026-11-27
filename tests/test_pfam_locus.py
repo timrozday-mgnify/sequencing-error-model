@@ -6,7 +6,7 @@ import pytest
 from test_pfam import CODONS, substitutions_only
 from test_pfam_truth import Mock
 
-from sequencing_error_model import pfam_locus
+from sequencing_error_model import pfam_locus, pfam_truth
 from sequencing_error_model.sources import pfam
 
 IX = pfam_locus.INDEX
@@ -126,3 +126,45 @@ def test_the_command_writes_a_report(tmp_path: Path) -> None:
     assert {x["codons"] for x in json.loads((tmp_path / "o.json").read_text())["loci"]} == {0}
     with pytest.raises(SystemExit):
         pfam_locus.main([*args, "--sam", "a.sam"])
+
+
+def test_selection_counts_stops_on_keyed_codons_against_all() -> None:
+    def rows(spec: list[tuple[int, str, int, str]]) -> np.ndarray:
+        out = np.zeros((len(spec), pfam_locus.FIRST + len(pfam_locus.FLANKS)), np.int64)
+        for i, (key, codon, pair, true) in enumerate(spec):
+            out[i, [pfam_locus.CODON, pfam_locus.PAIR, pfam_locus.TRUE]] = IX[codon], pair, IX[true]
+            out[i, pfam_locus.FIRST :] = key
+        return out
+
+    spec = [(11, "AAA", p, "AAA") for p in range(4)]  # keyed
+    spec += [(11, "AAA", 0, "AAA")]  # the other mate of fragment 0: keyed with it
+    # the error stop is keyed, its neighbours are not: they each have an other fragment that disagrees
+    spec += [(44, "AAA", p, "AAA") for p in range(20, 23)] + [(44, "TAA", 23, "AAA")]
+    spec += [(22, "TAA", p, "TAA") for p in range(5, 8)]  # the locus agrees on a stop: biology, in neither
+    spec += [(33, "AAA", 8, "AAA"), (33, "TAA", 9, "AAA")]  # one other fragment: not keyed
+    spec += [(0, "TAA" if p < 13 else "AAA", p, "AAA") for p in range(10, 20)]  # off a locus: three stops
+    got = pfam_locus.selection(rows(spec), 1)
+    assert (got["codons_keyed"], got["codons"], got["stops_keyed"], got["stops"]) == (6, 21, 1, 5)
+    assert got["keyed_over_all"] == pytest.approx((1 / 6) / (5 / 21))
+    assert got["truth"]["keyed_over_all"] == pytest.approx(got["keyed_over_all"])
+    assert got["truth"]["error_stops_keyed_over_all"] == pytest.approx(got["keyed_over_all"])
+
+
+def test_selection_and_masked_truth_end_to_end(tmp_path: Path) -> None:
+    world = Strains(6)
+    pairs, hits, _, _ = world.pairs(substitutions_only(0.005), 4000, 210, 100)
+    world.sam(tmp_path / "a.sam", pairs, 210, set())
+    rows = pfam_locus.table(pairs, hits, world.profiles, t1=30)
+    genome = world.genome()
+    masks = pfam_truth.sam_variant_masks(tmp_path / "a.sam", genome, 20, 0.2)
+    assert not any(m.any() for m in masks.values())  # every read on its own strain: no variant against it
+    pfam_locus.add_truth(rows, tmp_path / "a.sam", genome, 20, masks)
+    got = pfam_locus.report(rows, 1)["selection"]
+    # uniform errors: the keyed codons are as clean as the rest, by the stops and by the genomes
+    assert abs(got["keyed_over_all"] - 1) < 2.5 * got["sd"]
+    assert got["truth"]["keyed_over_all"] == pytest.approx(1, abs=0.1)
+    everywhere = {c: np.ones(len(g) + 1, bool) for c, g in genome.items()}
+    blank = rows.copy()
+    blank[:, pfam_locus.TRUE] = -1
+    pfam_locus.add_truth(blank, tmp_path / "a.sam", genome, 20, everywhere)
+    assert (blank[:, pfam_locus.TRUE] < 0).all()

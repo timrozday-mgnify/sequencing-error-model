@@ -481,7 +481,9 @@ per arm:
   spectrum within tolerance. Default mode then stands alone.
 - **(b) Narrow to a spectrum-and-context source** - level fails but spectrum, op composition and context hold.
   Default mode then supplies those and takes its level from `pe-overlap` or `reference`;
-  `sources.kmer.fit(level=...)` and `sites.keys`'s `level` ratio are already the hook. **This is where the
+  `sources.kmer.fit(level=...)` and `sites.keys`'s `level` ratio are already the hook, and
+  `--level-rate` puts the level on another mode's rate, such as `pfam`'s stop anchor, which needs neither a reference nor
+  mate overlap (docs/pfam_mode_plan.md §14). **This is where the
   present evidence points.**
 - **(c) Drop default mode** - no component beats `reference` + `pe-overlap` on the long-tail scenario. Then
   §1.1's third mode goes, `sources/kmer.py` and `sites.keys` stay only as a diagnostic, and enhanced mode

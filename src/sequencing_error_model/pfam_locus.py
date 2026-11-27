@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import math
 import sys
 from array import array
 from collections.abc import Iterable, Mapping, Sequence
@@ -91,10 +92,14 @@ def table(
     return np.array(rows, np.int64).reshape(-1, FIRST + len(FLANKS))
 
 
-def add_truth(rows: Array, sam: Path, genome: Mapping[str, str], min_mapq: int = 0) -> None:
+def add_truth(
+    rows: Array, sam: Path, genome: Mapping[str, str], min_mapq: int = 0, masks: Mapping[str, Array] | None = None
+) -> None:
     """Fill `TRUE` with the genome's codon, from the primary alignment of each read (named by pair number).
 
-    MAPQ 0 is kept: strains that tie on a read are alike under it, and dropping them would drop a mock's strains.
+    MAPQ 0 is kept by default: strains that tie on a read are alike under it, and dropping them would drop a mock's
+    strains. `masks` (`pfam_truth.sam_variant_masks`) leaves codons over a strain's variant site unknown, with
+    `min_mapq` 20 the truth `pfam_truth` judges P2 by.
     """
     reads = rows[:, READ].copy()  # contiguous: searching the column itself would copy it every time
     with pysam.AlignmentFile(str(sam), check_sq=False) as f:
@@ -112,6 +117,9 @@ def add_truth(rows: Array, sam: Path, genome: Mapping[str, str], min_mapq: int =
                 at, reverse = int(rows[k, START]), bool(rows[k, REVERSE])
                 where = [n - 1 - at - p if reverse else at + p for p in range(3)]
                 codon = Codon((0, 0), (where[0], where[1], where[2]), reverse, "", 0.0)
+                mask = masks.get(contig) if masks is not None else None
+                if mask is not None and any(placed.sites[x] >= 0 and mask[placed.sites[x]] for x in where):
+                    continue
                 if found := pfam_truth.true_bases(codon, placed, genome):
                     rows[k, TRUE] = INDEX.get(found[1], -1)
 
@@ -203,6 +211,62 @@ def _fitted(n: Array, chance: Array, again: Array) -> tuple[float, Array | None]
     return ratio, mixture(n, chance, ratio) if n.sum() and np.isfinite(ratio) else None
 
 
+def selection(rows: Array, flank: int, others: int = 2) -> dict[str, Any]:
+    """How clean the codons a locus labels are, against all exposed codons, measured by the stop anchor.
+
+    A codon is *keyed* when its flanks match a locus whose other fragments, `others` or more, share one sense codon.
+    That never looks at the codon itself, and a stop is labelled by the genetic code, not by a flank, so the stop rate
+    on keyed codons over that on all of them is how much the clean-flank rule selects against error: a k-mer key's
+    bias (docs/pfam_mode_plan.md §12), measured without a genome. Codons whose locus agrees on a stop are biology and
+    left out of both. Stops are ten ops in stop-adjacent contexts, so the factor holds for all error only if the
+    selection does not depend on the op; with truth, `truth` gives the factor over every base to check that.
+    """
+    exposed = rows[rows[:, CODON] >= 0]
+    keyed_at = np.flatnonzero(exposed[:, FIRST + flank] != 0)
+    sub = exposed[keyed_at]
+    row, want = consensus(sub[:, FIRST + flank], sub[:, CODON], sub[:, PAIR], others)
+    # `consensus` keeps one row per fragment; both mates of one are keyed alike
+    ids = np.unique(sub[:, [FIRST + flank, PAIR]], axis=0, return_inverse=True)[1].ravel()
+    verdict = np.full(int(ids.max()) + 1 if len(ids) else 0, -1)
+    verdict[ids[row]] = STOP[want]
+    keyed, biology = np.zeros(len(exposed), bool), np.zeros(len(exposed), bool)
+    keyed[keyed_at[verdict[ids] == 0]] = True
+    biology[keyed_at[verdict[ids] == 1]] = True
+    stop, rest = STOP[exposed[:, CODON]], ~keyed & ~biology
+    sk, su = int(stop[keyed].sum()), int(stop[rest].sum())
+    nk, nu = int(keyed.sum()), int(rest.sum())
+    rate_k, rate_all = sk / nk if nk else math.nan, (sk + su) / (nk + nu) if nk + nu else math.nan
+    ratio = rate_k / rate_all if rate_all else math.nan
+    # ln ratio = ln r_k - ln(f r_k + (1 - f) r_u): both counts enter through the share of stops not keyed
+    sd = ratio * (su / (sk + su)) * math.sqrt(1 / sk + 1 / su) if sk and su else math.inf
+    out: dict[str, Any] = {
+        "codons_keyed": nk,
+        "codons": nk + nu,
+        "stops_keyed": sk,
+        "stops": sk + su,
+        "stop_rate_keyed": rate_k,
+        "stop_rate": rate_all,
+        "keyed_over_all": ratio,
+        "sd": sd,
+    }
+    true, codon = exposed[:, TRUE], exposed[:, CODON]
+    known = (true >= 0) & ~biology
+    if known.any():
+        wrong = DIST[np.where(known, true, 0), codon]
+        error_stop = stop & ~STOP[np.where(known, true, 0)]
+        k = known & keyed
+        n_k, n_all = max(int(k.sum()), 1), int(known.sum())
+        per_k, per_all = wrong[k].sum() / (3 * n_k), wrong[known].sum() / (3 * n_all)
+        stops_k, stops_all = error_stop[k].sum() / n_k, error_stop[known].sum() / n_all
+        out["truth"] = {
+            "per_base_keyed": float(per_k),
+            "per_base": float(per_all),
+            "keyed_over_all": float(per_k / per_all) if per_all else math.nan,
+            "error_stops_keyed_over_all": float(stops_k / stops_all) if stops_all else math.nan,
+        }
+    return out
+
+
 def report(rows: Array, flank: int, others: int = 2, bootstrap: int = 25, seed: int = 0) -> dict[str, Any]:
     """Counts, opportunities and the mixture for one flank (an index into `FLANKS`), with truth where it is known."""
     use = rows[(rows[:, FIRST + flank] != 0) & (rows[:, CODON] >= 0)]
@@ -235,6 +299,7 @@ def report(rows: Array, flank: int, others: int = 2, bootstrap: int = 25, seed: 
             "mixture_sd": float(np.std(spread)) if spread else float("nan"),
         },
         "ops": {} if e is None else dict(zip(OPS, map(float, e), strict=True)),
+        "selection": selection(rows, flank, others),
     }
     known = true >= 0
     if known.any():
@@ -263,6 +328,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--prep", type=Path, required=True)
     p.add_argument("--sam", type=Path, help="the reads aligned to the sample's genomes, for truth")
     p.add_argument("--reference", type=Path, help="the genomes, FASTA")
+    p.add_argument(
+        "--mask-variants",
+        action="store_true",
+        help="truth as pfam_truth judges P2: MAPQ >= 20, and not at sites where these reads carry another base at >= 20 %%",
+    )
     p.add_argument("--t1", type=float, default=35.0)
     p.add_argument("--t2", type=float, default=6.0)
     p.add_argument("--output", type=Path, required=True, metavar="JSON")
@@ -274,7 +344,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.sam:
         with pysam.FastaFile(str(args.reference)) as f:
             genome = {c: f.fetch(c).upper() for c in f.references}
-        add_truth(rows, args.sam, genome)
+        if args.mask_variants:
+            masks = pfam_truth.sam_variant_masks(args.sam, genome, 20, 0.2)
+            add_truth(rows, args.sam, genome, 20, masks)
+        else:
+            add_truth(rows, args.sam, genome)
     found = [report(rows, k, others) for k in range(len(FLANKS)) for others in (2, 4)]
     args.output.write_text(json.dumps({"ops": OPS, "effects": EFFECTS, "exposed": len(rows), "loci": found}))
     return 0
