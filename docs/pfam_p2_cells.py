@@ -3,7 +3,8 @@
 P2 judged the fits per op, Q group, mate and read-position quarter, but showed the locus anchor only as a total, and on
 the bases it labels. This scores both per cell against the truth over **all** exposed bases, the truth P2's checks use:
 
-- `truth`: errors per base of every exposed codon, by the genome under it (`pfam_contrast_proto.add_truth`);
+- `truth`: errors per base of every exposed codon, by the genome under it (`pfam_contrast_proto.add_truth`), masked as
+  `pfam_truth` masks P2's truth: variant sites (another base in >= 20 % of reads) and MAPQ < 20 are unknown;
 - `truth_locus`: the same on the bases the locus labels; equal to `truth` in a cell when the locus selects only
   through the cell's covariates, unequal when its clean-flank, three-fragment rule picks cleaner reads within it;
 - `locus`: the label rate, a base against the unanimous base of two or more other reads of its locus (same column,
@@ -40,16 +41,46 @@ INSERT_NAMES = ("insert:unknown", "insert:0+", *(f"insert:{x}+" for x in INSERT_
 OTHERS = 2  # unanimous other reads that make a label (pfam_locus)
 
 
-def labels(t: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """(labelled, the other reads' base) per row: the base of its locus' other reads, where two or more agree on it."""
+# the columns scoring reads, in the smallest types that hold them: a P2 library is up to ~240 M rows
+COLUMNS = {
+    "locus": np.int64,
+    "base": np.int8,
+    "true": np.int8,
+    "q": np.uint8,
+    "cycle": np.int16,
+    "length": np.int16,
+    "mate": np.int8,
+    "insert": np.int32,
+}
+
+
+def load(path: Path) -> dict[str, np.ndarray]:
+    """The rows whose genome base is known, one column at a time, so only one int64 column is ever in memory."""
+    with np.load(path) as z:
+        known = z["true"] >= 0
+        return {k: z[k][known].astype(dtype) for k, dtype in COLUMNS.items()}
+
+
+def locus_counts(t: dict[str, np.ndarray]) -> np.ndarray:
+    """Bases per locus (locus ids are dense, -1 for none): loci x ACGT."""
     on = t["locus"] >= 0
-    _, locus = np.unique(np.where(on, t["locus"], -1), return_inverse=True)
-    counts = np.zeros((locus.max() + 1, 4), np.int64)
-    np.add.at(counts, (locus[on], t["base"][on]), 1)
-    others = counts[locus].copy()
-    others[np.arange(len(locus)), t["base"]] -= 1
-    depth, top = others.sum(1), others.argmax(1)
-    return on & (depth >= OTHERS) & (others.max(1) == depth), top
+    n = int(t["locus"].max()) + 1 if on.any() else 0
+    return np.bincount(t["locus"][on] * 4 + t["base"][on], minlength=4 * n).reshape(n, 4).astype(np.int32)
+
+
+def labels(t: dict[str, np.ndarray], counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(labelled, the other reads' base) per row: the base of its locus' other reads, where two or more agree on it.
+
+    From per-locus counts, never a per-row copy of them: the others agree on the row's own base when every read of
+    the locus has it, and on another base when the row's is the only read without it.
+    """
+    on = t["locus"] >= 0
+    at = np.where(on, t["locus"], 0)
+    total, top, top_n = counts.sum(1), counts.argmax(1).astype(np.int8), counts.max(1)
+    own, depth = counts[at, t["base"]], total[at]
+    same = on & (own == depth) & (depth - 1 >= OTHERS)
+    other = on & (own == 1) & (top_n[at] == depth - 1) & (top[at] != t["base"]) & (depth - 1 >= OTHERS)
+    return same | other, np.where(same, t["base"], top[at]).astype(np.int8)
 
 
 def judge(ratio: float, sd: float, tolerance: float = CELL) -> str:
@@ -63,28 +94,33 @@ def _rate(events: float, bases: float) -> float:
     return events / bases if bases else math.nan
 
 
-def score(t: dict[str, np.ndarray], boot: int = 5) -> dict[str, dict[str, object]]:
-    known = t["true"] >= 0
-    t = {k: v[known] for k, v in t.items()}
+def score(t: dict[str, np.ndarray], boot: int = 5, contrast_rows: int = 50_000_000) -> dict[str, dict[str, object]]:
+    """`t`: rows with a known genome base (`load`)."""
     err = t["base"] != t["true"]
-    lab, cons = labels(t)
+    counts = locus_counts(t)
+    lab, cons = labels(t, counts)
     mism = lab & (t["base"] != cons)
+    position = np.minimum(4 * t["cycle"].astype(np.int32) // np.maximum(t["length"], 1), 3)
+    insert = np.where(t["insert"] < 0, 0, 1 + np.digitize(t["insert"], INSERT_EDGES))
     schemes = {
-        "q": (np.digitize(t["q"], Q_EDGES), Q_NAMES),
-        "position": (np.minimum(4 * t["cycle"] // np.maximum(t["length"], 1), 3), [f"position:{i}" for i in range(4)]),
+        "q": (np.digitize(t["q"], Q_EDGES).astype(np.int8), Q_NAMES),
+        "position": (position.astype(np.int8), [f"position:{i}" for i in range(4)]),
         "mate": (t["mate"], ["mate:1", "mate:2"]),
         # not a covariate any mode but `reference` sees for long inserts: here to see whether error depends on it
-        "insert": (np.where(t["insert"] < 0, 0, 1 + np.digitize(t["insert"], INSERT_EDGES)), INSERT_NAMES),
+        "insert": (insert.astype(np.int8), INSERT_NAMES),
     }
+    del position, insert
     # the contrast, as the prototype fits it: every read of a locus of three or more against the locus' majority
     # (a leave-one-out label would leave an erring read alone in its locus, and b(locus) would absorb it)
-    deep = (t["locus"] >= 0) & (
-        np.bincount(np.maximum(t["locus"], 0))[np.maximum(t["locus"], 0)] >= proto.MIN_DEPTH["locus"]
-    )
-    _, group = np.unique(t["locus"][deep], return_inverse=True)
-    majority = np.zeros((group.max() + 1 if len(group) else 0, 4))
-    np.add.at(majority, (group, t["base"][deep]), 1)
-    y = (t["base"][deep] != majority.argmax(1)[group]).astype(float)
+    at = np.where(t["locus"] >= 0, t["locus"], 0)
+    deep = (t["locus"] >= 0) & (counts.sum(1)[at] >= proto.MIN_DEPTH["locus"])
+    # ponytail: the contrast on every k-th locus beyond `contrast_rows` rows, for memory; its shape stays unbiased
+    every = max(1, math.ceil(int(deep.sum()) / contrast_rows))
+    if every > 1:
+        deep &= t["locus"] % every == 0
+    group = t["locus"][deep]  # dense ids with gaps: `contrast`'s bincounts leave empty loci at zero weight
+    y = (t["base"][deep] != counts.argmax(1)[group]).astype(np.float64)
+    del at
     out: dict[str, dict[str, object]] = {}
 
     def cell(name: str, sel: np.ndarray, extra: dict[str, float] | None = None) -> None:
@@ -151,6 +187,7 @@ def score(t: dict[str, np.ndarray], boot: int = 5) -> dict[str, dict[str, object
                 "result": judge(ratio, sd),
             }
     out["total"]["labelled_share"] = float(lab.mean())
+    out["total"]["contrast_loci_every"] = every
     return out
 
 
@@ -167,13 +204,17 @@ def main() -> None:
     p.add_argument("--table", type=Path, required=True, help=".npz of the per-base table: built if missing")
     p.add_argument("--output", type=Path)
     p.add_argument("--boot", type=int, default=5, help="locus resamples for the contrast's sd")
+    p.add_argument(
+        "--contrast-rows", type=int, default=50_000_000, help="fit the contrast on every k-th locus above this"
+    )
     a = p.parse_args()
-    if not a.table.exists():
+    stale = a.table.exists() and "masked" not in np.load(a.table).files  # tables before the truth was masked
+    if not a.table.exists() or stale:
         if not (a.r1 and a.r2 and a.pairs and a.prep and a.sam and a.reference):
             p.error("building the table needs R1 R2 --pairs --prep --sam --reference")
         a.every_n, a.dose = 1, 0.0
         np.savez_compressed(a.table, allow_pickle=False, **proto.table(a))
-    out = score(dict(np.load(a.table)), a.boot)
+    out = score(load(a.table), a.boot, a.contrast_rows)
     if a.output:
         a.output.write_text(json.dumps(out, indent=1))
     t = out["total"]
