@@ -9,8 +9,8 @@ the bases it labels. This scores both per cell against the truth over **all** ex
 - `locus`: the label rate, a base against the unanimous base of two or more other reads of its locus (same column,
   base, strand and 12 bases each side); errors and singleton biology, as `pfam_locus` counts before its mixture;
 - `contrast`: `mismatch with the locus' majority = b(locus) + e(cell)` over loci of three or more reads
-  (`pfam_contrast_proto.contrast`, its `by="locus"` rows); only e's shape is identified, so its level is set to
-  `truth` over all bases, and the check is of the shape alone.
+  (`pfam_contrast_proto.contrast`, its `by="locus"` rows); only e's shape is identified, so its level is the truth's
+  on the same bases and each cell is checked against the truth on those bases: the shape alone, apart from selection.
 
 Q is a covariate throughout, never a label. Ratios use P2's rule (`pfam_truth.CELL`): `within` 25 %, `outside` by more
 than 25 % + 2 sd, tested only where the sd is at most half the tolerance.
@@ -105,7 +105,7 @@ def score(t: dict[str, np.ndarray], boot: int = 5) -> dict[str, dict[str, object
         }
 
     cell("total", np.ones(len(err), bool))
-    level = err.mean()
+    level = float(err[deep].mean()) if deep.any() else math.nan
     for z, names in schemes.values():
         shape = proto.contrast(group, z[deep], y)
         # loci resampled (Poisson weights), as the prototype: the sd of the shape, not of the level
@@ -115,7 +115,10 @@ def score(t: dict[str, np.ndarray], boot: int = 5) -> dict[str, dict[str, object
         )
         for i, name in enumerate(names):
             sel = z == i
-            truth = float(err[sel].mean()) if sel.any() else math.nan
+            # on the contrast's own bases: its shape plus their truth's level, against their truth in the cell
+            # (whether those bases are cleaner than the rest is `truth_locus` against `truth`)
+            here = sel[deep]
+            truth = float(err[deep][here].mean()) if here.any() else math.nan
             predicted = level + float(shape[i]) if i < len(shape) else math.nan
             ratio = predicted / truth if truth else math.nan
             sd = float(spread[i]) / truth if truth and i < len(spread) and boot > 1 else math.inf
