@@ -331,6 +331,25 @@ and searched with all of Pfam 38.2.
   position against the same truth, which P2 did not do. A fit of stops and locus without the overlap is then a new design: its rule is to be agreed before it
   sees libraries P2 did not use. Results: `results/` on HPC.
 
+**Diagnosis (2026-11-27)**, on 1 M pairs each of SRR12324253, ERR2935805 and SRR23926920 cut from `keep/`, and 200,000 of ERR2984773 (1x, from FIRE):
+[pfam_overlap_diag.py](pfam_overlap_diag.py) and [pfam_p2_cells.py](pfam_p2_cells.py); all seven with `workflows/pfam/diagnose.sh`.
+- **The overlap anchor misses two kinds of error, so it cannot set the level.** Neither is a bug.
+  - *Errors in the template*, which both mates read alike. The share of errors the overlap can see is 0.50 in SRR12324253, 0.87 in ERR2935805, 0.96 in
+    SRR23926920 and 1.00 in ERR2984773. SRR12324253's errors in both mates are 98 % unique to one molecule (sites ≥ 5 deep, no other read with the base) and are
+    C>A and G>T (2,286 and 1,031 in mate-1 orientation): oxidative damage (8-oxoG) from library preparation, not strains.
+  - *Insert size*: mates overlap only below two read lengths, and error rises with insert size **with Q, cycle quarter and mate held fixed**:
+    8.3 × 10⁻⁴ (50–100 bp) to 1.3 × 10⁻³ (≥ 350) in ERR2935805, 8 × 10⁻⁴ to 3 × 10⁻³ (700) in SRR12324253, flat to 300 then 2–9 × 10⁻³ beyond 500 in
+    SRR23926920. At Q ≥ 36 in ERR2984773, 5.8 × 10⁻⁵ inside the overlap against 5.9 × 10⁻⁴ outside. The long-insert excess is mostly mate 2 (T>G, A>C, A>T,
+    3.5–4.8x against 1.1–3.3x on mate 1): read-2 chemistry, not damage.
+- **The locus label is right on the bases it labels** (ERR2935805 5.92 against 5.91 × 10⁻⁴; SRR12324253 1.02 against 1.00 × 10⁻³), and it sees template damage
+  (C>A 0.93, G>T 0.94 of the truth in SRR12324253). But those bases are cleaner than the rest: 0.67 (ERR2935805) and 0.90 (SRR12324253) of the truth over all
+  exposed bases, and still 0.75 within Q < 30 groups, so weighting by Q does not fix it; reads without a proper pair and long inserts are under-covered (0.55–0.67).
+  In D6331 the strains' transitions are 2.4–2.8x the truth in the label: the mixture is needed there (P2's removed it).
+- **The within-locus contrast gets the shape right**: on its own bases, within 25 % in every testable cell of all three libraries (Q 0.90–1.02, position, mate,
+  insert 0.80–1.05), D6331's strains included. SRR12324253 and SRR23926920 have binned Q, so their Q shape is not tested.
+- **Insert size is a covariate of error here**, in the exposed Pfam bases too (ERR2935805: 6.8 × 10⁻⁴ under 150 bp, 1.35 × 10⁻³ at ≥ 350). Only an alignment
+  shows it beyond the overlap, so modelling it is a question for `reference` mode in the main plan, not this one.
+
 - **No-go** outcome is still useful: report the floor and keep the mode as a lower-effort check, or drop it.
 
 ### P3: real libraries (HPC)
